@@ -1,0 +1,61 @@
+services:
+  new-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: new-api-traj:local
+    container_name: new-api-traj-local
+    restart: unless-stopped
+    command: --log-dir /app/logs
+    ports:
+      - "1145:3000"
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    environment:
+      - SQL_DSN=postgresql://root:123456@postgres:5432/new-api
+      - REDIS_CONN_STRING=redis://:123456@redis:6379
+      - TZ=Asia/Shanghai
+      - NODE_NAME=traj-local
+      - ERROR_LOG_ENABLED=true
+      - BATCH_UPDATE_ENABLED=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - traj-local-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: new-api-traj-redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "123456"]
+    networks:
+      - traj-local-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: new-api-traj-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: new-api
+    volumes:
+      - traj_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d new-api"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - traj-local-network
+
+volumes:
+  traj_pg_data:
+
+networks:
+  traj-local-network:
+    driver: bridge

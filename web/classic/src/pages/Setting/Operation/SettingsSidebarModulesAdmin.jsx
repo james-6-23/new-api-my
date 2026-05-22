@@ -66,6 +66,7 @@ export default function SettingsSidebarModulesAdmin(props) {
       redemption: true,
       user: true,
       subscription: true,
+      conversation_logs: true,
       setting: true,
     },
   });
@@ -127,6 +128,7 @@ export default function SettingsSidebarModulesAdmin(props) {
         redemption: true,
         user: true,
         subscription: true,
+        conversation_logs: true,
         setting: true,
       },
     };
@@ -174,7 +176,12 @@ export default function SettingsSidebarModulesAdmin(props) {
     if (props.options && props.options.SidebarModulesAdmin) {
       try {
         const modules = JSON.parse(props.options.SidebarModulesAdmin);
-        setSidebarModulesAdmin(modules);
+        setSidebarModulesAdmin((prev) => ({
+          chat: { ...prev.chat, ...(modules.chat || {}) },
+          console: { ...prev.console, ...(modules.console || {}) },
+          personal: { ...prev.personal, ...(modules.personal || {}) },
+          admin: { ...prev.admin, ...(modules.admin || {}) },
+        }));
       } catch (error) {
         // 使用默认配置
         const defaultModules = {
@@ -196,6 +203,7 @@ export default function SettingsSidebarModulesAdmin(props) {
             redemption: true,
             user: true,
             subscription: true,
+            conversation_logs: true,
             setting: true,
           },
         };
@@ -271,6 +279,11 @@ export default function SettingsSidebarModulesAdmin(props) {
           description: t('兑换码生成管理'),
         },
         { key: 'user', title: t('用户管理'), description: t('用户账户管理') },
+        {
+          key: 'conversation_logs',
+          title: t('会话日志'),
+          description: t('会话采集记录与导出管理'),
+        },
         {
           key: 'setting',
           title: t('系统设置'),

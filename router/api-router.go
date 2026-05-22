@@ -209,6 +209,28 @@ func SetApiRouter(router *gin.Engine) {
 			performanceRoute.GET("/logs", controller.GetLogFiles)
 			performanceRoute.DELETE("/logs", controller.CleanupLogFiles)
 		}
+		conversationLogRoute := apiRouter.Group("/conversation_logs")
+		conversationLogRoute.Use(middleware.RootAuth())
+		{
+			conversationLogRoute.GET("/summary", controller.GetConversationLogSummary)
+			conversationLogRoute.GET("/export_summary", controller.GetConversationLogExportSummary)
+			conversationLogRoute.GET("/export.jsonl", controller.ExportConversationLogs)
+			conversationLogRoute.POST("/export_and_delete", controller.ExportAndDeleteConversationLogs)
+			conversationLogRoute.PUT("/settings", controller.UpdateConversationLogSettings)
+			conversationLogRoute.GET("/export_jobs/bounds", controller.ExportJobShardBounds)
+			conversationLogRoute.GET("/export_jobs", controller.ListExportJobs)
+			conversationLogRoute.POST("/export_jobs", controller.CreateExportJob)
+			conversationLogRoute.GET("/export_jobs/:id", controller.GetExportJob)
+			conversationLogRoute.GET("/export_jobs/:id/manifest", controller.DownloadExportJobManifest)
+			conversationLogRoute.GET("/export_jobs/:id/shards/:n", controller.DownloadExportJobShard)
+			conversationLogRoute.POST("/export_jobs/:id/cancel", controller.CancelExportJob)
+			conversationLogRoute.DELETE("/export_jobs/:id", controller.DeleteExportJob)
+			conversationLogRoute.GET("", controller.GetConversationLogs)
+			conversationLogRoute.GET("/", controller.GetConversationLogs)
+			conversationLogRoute.GET("/:id", controller.GetConversationLog)
+			conversationLogRoute.DELETE("", controller.DeleteConversationLogs)
+			conversationLogRoute.DELETE("/", controller.DeleteConversationLogs)
+		}
 		ratioSyncRoute := apiRouter.Group("/ratio_sync")
 		ratioSyncRoute.Use(middleware.RootAuth())
 		{

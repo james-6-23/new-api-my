@@ -301,6 +301,10 @@ func InitResources() error {
 		return err
 	}
 
+	// Conversation log cleanup + orphaned export job recovery. Must run AFTER
+	// model.InitLogDB so the conversation_export_jobs table exists.
+	service.StartConversationLogCleanupTask()
+
 	// Initialize Redis
 	err = common.InitRedisClient()
 	if err != nil {

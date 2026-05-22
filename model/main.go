@@ -281,6 +281,8 @@ func migrateDB() error {
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
 		&PerfMetric{},
+		&ConversationLog{},
+		&ConversationExportJob{},
 	)
 	if err != nil {
 		return err
@@ -293,6 +295,9 @@ func migrateDB() error {
 		if err := DB.AutoMigrate(&SubscriptionPlan{}); err != nil {
 			return err
 		}
+	}
+	if err := migrateConversationLogBodyColumns(DB); err != nil {
+		return err
 	}
 	return nil
 }
@@ -330,6 +335,8 @@ func migrateDBFast() error {
 		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
 		{&UserOAuthBinding{}, "UserOAuthBinding"},
 		{&PerfMetric{}, "PerfMetric"},
+		{&ConversationLog{}, "ConversationLog"},
+		{&ConversationExportJob{}, "ConversationExportJob"},
 	}
 	// 动态计算migration数量，确保errChan缓冲区足够大
 	errChan := make(chan error, len(migrations))
@@ -363,6 +370,9 @@ func migrateDBFast() error {
 			return err
 		}
 	}
+	if err := migrateConversationLogBodyColumns(DB); err != nil {
+		return err
+	}
 	common.SysLog("database migrated")
 	return nil
 }
@@ -372,7 +382,45 @@ func migrateLOGDB() error {
 	if err = LOG_DB.AutoMigrate(&Log{}); err != nil {
 		return err
 	}
+	if err = LOG_DB.AutoMigrate(&ConversationLog{}); err != nil {
+		return err
+	}
+	if err = LOG_DB.AutoMigrate(&ConversationExportJob{}); err != nil {
+		return err
+	}
+	if err = migrateConversationLogBodyColumns(LOG_DB); err != nil {
+		return err
+	}
 	return nil
+}
+
+func migrateConversationLogBodyColumns(db *gorm.DB) error {
+	if db == nil || !isMySQLDB(db) || !db.Migrator().HasTable(&ConversationLog{}) {
+		return nil
+	}
+	for _, col := range []string{
+		"request_body",
+		"response_body",
+		"client_request_body",
+		"client_response_body",
+		"upstream_request_body",
+		"upstream_response_body_raw",
+		"stream_chunks_path",
+		"usage_json",
+		"invalid_reason",
+	} {
+		if err := db.Exec("ALTER TABLE conversation_logs MODIFY COLUMN " + col + " LONGTEXT").Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isMySQLDB(db *gorm.DB) bool {
+	if db == nil {
+		return false
+	}
+	return db.Dialector.Name() == "mysql"
 }
 
 type sqliteColumnDef struct {
