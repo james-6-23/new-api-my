@@ -247,19 +247,17 @@ const ConversationLog = () => {
         };
         setSummary(summaryRes.data.data.summary);
         setSettings(nextSettings);
-        // The two GiB-typed fields aren't first-class properties of the
+        // The two MB-typed fields aren't first-class properties of the
         // settings object (the API stores bytes), so Form's values={settings}
         // controlled mode can't populate them on its own. Inject the derived
-        // GiB values into the form state explicitly.
+        // MB values into the form state explicitly.
         const formValues = {
           ...nextSettings,
-          auto_export_threshold_gib: Math.round(
-            (nextSettings.auto_export_threshold_bytes || 0) /
-              (1024 * 1024 * 1024),
+          auto_export_threshold_mb: Math.round(
+            (nextSettings.auto_export_threshold_bytes || 0) / (1024 * 1024),
           ),
-          auto_export_shard_max_gib: Math.round(
-            (nextSettings.auto_export_shard_max_bytes || 0) /
-              (1024 * 1024 * 1024),
+          auto_export_shard_max_mb: Math.round(
+            (nextSettings.auto_export_shard_max_bytes || 0) / (1024 * 1024),
           ),
         };
         settingsFormRef.current?.setValues(formValues);
@@ -337,13 +335,11 @@ const ConversationLog = () => {
       setSettings(nextSettings);
       const formValues = {
         ...nextSettings,
-        auto_export_threshold_gib: Math.round(
-          (nextSettings.auto_export_threshold_bytes || 0) /
-            (1024 * 1024 * 1024),
+        auto_export_threshold_mb: Math.round(
+          (nextSettings.auto_export_threshold_bytes || 0) / (1024 * 1024),
         ),
-        auto_export_shard_max_gib: Math.round(
-          (nextSettings.auto_export_shard_max_bytes || 0) /
-            (1024 * 1024 * 1024),
+        auto_export_shard_max_mb: Math.round(
+          (nextSettings.auto_export_shard_max_bytes || 0) / (1024 * 1024),
         ),
       };
       settingsFormRef.current?.setValues(formValues);
@@ -1362,34 +1358,34 @@ const ConversationLog = () => {
                     </Col>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
-                        field='auto_export_threshold_gib'
-                        label={t('触发阈值 (GiB)')}
-                        min={1}
-                        max={64}
-                        step={1}
-                        suffix='GiB'
+                        field='auto_export_threshold_mb'
+                        label={t('触发阈值 (MB)')}
+                        min={64}
+                        max={65536}
+                        step={64}
+                        suffix='MB'
                         onChange={(value) =>
                           setSettings({
                             ...settings,
                             auto_export_threshold_bytes:
-                              Number(value || 0) * 1024 * 1024 * 1024,
+                              Number(value || 0) * 1024 * 1024,
                           })
                         }
                       />
                     </Col>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
-                        field='auto_export_shard_max_gib'
-                        label={t('单个压缩包最大 (GiB)')}
-                        min={1}
-                        max={64}
-                        step={1}
-                        suffix='GiB'
+                        field='auto_export_shard_max_mb'
+                        label={t('单个压缩包最大 (MB)')}
+                        min={64}
+                        max={65536}
+                        step={64}
+                        suffix='MB'
                         onChange={(value) =>
                           setSettings({
                             ...settings,
                             auto_export_shard_max_bytes:
-                              Number(value || 0) * 1024 * 1024 * 1024,
+                              Number(value || 0) * 1024 * 1024,
                           })
                         }
                       />

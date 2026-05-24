@@ -35,6 +35,7 @@ import { API, showError, showSuccess, timestamp2string } from '../../helpers';
 const { Text, Title } = Typography;
 
 const GiB = 1024 * 1024 * 1024;
+const MB = 1024 * 1024;
 
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
@@ -147,8 +148,8 @@ const ExportJobs = () => {
       const payload = {
         mode: values.mode,
         filter: {},
-        shard_target_bytes: Math.round((values.shard_target_gib || 10) * GiB),
-        shard_max_bytes: Math.round((values.shard_max_gib || 10) * GiB),
+        shard_target_bytes: Math.round((values.shard_target_mb || 10240) * MB),
+        shard_max_bytes: Math.round((values.shard_max_mb || 10240) * MB),
         delete_after_export: !!values.delete_after_export,
       };
       const res = await API.post(
@@ -417,7 +418,7 @@ const ExportJobs = () => {
             </Title>
             <Text type='tertiary'>
               {t(
-                '将合规数据按 10–20 GiB 分片打包成 tar.gz 异步导出。同一个会话不会跨分片。',
+                '按 MB 粒度配置分片大小,把合规数据打包成 tar.gz 异步导出。同一个会话不会跨分片。',
               )}
             </Text>
           </div>
@@ -465,8 +466,8 @@ const ExportJobs = () => {
           onSubmit={onCreate}
           initValues={{
             mode: 'api_hijack_jsonl',
-            shard_target_gib: 10,
-            shard_max_gib: 10,
+            shard_target_mb: 10240,
+            shard_max_mb: 10240,
             delete_after_export: true,
           }}
         >
@@ -477,21 +478,21 @@ const ExportJobs = () => {
             rules={[{ required: true }]}
           />
           <Form.InputNumber
-            field='shard_target_gib'
-            label={t('分片目标大小 (GiB)')}
-            min={1}
-            max={64}
-            step={1}
-            suffix='GiB'
+            field='shard_target_mb'
+            label={t('分片目标大小 (MB)')}
+            min={64}
+            max={65536}
+            step={64}
+            suffix='MB'
             rules={[{ required: true }]}
           />
           <Form.InputNumber
-            field='shard_max_gib'
-            label={t('分片最大大小 (GiB)')}
-            min={1}
-            max={64}
-            step={1}
-            suffix='GiB'
+            field='shard_max_mb'
+            label={t('分片最大大小 (MB)')}
+            min={64}
+            max={65536}
+            step={64}
+            suffix='MB'
             rules={[{ required: true }]}
           />
           <Form.Checkbox field='delete_after_export'>

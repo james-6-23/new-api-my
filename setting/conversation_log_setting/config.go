@@ -12,7 +12,7 @@ const (
 
 	defaultShardTargetBytes = int64(15) << 30 // 15 GiB
 	defaultShardMaxBytes    = int64(20) << 30 // 20 GiB
-	minShardBytes           = int64(1) << 30  // 1 GiB
+	minShardBytes           = int64(64) << 20 // 64 MiB — small enough for MB-grained UI
 	maxShardBytes           = int64(64) << 30 // 64 GiB
 
 	// Auto-export defaults: trigger when stored conversation log bytes reach
