@@ -247,7 +247,22 @@ const ConversationLog = () => {
         };
         setSummary(summaryRes.data.data.summary);
         setSettings(nextSettings);
-        settingsFormRef.current?.setValues(nextSettings);
+        // The two GiB-typed fields aren't first-class properties of the
+        // settings object (the API stores bytes), so Form's values={settings}
+        // controlled mode can't populate them on its own. Inject the derived
+        // GiB values into the form state explicitly.
+        const formValues = {
+          ...nextSettings,
+          auto_export_threshold_gib: Math.round(
+            (nextSettings.auto_export_threshold_bytes || 0) /
+              (1024 * 1024 * 1024),
+          ),
+          auto_export_shard_max_gib: Math.round(
+            (nextSettings.auto_export_shard_max_bytes || 0) /
+              (1024 * 1024 * 1024),
+          ),
+        };
+        settingsFormRef.current?.setValues(formValues);
       } else {
         showError(summaryRes.data.message);
       }
@@ -320,7 +335,18 @@ const ConversationLog = () => {
         s3: { ...defaultSettings.s3, ...(data?.s3 || {}) },
       };
       setSettings(nextSettings);
-      settingsFormRef.current?.setValues(nextSettings);
+      const formValues = {
+        ...nextSettings,
+        auto_export_threshold_gib: Math.round(
+          (nextSettings.auto_export_threshold_bytes || 0) /
+            (1024 * 1024 * 1024),
+        ),
+        auto_export_shard_max_gib: Math.round(
+          (nextSettings.auto_export_shard_max_bytes || 0) /
+            (1024 * 1024 * 1024),
+        ),
+      };
+      settingsFormRef.current?.setValues(formValues);
       showSuccess(t('保存成功'));
       await loadSummary(mode);
     } catch (error) {
@@ -1342,10 +1368,6 @@ const ConversationLog = () => {
                         max={64}
                         step={1}
                         suffix='GiB'
-                        initValue={Math.round(
-                          (settings.auto_export_threshold_bytes || 0) /
-                            (1024 * 1024 * 1024),
-                        )}
                         onChange={(value) =>
                           setSettings({
                             ...settings,
@@ -1363,10 +1385,6 @@ const ConversationLog = () => {
                         max={64}
                         step={1}
                         suffix='GiB'
-                        initValue={Math.round(
-                          (settings.auto_export_shard_max_bytes || 0) /
-                            (1024 * 1024 * 1024),
-                        )}
                         onChange={(value) =>
                           setSettings({
                             ...settings,
