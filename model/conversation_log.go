@@ -197,6 +197,30 @@ func GetConversationLogSummary() (ConversationLogSummary, error) {
 	return summary, nil
 }
 
+// CountEligibleConversationLogs returns (records, distinct_sessions) for
+// validation_status = "valid" rows matching the query. Used by export jobs
+// that need totals without instantiating every row in memory.
+func CountEligibleConversationLogs(ctx context.Context, query ConversationLogQuery) (int64, int64, error) {
+	db := conversationLogDBWithContext(ctx).Model(&ConversationLog{})
+	db = applyConversationLogQuery(db, query).Where("validation_status = ?", "valid")
+
+	var records int64
+	if err := db.Count(&records).Error; err != nil {
+		return 0, 0, err
+	}
+
+	// distinct session_id count, ignoring empty session ids.
+	var sessions int64
+	sessionDB := conversationLogDBWithContext(ctx).Model(&ConversationLog{})
+	sessionDB = applyConversationLogQuery(sessionDB, query).
+		Where("validation_status = ?", "valid").
+		Where("session_id <> ?", "")
+	if err := sessionDB.Distinct("session_id").Count(&sessions).Error; err != nil {
+		return records, 0, err
+	}
+	return records, sessions, nil
+}
+
 func ForEachConversationLog(ctx context.Context, query ConversationLogQuery, batchSize int, fn func([]*ConversationLog) error) error {
 	if batchSize <= 0 {
 		batchSize = 100

@@ -335,6 +335,19 @@ func ValidateAPIRecord(log *model.ConversationLog) ConversationAPIValidation {
 	return result
 }
 
+// summaryInMemoryRecordCap bounds how many full ConversationLog records the
+// summary builder may keep in memory at once. Above this, the function drops
+// out of "rich analysis" mode and falls back to DB-side counts so big tables
+// (10s of GiB) don't OOM the process. The rich path still runs for the
+// common case of filtered queries used by the UI.
+const summaryInMemoryRecordCap = 50000
+
+// summaryTotalRecordsCap is the upper bound on rows the summary builder will
+// even *iterate*. Above this we don't trust ourselves to stream record
+// payloads (each row may carry a multi-MB response body) and switch to
+// pure DB-side counting.
+const summaryTotalRecordsCap = 200000
+
 func BuildConversationLogExportSummary(ctx context.Context, query model.ConversationLogQuery, mode string) (ConversationExportSummary, error) {
 	if !conversation_log_setting.IsValidExportMode(mode) {
 		mode = conversation_log_setting.ExportModeAPIHijackJSONL
@@ -344,7 +357,24 @@ func BuildConversationLogExportSummary(ctx context.Context, query model.Conversa
 		InvalidRecordsByReason:   make(map[string]int64),
 		RejectedSessionsByReason: make(map[string]int64),
 	}
+
+	// Cheap probe: if the table (or the filtered slice) is large, skip the
+	// in-memory walk entirely and only return DB-side counts. The UI still
+	// gets the headline numbers it cares about (eligible records / sessions);
+	// callers that need per-reason breakdowns must narrow their filter first.
+	records, sessions, cerr := model.CountEligibleConversationLogs(ctx, query)
+	if cerr == nil && records > summaryTotalRecordsCap {
+		summary.TotalCapturedRecords = records
+		summary.APIExportableRecords = records
+		if mode == conversation_log_setting.ExportModeSessionJSONL {
+			summary.TotalSessions = sessions
+			summary.SessionExportableSessions = sessions
+		}
+		return summary, nil
+	}
+
 	validRecords := make([]*model.ConversationLog, 0)
+	overflowed := false
 
 	err := model.ForEachConversationLog(ctx, query, 200, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
@@ -352,7 +382,14 @@ func BuildConversationLogExportSummary(ctx context.Context, query model.Conversa
 			validation := ValidateAPIRecord(item)
 			if validation.Exportable && item.ValidationStatus == ConversationValidationValid {
 				summary.APIExportableRecords++
-				validRecords = append(validRecords, item)
+				if !overflowed {
+					if int64(len(validRecords)) >= summaryInMemoryRecordCap {
+						overflowed = true
+						validRecords = nil
+					} else {
+						validRecords = append(validRecords, item)
+					}
+				}
 			} else {
 				reasons := validation.Reasons
 				if item.InvalidReason != "" {
@@ -375,12 +412,20 @@ func BuildConversationLogExportSummary(ctx context.Context, query model.Conversa
 		return summary, err
 	}
 	if mode == conversation_log_setting.ExportModeSessionJSONL {
-		candidates := buildSessionCandidates(validRecords)
-		summary.TotalSessions = int64(len(candidates))
-		exportable, duplicateRemoved, subsequenceRemoved := filterSessionCandidates(candidates, &summary)
-		summary.SessionExportableSessions = int64(len(exportable))
-		summary.DuplicateRemovedCount = int64(duplicateRemoved)
-		summary.SubsequenceRemovedCount = int64(subsequenceRemoved)
+		if overflowed {
+			_, sessionsCount, cerr2 := model.CountEligibleConversationLogs(ctx, query)
+			if cerr2 == nil {
+				summary.TotalSessions = sessionsCount
+				summary.SessionExportableSessions = sessionsCount
+			}
+		} else {
+			candidates := buildSessionCandidates(validRecords)
+			summary.TotalSessions = int64(len(candidates))
+			exportable, duplicateRemoved, subsequenceRemoved := filterSessionCandidates(candidates, &summary)
+			summary.SessionExportableSessions = int64(len(exportable))
+			summary.DuplicateRemovedCount = int64(duplicateRemoved)
+			summary.SubsequenceRemovedCount = int64(subsequenceRemoved)
+		}
 	}
 	return summary, nil
 }

@@ -272,10 +272,18 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 			return fmt.Errorf("invalid filter json: %w", err)
 		}
 	}
-	summary, err := BuildConversationLogExportSummary(ctx, query, job.Mode)
+	// Cheap totals so the operator UI can show "exported / total" without
+	// loading every row into memory. Use the DB to count, not in-memory
+	// iteration — for a 50 GiB log table the latter OOMs the process.
+	recordsEligible, sessionsEligible, err := model.CountEligibleConversationLogs(ctx, query)
 	if err != nil {
-		return err
+		return fmt.Errorf("count eligible conversation logs: %w", err)
 	}
+	updateJobProgress(job.JobId, map[string]interface{}{
+		"total_records":  recordsEligible,
+		"total_sessions": sessionsEligible,
+		"progress":       "starting export",
+	})
 
 	tmpDir := filepath.Join(job.OutputDirectory, ".tmp")
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
@@ -293,6 +301,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		shardTargetBytes:  job.ShardTargetBytes,
 		shardMaxBytes:     job.ShardMaxBytes,
 		deleteAfterExport: job.DeleteAfterExport,
+		totalEligible:     recordsEligible,
 	}
 
 	var processErr error
@@ -309,22 +318,28 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		return err
 	}
 
-	// Write top-level manifest.
+	// Write top-level manifest. Summary is intentionally minimal — the rich
+	// in-memory summary (per-reason breakdowns, dedup analysis) is too
+	// expensive to compute for a 50 GiB shard run.
 	manifest := TopManifest{
-		JobID:             job.JobId,
-		SchemaVersion:     "1",
-		Mode:              job.Mode,
-		CreatedAt:         job.CreatedAt,
-		FinishedAt:        common.GetTimestamp(),
-		ShardTargetBytes:  job.ShardTargetBytes,
-		ShardMaxBytes:     job.ShardMaxBytes,
-		Filter:            query,
-		Summary:           summary,
-		Shards:            state.shards,
+		JobID:            job.JobId,
+		SchemaVersion:    "1",
+		Mode:             job.Mode,
+		CreatedAt:        job.CreatedAt,
+		FinishedAt:       common.GetTimestamp(),
+		ShardTargetBytes: job.ShardTargetBytes,
+		ShardMaxBytes:    job.ShardMaxBytes,
+		Filter:           query,
+		Summary: ConversationExportSummary{
+			Mode:                 job.Mode,
+			APIExportableRecords: recordsEligible,
+			TotalSessions:        sessionsEligible,
+		},
+		Shards: state.shards,
 		Totals: TopManifestTotals{
-			RecordsEligible:   summary.APIExportableRecords,
+			RecordsEligible:   recordsEligible,
 			RecordsExported:   state.totalRecordCount,
-			SessionsEligible:  summary.TotalSessions,
+			SessionsEligible:  sessionsEligible,
 			SessionsExported:  state.totalSessionCount,
 			UncompressedBytes: state.totalUncompressed,
 			CompressedBytes:   state.totalCompressed,
@@ -341,9 +356,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 
 	updateJobProgress(job.JobId, map[string]interface{}{
 		"manifest_path":      manifestPath,
-		"total_records":      summary.APIExportableRecords,
+		"total_records":      recordsEligible,
 		"exported_records":   state.totalRecordCount,
-		"total_sessions":     summary.TotalSessions,
+		"total_sessions":     sessionsEligible,
 		"exported_sessions":  state.totalSessionCount,
 		"uncompressed_bytes": state.totalUncompressed,
 		"compressed_bytes":   state.totalCompressed,
@@ -370,6 +385,10 @@ type shardWriterState struct {
 	shardTargetBytes  int64
 	shardMaxBytes     int64
 	deleteAfterExport bool
+	// totalEligible is the DB-side count of rows the job is expected to
+	// process. Used purely for the progress text — the writer never indexes by
+	// it.
+	totalEligible int64
 
 	// Current shard accumulator (streaming).
 	currentIndex      int
@@ -479,18 +498,33 @@ func (s *shardWriterState) maybePushProgress(force bool) {
 	s.lastProgressAt = time.Now()
 	uncompressed := s.totalUncompressed + s.currentSize
 	records := s.totalRecordCount + s.currentRecordCnt
+	progressText := fmt.Sprintf(
+		"writing shard %d: %d records, %.2f GiB",
+		s.currentIndex+1,
+		s.currentRecordCnt,
+		float64(s.currentSize)/(1<<30),
+	)
+	if s.totalEligible > 0 {
+		pct := float64(records) / float64(s.totalEligible) * 100
+		if pct > 100 {
+			pct = 100
+		}
+		progressText = fmt.Sprintf(
+			"shard %d: %d/%d records (%.1f%%), %.2f GiB",
+			s.currentIndex+1,
+			records,
+			s.totalEligible,
+			pct,
+			float64(uncompressed)/(1<<30),
+		)
+	}
 	updateJobProgress(s.jobID, map[string]interface{}{
 		"shard_count":        len(s.shards),
 		"exported_records":   records,
 		"exported_sessions":  s.totalSessionCount + s.currentSessionCnt,
 		"uncompressed_bytes": uncompressed,
 		"compressed_bytes":   s.totalCompressed,
-		"progress": fmt.Sprintf(
-			"writing shard %d: %d records, %.2f GiB",
-			s.currentIndex+1,
-			s.currentRecordCnt,
-			float64(s.currentSize)/(1<<30),
-		),
+		"progress":           progressText,
 	})
 }
 
@@ -680,7 +714,7 @@ func streamShardTarGz(tarPath, shardName, jsonlPath string, jsonlSize int64, sha
 }
 
 func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) error {
-	return model.ForEachConversationLog(ctx, query, 200, func(logs []*model.ConversationLog) error {
+	return model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -810,7 +844,7 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 		return nil
 	}
 
-	err := model.ForEachConversationLog(ctx, query, 200, func(logs []*model.ConversationLog) error {
+	err := model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
