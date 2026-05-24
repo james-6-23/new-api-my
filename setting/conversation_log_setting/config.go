@@ -14,6 +14,12 @@ const (
 	defaultShardMaxBytes    = int64(20) << 30 // 20 GiB
 	minShardBytes           = int64(1) << 30  // 1 GiB
 	maxShardBytes           = int64(64) << 30 // 64 GiB
+
+	// Auto-export defaults: trigger when stored conversation log bytes reach
+	// 10 GiB and bundle each shard up to 10 GiB.
+	defaultAutoExportThresholdBytes = int64(10) << 30
+	defaultAutoExportShardMaxBytes  = int64(10) << 30
+	defaultAutoExportCheckInterval  = 300 // seconds (5 minutes)
 )
 
 type S3Setting struct {
@@ -38,6 +44,18 @@ type ConversationLogSetting struct {
 	DefaultShardMaxBytes    int64 `json:"default_shard_max_bytes"`
 	ExportJobConcurrency    int   `json:"export_job_concurrency"`
 	ExportJobRetentionDays  int   `json:"export_job_retention_days"`
+
+	// Auto-export configuration. When enabled, a background watcher creates an
+	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
+	// packs them into tar.gz shards capped at AutoExportShardMaxBytes, then (if
+	// AutoExportDeleteAfter is true) wipes the source rows so storage frees up.
+	AutoExportEnabled              bool   `json:"auto_export_enabled"`
+	AutoExportThresholdBytes       int64  `json:"auto_export_threshold_bytes"`
+	AutoExportShardMaxBytes        int64  `json:"auto_export_shard_max_bytes"`
+	AutoExportMode                 string `json:"auto_export_mode"`
+	AutoExportDirectory            string `json:"auto_export_directory"`
+	AutoExportCheckIntervalSeconds int    `json:"auto_export_check_interval_seconds"`
+	AutoExportDeleteAfter          bool   `json:"auto_export_delete_after"`
 }
 
 var conversationLogSetting = ConversationLogSetting{
@@ -50,6 +68,14 @@ var conversationLogSetting = ConversationLogSetting{
 	DefaultShardMaxBytes:    defaultShardMaxBytes,
 	ExportJobConcurrency:    1,
 	ExportJobRetentionDays:  14,
+
+	AutoExportEnabled:              false,
+	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
+	AutoExportShardMaxBytes:        defaultAutoExportShardMaxBytes,
+	AutoExportMode:                 ExportModeAPIHijackJSONL,
+	AutoExportDirectory:            filepath.Join("data", "conversation_exports", "auto"),
+	AutoExportCheckIntervalSeconds: defaultAutoExportCheckInterval,
+	AutoExportDeleteAfter:          true,
 }
 
 func init() {
@@ -79,6 +105,20 @@ func GetSetting() ConversationLogSetting {
 	setting.ExportJobConcurrency = 1
 	if setting.ExportJobRetentionDays < 0 {
 		setting.ExportJobRetentionDays = 0
+	}
+
+	if setting.AutoExportThresholdBytes <= 0 {
+		setting.AutoExportThresholdBytes = defaultAutoExportThresholdBytes
+	}
+	setting.AutoExportShardMaxBytes = clampShardBytes(setting.AutoExportShardMaxBytes, defaultAutoExportShardMaxBytes)
+	if !IsValidExportMode(setting.AutoExportMode) {
+		setting.AutoExportMode = ExportModeAPIHijackJSONL
+	}
+	if setting.AutoExportDirectory == "" {
+		setting.AutoExportDirectory = filepath.Join("data", "conversation_exports", "auto")
+	}
+	if setting.AutoExportCheckIntervalSeconds <= 0 {
+		setting.AutoExportCheckIntervalSeconds = defaultAutoExportCheckInterval
 	}
 	return setting
 }

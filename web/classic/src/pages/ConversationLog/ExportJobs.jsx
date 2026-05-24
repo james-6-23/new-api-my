@@ -121,8 +121,8 @@ const ExportJobs = () => {
       const payload = {
         mode: values.mode,
         filter: {},
-        shard_target_bytes: Math.round((values.shard_target_gib || 15) * GiB),
-        shard_max_bytes: Math.round((values.shard_max_gib || 20) * GiB),
+        shard_target_bytes: Math.round((values.shard_target_gib || 10) * GiB),
+        shard_max_bytes: Math.round((values.shard_max_gib || 10) * GiB),
         delete_after_export: !!values.delete_after_export,
       };
       const res = await API.post(
@@ -216,7 +216,24 @@ const ExportJobs = () => {
   };
 
   const downloadShard = (jobId, n) => {
-    const name = `shard-${String(n).padStart(4, '0')}.tar.gz`;
+    const fallback = `shard-${String(n).padStart(4, '0')}.tar.gz`;
+    const job = jobs.find((j) => j.job_id === jobId);
+    let name = fallback;
+    if (job?.created_at) {
+      const date = new Date(job.created_at * 1000);
+      const ts =
+        `${date.getUTCFullYear()}` +
+        `${String(date.getUTCMonth() + 1).padStart(2, '0')}` +
+        `${String(date.getUTCDate()).padStart(2, '0')}T` +
+        `${String(date.getUTCHours()).padStart(2, '0')}` +
+        `${String(date.getUTCMinutes()).padStart(2, '0')}` +
+        `${String(date.getUTCSeconds()).padStart(2, '0')}`;
+      const modeTag =
+        job.mode === 'session_jsonl' ? 'session' : 'api';
+      const trigger = job.trigger?.trim() || 'manual';
+      const short = (job.job_id || '').slice(0, 8);
+      name = `conversation-logs-${modeTag}-${trigger}-${ts}-${short}-shard${String(n).padStart(4, '0')}.tar.gz`;
+    }
     downloadBlob(
       `/api/conversation_logs/export_jobs/${jobId}/shards/${n}`,
       name,
@@ -395,9 +412,9 @@ const ExportJobs = () => {
           onSubmit={onCreate}
           initValues={{
             mode: 'api_hijack_jsonl',
-            shard_target_gib: 15,
-            shard_max_gib: 20,
-            delete_after_export: false,
+            shard_target_gib: 10,
+            shard_max_gib: 10,
+            delete_after_export: true,
           }}
         >
           <Form.Select

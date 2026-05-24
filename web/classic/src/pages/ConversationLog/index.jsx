@@ -82,6 +82,13 @@ const defaultSettings = {
     secret_key: '',
     prefix: '',
   },
+  auto_export_enabled: false,
+  auto_export_threshold_bytes: 10 * 1024 * 1024 * 1024,
+  auto_export_shard_max_bytes: 10 * 1024 * 1024 * 1024,
+  auto_export_mode: 'api_hijack_jsonl',
+  auto_export_directory: 'data/conversation_exports/auto',
+  auto_export_check_interval_seconds: 300,
+  auto_export_delete_after: true,
 };
 
 const formInitValues = {
@@ -225,13 +232,9 @@ const ConversationLog = () => {
     setSummaryLoading(true);
     try {
       const filters = getFilterParams();
-      const [summaryRes, exportRes] = await Promise.all([
-        API.get('/api/conversation_logs/summary', { disableDuplicate: true }),
-        API.get('/api/conversation_logs/export_summary', {
-          params: { ...filters, mode: targetMode },
-          disableDuplicate: true,
-        }),
-      ]);
+      const summaryRes = await API.get('/api/conversation_logs/summary', {
+        disableDuplicate: true,
+      });
 
       if (summaryRes.data.success) {
         const nextSettings = {
@@ -249,10 +252,22 @@ const ConversationLog = () => {
         showError(summaryRes.data.message);
       }
 
-      if (exportRes.data.success) {
-        setExportSummary(exportRes.data.data);
-      } else {
-        showError(exportRes.data.message);
+      try {
+        const exportRes = await API.get(
+          '/api/conversation_logs/export_summary',
+          {
+            params: { ...filters, mode: targetMode },
+            disableDuplicate: true,
+          },
+        );
+
+        if (exportRes.data.success) {
+          setExportSummary(exportRes.data.data);
+        } else {
+          showError(exportRes.data.message);
+        }
+      } catch (exportError) {
+        showError(exportError.message || t('刷新失败'));
       }
     } catch (error) {
       showError(error.message || t('刷新失败'));
@@ -984,7 +999,11 @@ const ConversationLog = () => {
               </Card>
 
               {/* Card 2: Export Overview */}
-              <Card className='!rounded-2xl h-full' title={t('导出概览')} bordered>
+              <Card
+                className='!rounded-2xl h-full'
+                title={t('导出概览')}
+                bordered
+              >
                 <Spin spinning={summaryLoading}>
                   <div className='flex flex-col gap-4'>
                     <Form layout='vertical'>
@@ -1005,17 +1024,25 @@ const ConversationLog = () => {
                     </Form>
                     <div className='grid grid-cols-3 xl:grid-cols-1 gap-2'>
                       <div className='flex xl:flex-row flex-col justify-between xl:items-center'>
-                        <Text type='tertiary' size='small'>{t('当前筛选可导出')}</Text>
-                        <Text strong className='text-sm'>{compliantCount}</Text>
+                        <Text type='tertiary' size='small'>
+                          {t('当前筛选可导出')}
+                        </Text>
+                        <Text strong className='text-sm'>
+                          {compliantCount}
+                        </Text>
                       </div>
                       <div className='flex xl:flex-row flex-col justify-between xl:items-center'>
-                        <Text type='tertiary' size='small'>{t('API 合规记录')}</Text>
+                        <Text type='tertiary' size='small'>
+                          {t('API 合规记录')}
+                        </Text>
                         <Text strong className='text-sm'>
                           {exportSummary?.api_exportable_records ?? 0}
                         </Text>
                       </div>
                       <div className='flex xl:flex-row flex-col justify-between xl:items-center'>
-                        <Text type='tertiary' size='small'>{t('Session 合规会话')}</Text>
+                        <Text type='tertiary' size='small'>
+                          {t('Session 合规会话')}
+                        </Text>
                         <Text strong className='text-sm'>
                           {exportSummary?.session_exportable_sessions ?? 0}
                         </Text>
@@ -1071,10 +1098,14 @@ const ConversationLog = () => {
                 empty={
                   <Empty
                     image={
-                      <IllustrationNoResult style={{ width: 150, height: 150 }} />
+                      <IllustrationNoResult
+                        style={{ width: 150, height: 150 }}
+                      />
                     }
                     darkModeImage={
-                      <IllustrationNoResultDark style={{ width: 150, height: 150 }} />
+                      <IllustrationNoResultDark
+                        style={{ width: 150, height: 150 }}
+                      />
                     }
                     description={t('搜索无结果')}
                     style={{ padding: 30 }}
@@ -1104,7 +1135,11 @@ const ConversationLog = () => {
               <Spin spinning={detailLoading}>
                 {detail ? (
                   <div className='flex flex-col gap-4'>
-                    <Descriptions data={detailRows} column={{ xs: 1, sm: 2, lg: 3 }} size='small' />
+                    <Descriptions
+                      data={detailRows}
+                      column={{ xs: 1, sm: 2, lg: 3 }}
+                      size='small'
+                    />
                     {detail.invalid_reason ? (
                       <div>
                         <Text strong>{t('异常原因')}</Text>
@@ -1114,24 +1149,37 @@ const ConversationLog = () => {
                       </div>
                     ) : null}
                     <Tabs type='line'>
-                      <Tabs.TabPane tab={t('客户端请求')} itemKey='client_request'>
+                      <Tabs.TabPane
+                        tab={t('客户端请求')}
+                        itemKey='client_request'
+                      >
                         {renderCodePane(
                           detail.client_request_body || detail.request_body,
                         )}
                       </Tabs.TabPane>
-                      <Tabs.TabPane tab={t('上游请求')} itemKey='upstream_request'>
+                      <Tabs.TabPane
+                        tab={t('上游请求')}
+                        itemKey='upstream_request'
+                      >
                         {renderCodePane(
                           detail.upstream_request_body || detail.request_body,
                         )}
                       </Tabs.TabPane>
-                      <Tabs.TabPane tab={t('客户端响应')} itemKey='client_response'>
+                      <Tabs.TabPane
+                        tab={t('客户端响应')}
+                        itemKey='client_response'
+                      >
                         {renderCodePane(
                           detail.client_response_body || detail.response_body,
                         )}
                       </Tabs.TabPane>
-                      <Tabs.TabPane tab={t('上游响应')} itemKey='upstream_response'>
+                      <Tabs.TabPane
+                        tab={t('上游响应')}
+                        itemKey='upstream_response'
+                      >
                         {renderCodePane(
-                          detail.upstream_response_body_raw || detail.response_body,
+                          detail.upstream_response_body_raw ||
+                            detail.response_body,
                         )}
                       </Tabs.TabPane>
                       <Tabs.TabPane tab={t('用量')} itemKey='usage'>
@@ -1147,7 +1195,15 @@ const ConversationLog = () => {
         <Tabs.TabPane tab={t('分片导出任务')} itemKey='export_jobs'>
           <ExportJobs />
         </Tabs.TabPane>
-        <Tabs.TabPane tab={<span><IconSetting style={{ marginRight: 6 }} />{t('采集配置')}</span>} itemKey='settings'>
+        <Tabs.TabPane
+          tab={
+            <span>
+              <IconSetting style={{ marginRight: 6 }} />
+              {t('采集配置')}
+            </span>
+          }
+          itemKey='settings'
+        >
           <div className='flex flex-col gap-3'>
             <Card
               className='!rounded-2xl'
@@ -1171,7 +1227,10 @@ const ConversationLog = () => {
                   getFormApi={(formApi) => (settingsFormRef.current = formApi)}
                   layout='vertical'
                 >
-                  <div className='text-sm font-semibold mb-3' style={{ color: 'var(--semi-color-text-0)' }}>
+                  <div
+                    className='text-sm font-semibold mb-3'
+                    style={{ color: 'var(--semi-color-text-0)' }}
+                  >
                     {t('基础配置')}
                   </div>
                   <Row gutter={16}>
@@ -1230,7 +1289,10 @@ const ConversationLog = () => {
                           { label: t('Session JSONL'), value: 'session_jsonl' },
                         ]}
                         onChange={(value) =>
-                          setSettings({ ...settings, default_export_mode: value })
+                          setSettings({
+                            ...settings,
+                            default_export_mode: value,
+                          })
                         }
                       />
                     </Col>
@@ -1245,7 +1307,148 @@ const ConversationLog = () => {
                     </Col>
                   </Row>
 
-                  <div className='text-sm font-semibold mt-6 mb-3 border-t pt-4' style={{ borderColor: 'var(--semi-color-border)', color: 'var(--semi-color-text-0)' }}>
+                  <div
+                    className='text-sm font-semibold mt-6 mb-3 border-t pt-4'
+                    style={{
+                      borderColor: 'var(--semi-color-border)',
+                      color: 'var(--semi-color-text-0)',
+                    }}
+                  >
+                    {t('自动导出与清理')}
+                  </div>
+                  <Row gutter={16}>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='auto_export_enabled'
+                        label={t('启用自动导出')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          '存储占用达到阈值时自动打包导出 tar.gz',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_enabled: value,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='auto_export_threshold_gib'
+                        label={t('触发阈值 (GiB)')}
+                        min={1}
+                        max={64}
+                        step={1}
+                        suffix='GiB'
+                        initValue={Math.round(
+                          (settings.auto_export_threshold_bytes || 0) /
+                            (1024 * 1024 * 1024),
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_threshold_bytes:
+                              Number(value || 0) * 1024 * 1024 * 1024,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='auto_export_shard_max_gib'
+                        label={t('单个压缩包最大 (GiB)')}
+                        min={1}
+                        max={64}
+                        step={1}
+                        suffix='GiB'
+                        initValue={Math.round(
+                          (settings.auto_export_shard_max_bytes || 0) /
+                            (1024 * 1024 * 1024),
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_shard_max_bytes:
+                              Number(value || 0) * 1024 * 1024 * 1024,
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} md={8}>
+                      <Form.Select
+                        field='auto_export_mode'
+                        label={t('自动导出模式')}
+                        optionList={[
+                          {
+                            label: t('API Hijack JSONL'),
+                            value: 'api_hijack_jsonl',
+                          },
+                          { label: t('Session JSONL'), value: 'session_jsonl' },
+                        ]}
+                        onChange={(value) =>
+                          setSettings({ ...settings, auto_export_mode: value })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} md={8}>
+                      <Form.InputNumber
+                        field='auto_export_check_interval_seconds'
+                        label={t('检查周期 (秒)')}
+                        min={30}
+                        step={30}
+                        suffix={t('秒')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_check_interval_seconds: Number(
+                              value || 0,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} md={8}>
+                      <Form.Switch
+                        field='auto_export_delete_after'
+                        label={t('导出后清理源记录')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t('压缩成功后删除已导出会话日志')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_delete_after: value,
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24}>
+                      <Form.Input
+                        field='auto_export_directory'
+                        label={t('自动导出目录')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_directory: value,
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+
+                  <div
+                    className='text-sm font-semibold mt-6 mb-3 border-t pt-4'
+                    style={{
+                      borderColor: 'var(--semi-color-border)',
+                      color: 'var(--semi-color-text-0)',
+                    }}
+                  >
                     {t('S3 备份存储设置')}
                   </div>
                   <Row gutter={16}>

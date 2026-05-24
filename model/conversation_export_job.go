@@ -47,6 +47,10 @@ type ConversationExportJob struct {
 	OutputDirectory string `json:"output_directory" gorm:"type:text"`
 	BatchId         string `json:"batch_id" gorm:"type:varchar(64);index;default:''"`
 	Cancelled       bool   `json:"cancelled" gorm:"default:false"`
+	// Trigger records how the job was started: "manual" (operator) or
+	// "auto" (storage threshold watcher). Cosmetic — drives filename and UI
+	// annotations only.
+	Trigger string `json:"trigger" gorm:"type:varchar(16);index;default:''"`
 }
 
 func CreateConversationExportJob(job *ConversationExportJob) error {

@@ -111,6 +111,14 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		ExportDirectory   *string                             `json:"export_directory"`
 		DefaultExportMode *string                             `json:"default_export_mode"`
 		S3                *conversation_log_setting.S3Setting `json:"s3"`
+
+		AutoExportEnabled              *bool   `json:"auto_export_enabled"`
+		AutoExportThresholdBytes       *int64  `json:"auto_export_threshold_bytes"`
+		AutoExportShardMaxBytes        *int64  `json:"auto_export_shard_max_bytes"`
+		AutoExportMode                 *string `json:"auto_export_mode"`
+		AutoExportDirectory            *string `json:"auto_export_directory"`
+		AutoExportCheckIntervalSeconds *int    `json:"auto_export_check_interval_seconds"`
+		AutoExportDeleteAfter          *bool   `json:"auto_export_delete_after"`
 	}
 	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
 		common.ApiError(c, err)
@@ -162,6 +170,62 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 		if err := model.UpdateOption("conversation_log_setting.s3", string(data)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportEnabled != nil {
+		if err := model.UpdateOption("conversation_log_setting.auto_export_enabled", strconv.FormatBool(*req.AutoExportEnabled)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportThresholdBytes != nil {
+		if *req.AutoExportThresholdBytes <= 0 {
+			common.ApiErrorMsg(c, "auto_export_threshold_bytes must be > 0")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.auto_export_threshold_bytes", strconv.FormatInt(*req.AutoExportThresholdBytes, 10)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportShardMaxBytes != nil {
+		minBound, maxBound := conversation_log_setting.ShardBytesBounds()
+		if *req.AutoExportShardMaxBytes < minBound || *req.AutoExportShardMaxBytes > maxBound {
+			common.ApiErrorMsg(c, fmt.Sprintf("auto_export_shard_max_bytes must be in [%d, %d]", minBound, maxBound))
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.auto_export_shard_max_bytes", strconv.FormatInt(*req.AutoExportShardMaxBytes, 10)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportMode != nil {
+		mode := conversationLogMode(*req.AutoExportMode)
+		if err := model.UpdateOption("conversation_log_setting.auto_export_mode", mode); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportDirectory != nil {
+		if err := model.UpdateOption("conversation_log_setting.auto_export_directory", strings.TrimSpace(*req.AutoExportDirectory)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportCheckIntervalSeconds != nil {
+		if *req.AutoExportCheckIntervalSeconds < 30 {
+			common.ApiErrorMsg(c, "auto_export_check_interval_seconds must be >= 30")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.auto_export_check_interval_seconds", strconv.Itoa(*req.AutoExportCheckIntervalSeconds)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportDeleteAfter != nil {
+		if err := model.UpdateOption("conversation_log_setting.auto_export_delete_after", strconv.FormatBool(*req.AutoExportDeleteAfter)); err != nil {
 			common.ApiError(c, err)
 			return
 		}

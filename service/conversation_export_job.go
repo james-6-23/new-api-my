@@ -96,6 +96,13 @@ type ExportJobCreateRequest struct {
 	ShardMaxBytes     int64                      `json:"shard_max_bytes"`
 	DeleteAfterExport bool                       `json:"delete_after_export"`
 	S3Upload          bool                       `json:"s3_upload"`
+	// Trigger annotates how the job was started: "manual" (default) or "auto".
+	// Used for filename generation and audit/observability only.
+	Trigger string `json:"trigger,omitempty"`
+	// OutputRoot overrides the export directory (e.g. the auto-export watcher
+	// writes into a dedicated subdirectory). When empty, settings.ExportDirectory
+	// is used.
+	OutputRoot string `json:"output_root,omitempty"`
 }
 
 var (
@@ -145,7 +152,11 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 	}
 	jobID := uuid.NewString()
 	now := common.GetTimestamp()
-	outputDir := filepath.Join(settings.ExportDirectory, jobID)
+	exportRoot := settings.ExportDirectory
+	if strings.TrimSpace(req.OutputRoot) != "" {
+		exportRoot = req.OutputRoot
+	}
+	outputDir := filepath.Join(exportRoot, jobID)
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
 	}
@@ -163,6 +174,7 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 		Status:            model.ConversationExportJobStatusPending,
 		BatchId:           jobID,
 		OutputDirectory:   outputDir,
+		Trigger:           req.Trigger,
 	}
 	if err := model.CreateConversationExportJob(job); err != nil {
 		_ = os.RemoveAll(outputDir)
@@ -272,6 +284,8 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	state := &shardWriterState{
 		jobID:           job.JobId,
 		mode:            job.Mode,
+		trigger:         job.Trigger,
+		createdAt:       job.CreatedAt,
 		outputDir:       job.OutputDirectory,
 		tmpDir:          tmpDir,
 		shardTargetBytes: job.ShardTargetBytes,
@@ -360,6 +374,8 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 type shardWriterState struct {
 	jobID            string
 	mode             string
+	trigger          string
+	createdAt        int64
 	outputDir        string
 	tmpDir           string
 	shardTargetBytes int64
@@ -431,8 +447,12 @@ func (s *shardWriterState) closeCurrentShard() error {
 		return nil
 	}
 	s.currentIndex++
-	shardName := fmt.Sprintf("shard-%04d", s.currentIndex)
-	tarPath := filepath.Join(s.outputDir, shardName+".tar.gz")
+	// Two names: the human-readable file name written to disk, and the short
+	// directory name embedded inside the tar (kept stable across renames so
+	// downstream tools indexing by directory keep working).
+	innerName := fmt.Sprintf("shard-%04d", s.currentIndex)
+	fileBase := buildShardFilename(s.jobID, s.mode, s.trigger, s.createdAt, s.currentIndex)
+	tarPath := filepath.Join(s.outputDir, fileBase+".tar.gz")
 
 	// 1. Hash the data.jsonl bytes.
 	hash := sha256.Sum256(s.currentBuffer)
@@ -460,8 +480,8 @@ func (s *shardWriterState) closeCurrentShard() error {
 	}
 
 	// 3. Write tar.gz atomically: write to .tmp/, then rename.
-	tmpTarPath := filepath.Join(s.tmpDir, shardName+".tar.gz")
-	if err := writeShardTarGz(tmpTarPath, shardName, s.currentBuffer, manifestBytes); err != nil {
+	tmpTarPath := filepath.Join(s.tmpDir, fileBase+".tar.gz")
+	if err := writeShardTarGz(tmpTarPath, innerName, s.currentBuffer, manifestBytes); err != nil {
 		return err
 	}
 	compressedInfo, err := os.Stat(tmpTarPath)
@@ -771,12 +791,58 @@ func ServeShardFile(job *model.ConversationExportJob, shardIndex int) (string, e
 	if shardIndex <= 0 {
 		return "", fmt.Errorf("invalid shard index")
 	}
-	name := fmt.Sprintf("shard-%04d.tar.gz", shardIndex)
-	full := filepath.Join(job.OutputDirectory, name)
-	if _, err := os.Stat(full); err != nil {
-		return "", err
+	// Try the human-readable name first (current scheme), then fall back to
+	// the legacy "shard-%04d.tar.gz" so jobs created before the rename still
+	// download.
+	candidates := []string{
+		buildShardFilename(job.JobId, job.Mode, job.Trigger, job.CreatedAt, shardIndex) + ".tar.gz",
+		fmt.Sprintf("shard-%04d.tar.gz", shardIndex),
 	}
-	return full, nil
+	for _, name := range candidates {
+		full := filepath.Join(job.OutputDirectory, name)
+		if _, err := os.Stat(full); err == nil {
+			return full, nil
+		}
+	}
+	// Last-resort: scan the directory for any "*shard{NNNN}*.tar.gz" file. This
+	// catches future renames or operator-side renames without breaking downloads.
+	pattern := fmt.Sprintf("*shard%04d*.tar.gz", shardIndex)
+	matches, _ := filepath.Glob(filepath.Join(job.OutputDirectory, pattern))
+	if len(matches) > 0 {
+		return matches[0], nil
+	}
+	return "", fmt.Errorf("shard %d not found", shardIndex)
+}
+
+// buildShardFilename produces a human-readable, well-collated tar.gz base name.
+//
+// Format: conversation-logs-{mode}-{trigger}-{yyyymmddTHHMMSS}-{shortJobID}-shard{NNNN}
+//
+// Example: conversation-logs-api-auto-20260525T091230-a1b2c3d4-shard0001.tar.gz
+//
+// `mode` is shortened (api / session) for brevity. `trigger` defaults to "manual"
+// when empty so the filename is unambiguous.
+func buildShardFilename(jobID, mode, trigger string, createdAt int64, shardIndex int) string {
+	modeTag := "mode"
+	switch mode {
+	case conversation_log_setting.ExportModeAPIHijackJSONL:
+		modeTag = "api"
+	case conversation_log_setting.ExportModeSessionJSONL:
+		modeTag = "session"
+	}
+	triggerTag := strings.TrimSpace(trigger)
+	if triggerTag == "" {
+		triggerTag = "manual"
+	}
+	ts := "00000000T000000"
+	if createdAt > 0 {
+		ts = time.Unix(createdAt, 0).UTC().Format("20060102T150405")
+	}
+	short := jobID
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return fmt.Sprintf("conversation-logs-%s-%s-%s-%s-shard%04d", modeTag, triggerTag, ts, short, shardIndex)
 }
 
 // DeleteExportJobArtifacts wipes the on-disk directory for a job (used by
