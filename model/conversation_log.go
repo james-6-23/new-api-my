@@ -165,48 +165,61 @@ func GetConversationLogs(query ConversationLogQuery, startIdx int, num int) ([]*
 }
 
 func GetConversationLogSummary() (ConversationLogSummary, error) {
+	// Fold all aggregate columns into a single SELECT — five separate full
+	// table scans on a 50 GiB log table can keep the UI hanging for minutes.
+	// The CASE-based conditional sums work identically across SQLite, MySQL,
+	// and PostgreSQL.
 	summary := ConversationLogSummary{}
-	var sum sql.NullInt64
-	if err := LOG_DB.Model(&ConversationLog{}).Select("COALESCE(SUM(storage_bytes), 0)").Scan(&sum).Error; err != nil {
-		return summary, err
-	}
-	summary.StorageBytes = sum.Int64
-	if err := LOG_DB.Model(&ConversationLog{}).Count(&summary.RecordCount).Error; err != nil {
-		return summary, err
-	}
-	if err := LOG_DB.Model(&ConversationLog{}).Where("exported_at > ?", 0).Count(&summary.ExportedCount).Error; err != nil {
-		return summary, err
-	}
-	if err := LOG_DB.Model(&ConversationLog{}).Where("validation_status = ?", "valid").Count(&summary.ExportableAPICount).Error; err != nil {
-		return summary, err
-	}
-	if err := LOG_DB.Model(&ConversationLog{}).Where("validation_status <> ? OR validation_status = ?", "valid", "").Count(&summary.InvalidCount).Error; err != nil {
-		return summary, err
-	}
-	var bounds struct {
-		EarliestCreatedAt sql.NullInt64 `gorm:"column:earliest_created_at"`
-		LatestCreatedAt   sql.NullInt64 `gorm:"column:latest_created_at"`
+	var row struct {
+		StorageBytes       sql.NullInt64 `gorm:"column:storage_bytes"`
+		RecordCount        sql.NullInt64 `gorm:"column:record_count"`
+		ExportedCount      sql.NullInt64 `gorm:"column:exported_count"`
+		ExportableAPICount sql.NullInt64 `gorm:"column:exportable_api_count"`
+		InvalidCount       sql.NullInt64 `gorm:"column:invalid_count"`
+		EarliestCreatedAt  sql.NullInt64 `gorm:"column:earliest_created_at"`
+		LatestCreatedAt    sql.NullInt64 `gorm:"column:latest_created_at"`
 	}
 	if err := LOG_DB.Model(&ConversationLog{}).
-		Select("COALESCE(MIN(created_at), 0) AS earliest_created_at, COALESCE(MAX(created_at), 0) AS latest_created_at").
-		Scan(&bounds).Error; err != nil {
+		Select(`
+			COALESCE(SUM(storage_bytes), 0) AS storage_bytes,
+			COUNT(*) AS record_count,
+			SUM(CASE WHEN exported_at > 0 THEN 1 ELSE 0 END) AS exported_count,
+			SUM(CASE WHEN validation_status = 'valid' THEN 1 ELSE 0 END) AS exportable_api_count,
+			SUM(CASE WHEN validation_status <> 'valid' OR validation_status = '' THEN 1 ELSE 0 END) AS invalid_count,
+			COALESCE(MIN(created_at), 0) AS earliest_created_at,
+			COALESCE(MAX(created_at), 0) AS latest_created_at
+		`).
+		Scan(&row).Error; err != nil {
 		return summary, err
 	}
-	summary.EarliestCreatedAt = bounds.EarliestCreatedAt.Int64
-	summary.LatestCreatedAt = bounds.LatestCreatedAt.Int64
+	summary.StorageBytes = row.StorageBytes.Int64
+	summary.RecordCount = row.RecordCount.Int64
+	summary.ExportedCount = row.ExportedCount.Int64
+	summary.ExportableAPICount = row.ExportableAPICount.Int64
+	summary.InvalidCount = row.InvalidCount.Int64
+	summary.EarliestCreatedAt = row.EarliestCreatedAt.Int64
+	summary.LatestCreatedAt = row.LatestCreatedAt.Int64
 	return summary, nil
 }
 
 // CountEligibleConversationLogs returns (records, distinct_sessions) for
 // validation_status = "valid" rows matching the query. Used by export jobs
 // that need totals without instantiating every row in memory.
-func CountEligibleConversationLogs(ctx context.Context, query ConversationLogQuery) (int64, int64, error) {
+//
+// distinct_sessions is computed only when countSessions is true — a
+// COUNT(DISTINCT session_id) is expensive on multi-GiB tables (no index on
+// the derived value), so callers in API hijack mode should opt out.
+func CountEligibleConversationLogs(ctx context.Context, query ConversationLogQuery, countSessions bool) (int64, int64, error) {
 	db := conversationLogDBWithContext(ctx).Model(&ConversationLog{})
 	db = applyConversationLogQuery(db, query).Where("validation_status = ?", "valid")
 
 	var records int64
 	if err := db.Count(&records).Error; err != nil {
 		return 0, 0, err
+	}
+
+	if !countSessions {
+		return records, 0, nil
 	}
 
 	// distinct session_id count, ignoring empty session ids.

@@ -362,11 +362,12 @@ func BuildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	// in-memory walk entirely and only return DB-side counts. The UI still
 	// gets the headline numbers it cares about (eligible records / sessions);
 	// callers that need per-reason breakdowns must narrow their filter first.
-	records, sessions, cerr := model.CountEligibleConversationLogs(ctx, query)
+	needSessions := mode == conversation_log_setting.ExportModeSessionJSONL
+	records, sessions, cerr := model.CountEligibleConversationLogs(ctx, query, needSessions)
 	if cerr == nil && records > summaryTotalRecordsCap {
 		summary.TotalCapturedRecords = records
 		summary.APIExportableRecords = records
-		if mode == conversation_log_setting.ExportModeSessionJSONL {
+		if needSessions {
 			summary.TotalSessions = sessions
 			summary.SessionExportableSessions = sessions
 		}
@@ -413,7 +414,7 @@ func BuildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	}
 	if mode == conversation_log_setting.ExportModeSessionJSONL {
 		if overflowed {
-			_, sessionsCount, cerr2 := model.CountEligibleConversationLogs(ctx, query)
+			_, sessionsCount, cerr2 := model.CountEligibleConversationLogs(ctx, query, true)
 			if cerr2 == nil {
 				summary.TotalSessions = sessionsCount
 				summary.SessionExportableSessions = sessionsCount

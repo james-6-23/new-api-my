@@ -275,7 +275,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	// Cheap totals so the operator UI can show "exported / total" without
 	// loading every row into memory. Use the DB to count, not in-memory
 	// iteration — for a 50 GiB log table the latter OOMs the process.
-	recordsEligible, sessionsEligible, err := model.CountEligibleConversationLogs(ctx, query)
+	// Distinct session count is only needed for session-mode exports.
+	needSessions := job.Mode == conversation_log_setting.ExportModeSessionJSONL
+	recordsEligible, sessionsEligible, err := model.CountEligibleConversationLogs(ctx, query, needSessions)
 	if err != nil {
 		return fmt.Errorf("count eligible conversation logs: %w", err)
 	}
