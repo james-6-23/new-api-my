@@ -15,6 +15,7 @@ import {
   Form,
   Modal,
   Popconfirm,
+  Progress,
   Space,
   Spin,
   Table,
@@ -62,6 +63,31 @@ function statusTag(status, t) {
   };
   const cfg = map[status] || { color: 'grey', text: status };
   return <Tag color={cfg.color}>{cfg.text}</Tag>;
+}
+
+// computeJobPercent infers a 0-100 progress hint from whatever the backend
+// has reported. Prefers records, falls back to bytes, falls back to status
+// (running ⇒ small non-zero so the bar shows movement; completed ⇒ 100).
+function computeJobPercent(job) {
+  if (!job) return 0;
+  if (job.status === 'completed') return 100;
+  if (job.status === 'failed' || job.status === 'cancelled') {
+    if (job.total_records > 0 && job.exported_records > 0) {
+      return Math.min(
+        100,
+        Math.round((job.exported_records / job.total_records) * 100),
+      );
+    }
+    return 0;
+  }
+  if (job.total_records > 0) {
+    return Math.min(
+      99,
+      Math.round((job.exported_records / job.total_records) * 100),
+    );
+  }
+  if (job.status === 'running') return 1;
+  return 0;
 }
 
 const modeOptions = [
@@ -277,7 +303,34 @@ const ExportJobs = () => {
     {
       title: t('进度'),
       dataIndex: 'progress',
-      ellipsis: true,
+      width: 220,
+      render: (text, record) => {
+        const percent = computeJobPercent(record);
+        return (
+          <div className='flex flex-col gap-1'>
+            <Progress
+              percent={percent}
+              showInfo
+              size='small'
+              stroke={
+                record.status === 'failed'
+                  ? 'var(--semi-color-danger)'
+                  : record.status === 'cancelled'
+                    ? 'var(--semi-color-warning)'
+                    : undefined
+              }
+            />
+            <Text
+              type='tertiary'
+              size='small'
+              ellipsis={{ showTooltip: true }}
+              style={{ maxWidth: 200 }}
+            >
+              {text || '-'}
+            </Text>
+          </div>
+        );
+      },
     },
     {
       title: t('分片'),
@@ -464,6 +517,31 @@ const ExportJobs = () => {
       >
         {detail && (
           <div className='flex flex-col gap-4'>
+            <div className='flex flex-col gap-1'>
+              <Text type='tertiary' size='small'>
+                {t('总进度')}
+              </Text>
+              <Progress
+                percent={computeJobPercent(detail)}
+                showInfo
+                stroke={
+                  detail.status === 'failed'
+                    ? 'var(--semi-color-danger)'
+                    : detail.status === 'cancelled'
+                      ? 'var(--semi-color-warning)'
+                      : undefined
+                }
+              />
+              <Text type='tertiary' size='small'>
+                {detail.exported_records || 0}
+                {detail.total_records > 0
+                  ? ` / ${detail.total_records}`
+                  : ''}{' '}
+                {t('条记录')} · {formatBytes(detail.uncompressed_bytes)}{' '}
+                {t('原始')} · {formatBytes(detail.compressed_bytes)}{' '}
+                {t('压缩后')}
+              </Text>
+            </div>
             <Descriptions
               data={[
                 { key: 'Job ID', value: detail.job_id },

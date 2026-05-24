@@ -2,12 +2,14 @@ package service
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -282,14 +284,15 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	defer os.RemoveAll(tmpDir)
 
 	state := &shardWriterState{
-		jobID:           job.JobId,
-		mode:            job.Mode,
-		trigger:         job.Trigger,
-		createdAt:       job.CreatedAt,
-		outputDir:       job.OutputDirectory,
-		tmpDir:          tmpDir,
-		shardTargetBytes: job.ShardTargetBytes,
-		shardMaxBytes:    job.ShardMaxBytes,
+		jobID:             job.JobId,
+		mode:              job.Mode,
+		trigger:           job.Trigger,
+		createdAt:         job.CreatedAt,
+		outputDir:         job.OutputDirectory,
+		tmpDir:            tmpDir,
+		shardTargetBytes:  job.ShardTargetBytes,
+		shardMaxBytes:     job.ShardMaxBytes,
+		deleteAfterExport: job.DeleteAfterExport,
 	}
 
 	var processErr error
@@ -304,17 +307,6 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 
 	if err := state.closeCurrentShard(); err != nil {
 		return err
-	}
-
-	// Mark all exported records as exported (per shard already attempted; this
-	// is a final sweep in case any were missed).
-	if len(state.allExportedIDs) > 0 {
-		exportedAt := common.GetTimestamp()
-		for _, chunk := range chunkIntsForExport(state.allExportedIDs, 200) {
-			if err := model.MarkConversationLogsExported(chunk, job.JobId, exportedAt); err != nil {
-				common.SysError("mark exported (final): " + err.Error())
-			}
-		}
 	}
 
 	// Write top-level manifest.
@@ -359,31 +351,33 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		"progress":           fmt.Sprintf("done: %d shard(s), %d record(s)", len(state.shards), state.totalRecordCount),
 	})
 
-	if job.DeleteAfterExport && len(state.allExportedIDs) > 0 {
-		for _, chunk := range chunkIntsForExport(state.allExportedIDs, 200) {
-			if _, err := model.DeleteConversationLogsByIDs(chunk); err != nil {
-				common.SysError("delete after export: " + err.Error())
-			}
-		}
-	}
-
 	return nil
 }
 
 // shardWriterState carries all per-job mutable state.
+//
+// To bound memory at >10 GiB shard sizes, the in-progress JSONL is streamed to
+// a temp file on disk (bufio-buffered, hash computed inline). closeCurrentShard
+// then streams that file into the tar.gz without ever holding the full payload
+// in RAM.
 type shardWriterState struct {
-	jobID            string
-	mode             string
-	trigger          string
-	createdAt        int64
-	outputDir        string
-	tmpDir           string
-	shardTargetBytes int64
-	shardMaxBytes    int64
+	jobID             string
+	mode              string
+	trigger           string
+	createdAt         int64
+	outputDir         string
+	tmpDir            string
+	shardTargetBytes  int64
+	shardMaxBytes     int64
+	deleteAfterExport bool
 
-	// Current shard accumulator
+	// Current shard accumulator (streaming).
 	currentIndex      int
-	currentBuffer     []byte
+	currentJSONLPath  string
+	currentJSONLFile  *os.File
+	currentJSONLBuf   *bufio.Writer
+	currentHasher     hash.Hash
+	currentSize       int64
 	currentRecordIDs  []int
 	currentRecordCnt  int64
 	currentSessionCnt int64
@@ -394,28 +388,56 @@ type shardWriterState struct {
 
 	// Job totals
 	shards            []TopManifestShard
-	allExportedIDs    []int
 	totalRecordCount  int64
 	totalSessionCount int64
 	totalUncompressed int64
 	totalCompressed   int64
+
+	// Progress throttling
+	lastProgressAt time.Time
+}
+
+// ensureCurrentShard opens the streaming temp file lazily on the first
+// appendLine of a new shard.
+func (s *shardWriterState) ensureCurrentShard() error {
+	if s.currentJSONLFile != nil {
+		return nil
+	}
+	// Use a stable temp name keyed on the current shard *number that this file
+	// will become*. The shard index is incremented inside closeCurrentShard so
+	// the file produced by appends 1..N becomes shard {nextIndex}.
+	tmpName := fmt.Sprintf("shard-pending-%04d.jsonl", s.currentIndex+1)
+	path := filepath.Join(s.tmpDir, tmpName)
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	s.currentJSONLPath = path
+	s.currentJSONLFile = f
+	s.currentJSONLBuf = bufio.NewWriterSize(f, 1<<20) // 1 MiB
+	s.currentHasher = sha256.New()
+	s.currentSize = 0
+	return nil
 }
 
 // wouldOverflowMax reports whether appending lineBytes to the current shard
 // would exceed shard_max_bytes.
 func (s *shardWriterState) wouldOverflowMax(lineBytes int64) bool {
-	return int64(len(s.currentBuffer))+lineBytes > s.shardMaxBytes
+	return s.currentSize+lineBytes > s.shardMaxBytes
 }
 
 // shouldRotateAfter reports whether we should close the shard *after* appending,
 // i.e. we've reached the soft target.
 func (s *shardWriterState) shouldRotateAfter() bool {
-	return int64(len(s.currentBuffer)) >= s.shardTargetBytes
+	return s.currentSize >= s.shardTargetBytes
 }
 
-// appendLine writes one JSONL line into the current shard's in-memory buffer.
+// appendLine streams one JSONL line into the current shard's temp file.
 // Caller must ensure overflow checks have been done.
-func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount int64, timeMin, timeMax int64) {
+func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount int64, timeMin, timeMax int64) error {
+	if err := s.ensureCurrentShard(); err != nil {
+		return err
+	}
 	if s.currentRecordCnt == 0 {
 		s.currentTimeMin = timeMin
 		s.currentTimeMax = timeMax
@@ -433,31 +455,76 @@ func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount
 	if len(recordIDs) > 0 {
 		s.currentLastID = recordIDs[len(recordIDs)-1]
 	}
-	s.currentBuffer = append(s.currentBuffer, line...)
-	s.currentBuffer = append(s.currentBuffer, '\n')
+	mw := io.MultiWriter(s.currentJSONLBuf, s.currentHasher)
+	if _, err := mw.Write(line); err != nil {
+		return err
+	}
+	if _, err := mw.Write([]byte{'\n'}); err != nil {
+		return err
+	}
+	s.currentSize += int64(len(line)) + 1
 	s.currentRecordCnt += int64(len(recordIDs))
 	s.currentSessionCnt += sessionCount
 	s.currentRecordIDs = append(s.currentRecordIDs, recordIDs...)
+	return nil
 }
 
-// closeCurrentShard packages the in-memory buffer into a tar.gz, computes SHA256,
-// marks records exported, and resets state for the next shard.
+// maybePushProgress refreshes job progress fields in the DB at most once every
+// few seconds — frequent enough for a live progress bar but cheap enough that
+// it doesn't dominate export time.
+func (s *shardWriterState) maybePushProgress(force bool) {
+	if !force && time.Since(s.lastProgressAt) < 3*time.Second {
+		return
+	}
+	s.lastProgressAt = time.Now()
+	uncompressed := s.totalUncompressed + s.currentSize
+	records := s.totalRecordCount + s.currentRecordCnt
+	updateJobProgress(s.jobID, map[string]interface{}{
+		"shard_count":        len(s.shards),
+		"exported_records":   records,
+		"exported_sessions":  s.totalSessionCount + s.currentSessionCnt,
+		"uncompressed_bytes": uncompressed,
+		"compressed_bytes":   s.totalCompressed,
+		"progress": fmt.Sprintf(
+			"writing shard %d: %d records, %.2f GiB",
+			s.currentIndex+1,
+			s.currentRecordCnt,
+			float64(s.currentSize)/(1<<30),
+		),
+	})
+}
+
+// closeCurrentShard finalises the temp .jsonl file, packs it (streaming) into
+// a tar.gz next to its manifest, and resets shard state.
 func (s *shardWriterState) closeCurrentShard() error {
-	if len(s.currentBuffer) == 0 {
+	if s.currentJSONLFile == nil || s.currentSize == 0 {
+		// Either there's nothing to flush, or appendLine was never called for
+		// this shard. Defensive: clean up an empty temp file if one exists.
+		if s.currentJSONLFile != nil {
+			_ = s.currentJSONLBuf.Flush()
+			_ = s.currentJSONLFile.Close()
+			_ = os.Remove(s.currentJSONLPath)
+			s.currentJSONLFile = nil
+			s.currentJSONLBuf = nil
+		}
 		return nil
 	}
+
+	// 1. Flush and close the temp jsonl.
+	if err := s.currentJSONLBuf.Flush(); err != nil {
+		return err
+	}
+	if err := s.currentJSONLFile.Close(); err != nil {
+		return err
+	}
+
 	s.currentIndex++
-	// Two names: the human-readable file name written to disk, and the short
-	// directory name embedded inside the tar (kept stable across renames so
-	// downstream tools indexing by directory keep working).
 	innerName := fmt.Sprintf("shard-%04d", s.currentIndex)
 	fileBase := buildShardFilename(s.jobID, s.mode, s.trigger, s.createdAt, s.currentIndex)
 	tarPath := filepath.Join(s.outputDir, fileBase+".tar.gz")
 
-	// 1. Hash the data.jsonl bytes.
-	hash := sha256.Sum256(s.currentBuffer)
-	dataSHA := hex.EncodeToString(hash[:])
-	uncompressed := int64(len(s.currentBuffer))
+	dataSHA := hex.EncodeToString(s.currentHasher.Sum(nil))
+	uncompressed := s.currentSize
 
 	// 2. Build shard manifest.
 	shardManifest := ShardManifest{
@@ -479,9 +546,9 @@ func (s *shardWriterState) closeCurrentShard() error {
 		return err
 	}
 
-	// 3. Write tar.gz atomically: write to .tmp/, then rename.
+	// 3. Stream the temp .jsonl into tar.gz, then atomically rename.
 	tmpTarPath := filepath.Join(s.tmpDir, fileBase+".tar.gz")
-	if err := writeShardTarGz(tmpTarPath, innerName, s.currentBuffer, manifestBytes); err != nil {
+	if err := streamShardTarGz(tmpTarPath, innerName, s.currentJSONLPath, uncompressed, manifestBytes); err != nil {
 		return err
 	}
 	compressedInfo, err := os.Stat(tmpTarPath)
@@ -491,8 +558,12 @@ func (s *shardWriterState) closeCurrentShard() error {
 	if err := os.Rename(tmpTarPath, tarPath); err != nil {
 		return err
 	}
+	// 4. Drop the temp jsonl now that it's fully captured in the tar.gz.
+	_ = os.Remove(s.currentJSONLPath)
 
-	// 4. Mark records exported only after the file exists on disk.
+	// 5. Mark records exported only after the file exists on disk. If
+	// delete_after_export was requested, also wipe the source rows now (rather
+	// than at the end of the job) so RAM and DB pressure are released per shard.
 	if len(s.currentRecordIDs) > 0 {
 		exportedAt := common.GetTimestamp()
 		for _, chunk := range chunkIntsForExport(s.currentRecordIDs, 200) {
@@ -500,10 +571,16 @@ func (s *shardWriterState) closeCurrentShard() error {
 				common.SysError("mark exported (shard close): " + err.Error())
 			}
 		}
-		s.allExportedIDs = append(s.allExportedIDs, s.currentRecordIDs...)
+		if s.deleteAfterExport {
+			for _, chunk := range chunkIntsForExport(s.currentRecordIDs, 200) {
+				if _, err := model.DeleteConversationLogsByIDs(chunk); err != nil {
+					common.SysError("delete after export (shard close): " + err.Error())
+				}
+			}
+		}
 	}
 
-	// 5. Record the shard in the job's shard list.
+	// 6. Record the shard in the job's shard list.
 	s.shards = append(s.shards, TopManifestShard{
 		Index:             s.currentIndex,
 		File:              filepath.Base(tarPath),
@@ -522,7 +599,7 @@ func (s *shardWriterState) closeCurrentShard() error {
 	s.totalUncompressed += uncompressed
 	s.totalCompressed += compressedInfo.Size()
 
-	// 6. Update DB progress so the operator's polling reflects the new shard.
+	// 7. Update DB progress so the operator's polling reflects the new shard.
 	updateJobProgress(s.jobID, map[string]interface{}{
 		"shard_count":        len(s.shards),
 		"exported_records":   s.totalRecordCount,
@@ -531,9 +608,14 @@ func (s *shardWriterState) closeCurrentShard() error {
 		"compressed_bytes":   s.totalCompressed,
 		"progress":           fmt.Sprintf("shard %d closed (%d records, %.2f GiB uncompressed)", s.currentIndex, s.currentRecordCnt, float64(s.totalUncompressed)/(1<<30)),
 	})
+	s.lastProgressAt = time.Now()
 
-	// 7. Reset for next shard.
-	s.currentBuffer = nil
+	// 8. Reset for next shard.
+	s.currentJSONLFile = nil
+	s.currentJSONLBuf = nil
+	s.currentJSONLPath = ""
+	s.currentHasher = nil
+	s.currentSize = 0
 	s.currentRecordIDs = nil
 	s.currentRecordCnt = 0
 	s.currentSessionCnt = 0
@@ -544,40 +626,55 @@ func (s *shardWriterState) closeCurrentShard() error {
 	return nil
 }
 
-func writeShardTarGz(path, shardName string, dataJSONL, shardManifestJSON []byte) error {
-	f, err := os.Create(path)
+// streamShardTarGz writes a tar.gz containing data.jsonl (streamed from
+// jsonlPath) and shard-manifest.json. The tar header carries the precomputed
+// uncompressed size, so we never have to load the whole jsonl into memory.
+func streamShardTarGz(tarPath, shardName, jsonlPath string, jsonlSize int64, shardManifestJSON []byte) error {
+	in, err := os.Open(jsonlPath)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer in.Close()
 
-	gz := gzip.NewWriter(f)
+	out, err := os.Create(tarPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	gz := gzip.NewWriter(out)
 	defer gz.Close()
 
 	tw := tar.NewWriter(gz)
 	defer tw.Close()
 
 	now := time.Now()
-	files := []struct {
-		name string
-		data []byte
-	}{
-		{shardName + "/data.jsonl", dataJSONL},
-		{shardName + "/shard-manifest.json", shardManifestJSON},
+
+	// data.jsonl (streamed)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:    shardName + "/data.jsonl",
+		Mode:    0o644,
+		Size:    jsonlSize,
+		ModTime: now,
+	}); err != nil {
+		return err
 	}
-	for _, f := range files {
-		hdr := &tar.Header{
-			Name:    f.name,
-			Mode:    0o644,
-			Size:    int64(len(f.data)),
-			ModTime: now,
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-		if _, err := tw.Write(f.data); err != nil {
-			return err
-		}
+	buf := make([]byte, 1<<20) // 1 MiB copy buffer
+	if _, err := io.CopyBuffer(tw, in, buf); err != nil {
+		return err
+	}
+
+	// shard-manifest.json (small, bytes)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:    shardName + "/shard-manifest.json",
+		Mode:    0o644,
+		Size:    int64(len(shardManifestJSON)),
+		ModTime: now,
+	}); err != nil {
+		return err
+	}
+	if _, err := tw.Write(shardManifestJSON); err != nil {
+		return err
 	}
 	return nil
 }
@@ -609,13 +706,16 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 					return err
 				}
 			}
-			state.appendLine(line, []int{item.Id}, 0, item.RequestTime, item.ResponseTime)
+			if err := state.appendLine(line, []int{item.Id}, 0, item.RequestTime, item.ResponseTime); err != nil {
+				return err
+			}
 			if state.shouldRotateAfter() {
 				if err := state.closeCurrentShard(); err != nil {
 					return err
 				}
 			}
 		}
+		state.maybePushProgress(false)
 		return nil
 	})
 }
@@ -661,7 +761,9 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 		if lineLen > state.shardMaxBytes {
 			common.SysLog(fmt.Sprintf("export job: session %s exceeds shard_max_bytes (%d > %d), shard will be oversize", sessionID, lineLen, state.shardMaxBytes))
 		}
-		state.appendLine(line, candidate.RecordIDs, 1, entry.earliestReqTS, entry.latestReqTS)
+		if err := state.appendLine(line, candidate.RecordIDs, 1, entry.earliestReqTS, entry.latestReqTS); err != nil {
+			return err
+		}
 		if state.shouldRotateAfter() {
 			if err := state.closeCurrentShard(); err != nil {
 				return err
@@ -734,11 +836,17 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 				entry.latestReqTS = item.ResponseTime
 			}
 		}
-		return flushStable()
+		if err := flushStable(); err != nil {
+			return err
+		}
+		state.maybePushProgress(false)
+		return nil
 	})
 	if err != nil {
 		return err
 	}
+
+	state.maybePushProgress(true)
 
 	// End-of-scan: flush everything that's left.
 	remaining := make([]string, 0, len(pending))
