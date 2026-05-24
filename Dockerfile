@@ -28,12 +28,36 @@ ENV GOEXPERIMENT=greenteagc
 
 WORKDIR /build
 
+# Module download is its own layer so it only re-runs when go.mod / go.sum
+# change — independent of every other source file in the repo.
 ADD go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+# Copy only the directories that the Go binary actually compiles in. Doing
+# this granularly (instead of `COPY . .`) keeps the build cache from being
+# invalidated by edits under web/, docs/, .github/, etc.
+COPY main.go VERSION ./
+COPY common/ ./common/
+COPY constant/ ./constant/
+COPY controller/ ./controller/
+COPY dto/ ./dto/
+COPY i18n/ ./i18n/
+COPY logger/ ./logger/
+COPY middleware/ ./middleware/
+COPY model/ ./model/
+COPY oauth/ ./oauth/
+COPY pkg/ ./pkg/
+COPY relay/ ./relay/
+COPY router/ ./router/
+COPY service/ ./service/
+COPY setting/ ./setting/
+COPY types/ ./types/
+
+# Web bundles produced by the two front-end builder stages above. They land
+# under the //go:embed paths the binary expects.
 COPY --from=builder /build/dist ./web/default/dist
 COPY --from=builder-classic /build/dist ./web/classic/dist
+
 RUN go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$(cat VERSION)'" -o new-api
 
 FROM debian:bookworm-slim@sha256:f06537653ac770703bc45b4b113475bd402f451e85223f0f2837acbf89ab020a
