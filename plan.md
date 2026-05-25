@@ -1,11 +1,11 @@
-# traj v2.0 Strict Conversation Data Implementation Plan
+# traj v3.0 Strict Conversation Data Implementation Plan
 
-This plan replaces the earlier conversation-log draft. The source of truth is the two local reference PDFs:
+This plan replaces the earlier conversation-log draft. The source of truth is the current standard PDF plus the local format reference:
 
-- `demo/traj 标准 v2.0（勿外传）.pdf`
+- `demo/traj 标准 v3.0.pdf`
 - `demo/traj 格式参考（勿外传）.pdf`
 
-Goal: implement conversation data capture and export in `new-api` so the delivered data follows the traj v2.0 requirements strictly. Internal storage may contain extra debugging fields, but strict export files must use the PDF-defined schema and quality gates.
+Goal: implement conversation data capture and export in `new-api` so the delivered data follows the traj v3.0 requirements strictly. Internal storage may contain extra debugging fields, but strict export files must use the PDF-defined schema, quality gates, and delivery packaging rules.
 
 Protected project identity reminder: do not rename, remove, or replace `new-api`, `nеw-аρi`, `QuаntumΝоuѕ`, or the Go module path `github.com/QuantumNous/new-api`.
 
@@ -15,18 +15,23 @@ Protected project identity reminder: do not rename, remove, or replace `new-api`
 
 ### 1.1 Delivery formats
 
-The reference accepts:
+The v3.0 standard requires:
 
-- Preferred: Parquet.
-- Accepted: JSONL.
+- Accepted data files: `.json` or `.jsonl`.
 - Encoding for JSON/JSONL: UTF-8.
 - Every JSON record must be valid and parseable.
+- Transport package: `tar.gz`.
+- Normalized package paths; complex directory layouts must include path explanations.
+
+The format reference also mentions Parquet as preferred when available, but JSONL remains accepted.
 
 Implementation decision:
 
-- First implement JSONL export because it fits the current Go stack and admin export flow.
+- First implement JSONL data files because they fit the current Go stack and admin export flow.
+- Treat async export jobs as the formal delivery path: each shard is a `.tar.gz` containing `data.jsonl`, `shard-manifest.json`, and `path-manifest.json`.
+- Keep direct `.jsonl` downloads only as a small-sample/debug preview, not as the formal v3.0 delivery package.
 - Design exporter interfaces so Parquet can be added later without changing capture/storage contracts.
-- S3-compatible upload is optional transport only. It must upload strict JSONL/Parquet files, not a custom internal schema.
+- S3-compatible upload is optional transport only. It must upload strict tar.gz delivery packages and manifest files, not a custom internal schema.
 
 ### 1.2 Two data granularities
 
@@ -39,15 +44,15 @@ Implementation decision:
 
 - Capture raw API records first.
 - Export two modes:
-  - `api_hijack_jsonl`: strict request-body records.
-  - `session_jsonl`: normalized session trajectories derived from captured records.
+- `session_jsonl`: normalized session trajectories derived from captured records. This is the default for formal delivery.
+- `api_hijack_jsonl`: strict request-body records, kept for raw API capture analysis and preview/export diagnostics.
 - The admin UI should clearly label which export mode is being generated.
 
 ---
 
 ## 2. Demo Reference Analysis
 
-Two local demo projects are useful references, but neither is already a strict traj v2.0 implementation.
+Two local demo projects are useful references, but neither is already a strict traj v3.0 implementation.
 
 ### 2.1 `demo/new-api`: persistent ConversationLog implementation
 
@@ -449,7 +454,7 @@ Config should control:
 - max storage
 - export directory
 - optional S3 upload target
-- strict export mode default: `api_hijack_jsonl`
+- strict formal export mode default: `session_jsonl`
 
 Config must not add custom top-level fields to strict export.
 
@@ -586,6 +591,26 @@ Use concrete structs if the project does not already use interfaces in this area
 
 ## 10. Export Plan
 
+### Task 9.5: Formal tar.gz delivery package
+
+For traj v3.0 delivery, generated data must be transported as `tar.gz`.
+
+Each shard package must contain:
+
+- `shard-000N/data.jsonl`: canonical export data, one valid JSON record per line.
+- `shard-000N/shard-manifest.json`: record counts, byte counts, time range, record id range, and checksum.
+- `shard-000N/path-manifest.json`: package path explanation, data format, encoding, and notes.
+
+The top-level job output must also include `manifest.json` so operators can map each shard filename to its counts and checksum.
+
+Auto-export job directories should be operator-readable:
+
+```text
+data/conversation_exports/auto/session_jsonl-YYYYMMDDTHHMMSS-7810a11e/
+```
+
+The short job id suffix keeps names unique without forcing operators to identify jobs from a raw UUID directory.
+
 ### Task 10: Strict API JSONL exporter
 
 Output one JSON object per line:
@@ -640,13 +665,13 @@ This makes the admin UI honest about how much data is actually compliant.
 
 ### Task 13: Optional S3 upload
 
-S3 upload can stay, but it must upload files generated by Task 10 or Task 11.
+S3 upload can stay, but it must upload formal tar.gz shard packages generated by the export job plus the top-level manifest.
 
 Object key recommendation:
 
 ```text
-conversation-exports/{mode}/{yyyy-mm-dd}/{batch_id}.jsonl
-conversation-exports/{mode}/{yyyy-mm-dd}/{batch_id}.summary.json
+conversation-exports/{mode}/{yyyy-mm-dd}/{batch_id}/manifest.json
+conversation-exports/{mode}/{yyyy-mm-dd}/{batch_id}/conversation-logs-{mode}-{trigger}-{timestamp}-{job_id}-shard0001.tar.gz
 ```
 
 Do not upload DB-internal JSONL with custom fields as if it were traj-compliant.
@@ -666,9 +691,14 @@ Routes:
 - `GET /api/conversation_logs`
 - `GET /api/conversation_logs/:id`
 - `GET /api/conversation_logs/export_summary?mode=api_hijack_jsonl`
-- `GET /api/conversation_logs/export.jsonl?mode=api_hijack_jsonl`
-- `GET /api/conversation_logs/export.jsonl?mode=session_jsonl`
+- `GET /api/conversation_logs/export.jsonl?mode=api_hijack_jsonl` (debug/small-sample preview, not formal delivery)
+- `GET /api/conversation_logs/export.jsonl?mode=session_jsonl` (debug/small-sample preview, not formal delivery)
 - `POST /api/conversation_logs/export_and_delete`
+- `GET /api/conversation_logs/export_jobs`
+- `POST /api/conversation_logs/export_jobs`
+- `GET /api/conversation_logs/export_jobs/:id`
+- `GET /api/conversation_logs/export_jobs/:id/manifest`
+- `GET /api/conversation_logs/export_jobs/:id/shards/:n`
 - `DELETE /api/conversation_logs`
 - `PUT /api/conversation_logs/settings`
 
@@ -945,6 +975,10 @@ Use Browser verification for the local settings page after UI changes.
 ## 16. Acceptance Checklist
 
 - [ ] `api_hijack_jsonl` emits only `session_id`, `provider`, `request_body`, `response_body`, `request_time`, `response_time`.
+- [ ] Formal delivery artifacts are `.tar.gz` shard packages, not bare `.jsonl` downloads.
+- [ ] Each `.tar.gz` shard contains `data.jsonl`, `shard-manifest.json`, and `path-manifest.json`.
+- [ ] `path-manifest.json` explains all package paths, data format, and UTF-8 encoding.
+- [ ] Top-level `manifest.json` maps shard filenames to counts, byte sizes, checksum, and path conventions.
 - [ ] `request_body` and `response_body` are complete parseable JSON strings.
 - [ ] Raw SSE is never emitted as strict `response_body`.
 - [ ] `request_body` contains `model`.
@@ -983,6 +1017,7 @@ The previous plan was not strict enough because it introduced a custom traj-like
 - Session export now has explicit `tools` and `messages` requirements.
 - Quality gates now include effective turns, structured tool use, tool definitions, tool result pairing ratio, and duplicate/subsequence removal.
 - S3 is treated as optional delivery transport, not a data standard.
+- traj v3.0 delivery rules now require formal tar.gz packages and path explanations for packaged files.
 - `demo/new-api` is now documented as a persistence reference, not a schema reference.
 - `demo/new-api-radical` is now documented as a memory/temp-file/stream-buffering reference, not a durable storage reference.
 - UI target is now explicitly `web/classic`.

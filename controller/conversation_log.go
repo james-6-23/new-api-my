@@ -308,12 +308,13 @@ func conversationLogMode(value string) string {
 
 func exportConversationLogs(c *gin.Context, query model.ConversationLogQuery, mode string, deleteAfterExport bool) {
 	batchID := uuid.NewString()
-	fileName := fmt.Sprintf("conversation-logs-%s-%s.jsonl", mode, batchID)
+	fileName := fmt.Sprintf("conversation-logs-preview-%s-%s.jsonl", mode, batchID)
 	c.Header("Content-Type", "application/x-ndjson; charset=utf-8")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
 	c.Header("X-Conversation-Log-Batch-Id", batchID)
 	c.Header("X-Conversation-Log-Export-Mode", mode)
-	c.Header("Access-Control-Expose-Headers", "X-Conversation-Log-Batch-Id, X-Conversation-Log-Export-Mode")
+	c.Header("X-Conversation-Log-Delivery-Kind", "preview-jsonl")
+	c.Header("Access-Control-Expose-Headers", "X-Conversation-Log-Batch-Id, X-Conversation-Log-Export-Mode, X-Conversation-Log-Delivery-Kind")
 	c.Status(http.StatusOK)
 
 	exportedIDs, _, err := service.ExportConversationLogsJSONL(c.Request.Context(), c.Writer, query, mode)

@@ -196,8 +196,9 @@ func TestBuildGeminiSessionCandidatePairsFunctionResponseByName(t *testing.T) {
 }
 
 func TestValidateSessionTrajectoryRejectsLowPairingRatio(t *testing.T) {
+	toolParameters := `{"type":"object","properties":{"file_path":{"type":"string","description":"Path to read"}}}`
 	trajectory := SessionTrajectory{
-		Tools: []SessionTool{{Name: "Read", Parameters: "{}"}},
+		Tools: []SessionTool{{Name: "Read", Description: "Reads a file.", Parameters: toolParameters}},
 		Messages: []SessionMessage{
 			{Role: "user", Content: nullableString("read one")},
 			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", CallID: "call_1"}, {Name: "Read", CallID: "call_2"}}},
@@ -213,6 +214,43 @@ func TestValidateSessionTrajectoryRejectsLowPairingRatio(t *testing.T) {
 	trajectory.Messages[2].ToolCallID = nullableString("other_call")
 	reasons = validateSessionTrajectory(trajectory)
 	require.Contains(t, reasons, "tool_result_pairing_lt_0_5")
+}
+
+func TestValidateSessionTrajectoryRejectsIncompleteToolSchema(t *testing.T) {
+	trajectory := SessionTrajectory{
+		Tools: []SessionTool{{Name: "Read", Parameters: `{"type":"object"}`}},
+		Messages: []SessionMessage{
+			{Role: "user", Content: nullableString("read one")},
+			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", CallID: "call_1"}}},
+			{Role: "tool", Content: nullableString("one"), ToolCallID: nullableString("call_1")},
+			{Role: "user", Content: nullableString("summarize")},
+			{Role: "assistant", Content: nullableString("done")},
+		},
+	}
+
+	reasons := validateSessionTrajectory(trajectory)
+	require.Contains(t, reasons, "tool_schema_incomplete")
+	require.Contains(t, reasons, "tool_definition_missing")
+}
+
+func TestSessionSignatureMatchesPDFDuplicateScope(t *testing.T) {
+	messages := []SessionMessage{
+		{Role: "user", Content: nullableString("read main.go")},
+		{Role: "assistant", Thinking: nullableString("private chain"), ToolCalls: []SessionToolCall{{Name: "Read", Arguments: `{"file_path":"main.go"}`, CallID: "call_1"}}},
+		{Role: "tool", Content: nullableString("package main"), ToolCallID: nullableString("call_1")},
+		{Role: "assistant", Content: nullableString("done")},
+	}
+	a := SessionTrajectory{
+		SystemPrompt: nullableString("system"),
+		Tools:        []SessionTool{{Name: "Read", Description: "Reads a file.", Parameters: `{"type":"object"}`}},
+		Messages:     messages,
+	}
+	b := a
+	b.Tools = []SessionTool{{Name: "Read", Description: "Different schema text.", Parameters: `{"type":"object","properties":{"file_path":{"type":"string"}}}`}}
+	b.Messages = append([]SessionMessage(nil), messages...)
+	b.Messages[1].Thinking = nullableString("different reasoning")
+
+	require.Equal(t, sessionSignature(a), sessionSignature(b))
 }
 
 func TestFilterSessionCandidatesRemovesExactDuplicateAndSubsequence(t *testing.T) {

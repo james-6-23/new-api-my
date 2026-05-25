@@ -77,7 +77,7 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 
 	mode := settings.AutoExportMode
 	if !conversation_log_setting.IsValidExportMode(mode) {
-		mode = conversation_log_setting.ExportModeAPIHijackJSONL
+		mode = conversation_log_setting.ExportModeSessionJSONL
 	}
 	shardMax := settings.AutoExportShardMaxBytes
 	if shardMax <= 0 {

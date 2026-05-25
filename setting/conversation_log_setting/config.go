@@ -63,7 +63,7 @@ var conversationLogSetting = ConversationLogSetting{
 	RetentionDays:           30,
 	MaxStorageGB:            50,
 	ExportDirectory:         filepath.Join("data", "conversation_exports"),
-	DefaultExportMode:       ExportModeAPIHijackJSONL,
+	DefaultExportMode:       ExportModeSessionJSONL,
 	DefaultShardTargetBytes: defaultShardTargetBytes,
 	DefaultShardMaxBytes:    defaultShardMaxBytes,
 	ExportJobConcurrency:    1,
@@ -72,7 +72,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
 	AutoExportShardMaxBytes:        defaultAutoExportShardMaxBytes,
-	AutoExportMode:                 ExportModeAPIHijackJSONL,
+	AutoExportMode:                 ExportModeSessionJSONL,
 	AutoExportDirectory:            filepath.Join("data", "conversation_exports", "auto"),
 	AutoExportCheckIntervalSeconds: defaultAutoExportCheckInterval,
 	AutoExportDeleteAfter:          true,
@@ -94,7 +94,7 @@ func GetSetting() ConversationLogSetting {
 		setting.ExportDirectory = filepath.Join("data", "conversation_exports")
 	}
 	if !IsValidExportMode(setting.DefaultExportMode) {
-		setting.DefaultExportMode = ExportModeAPIHijackJSONL
+		setting.DefaultExportMode = ExportModeSessionJSONL
 	}
 	setting.DefaultShardTargetBytes = clampShardBytes(setting.DefaultShardTargetBytes, defaultShardTargetBytes)
 	setting.DefaultShardMaxBytes = clampShardBytes(setting.DefaultShardMaxBytes, defaultShardMaxBytes)
@@ -112,7 +112,7 @@ func GetSetting() ConversationLogSetting {
 	}
 	setting.AutoExportShardMaxBytes = clampShardBytes(setting.AutoExportShardMaxBytes, defaultAutoExportShardMaxBytes)
 	if !IsValidExportMode(setting.AutoExportMode) {
-		setting.AutoExportMode = ExportModeAPIHijackJSONL
+		setting.AutoExportMode = ExportModeSessionJSONL
 	}
 	if setting.AutoExportDirectory == "" {
 		setting.AutoExportDirectory = filepath.Join("data", "conversation_exports", "auto")

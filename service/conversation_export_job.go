@@ -53,6 +53,25 @@ type ShardManifest struct {
 	LastRecordID      int    `json:"last_record_id"`
 }
 
+// ShardPathManifest documents the internal paths of each delivery tar.gz.
+// traj v3.0 requires path explanations when the delivery package contains a
+// directory structure beyond a single flat file.
+type ShardPathManifest struct {
+	FormatVersion string                   `json:"format_version"`
+	PackageFormat string                   `json:"package_format"`
+	DataFormat    string                   `json:"data_format"`
+	Encoding      string                   `json:"encoding"`
+	ShardRoot     string                   `json:"shard_root"`
+	Entries       []ShardPathManifestEntry `json:"entries"`
+	Notes         []string                 `json:"notes"`
+}
+
+type ShardPathManifestEntry struct {
+	Path        string `json:"path"`
+	Required    bool   `json:"required"`
+	Description string `json:"description"`
+}
+
 type TopManifestShard struct {
 	Index             int    `json:"index"`
 	File              string `json:"file"`
@@ -77,17 +96,20 @@ type TopManifestTotals struct {
 }
 
 type TopManifest struct {
-	JobID             string                    `json:"job_id"`
-	SchemaVersion     string                    `json:"schema_version"`
-	Mode              string                    `json:"mode"`
-	CreatedAt         int64                     `json:"created_at"`
-	FinishedAt        int64                     `json:"finished_at"`
-	ShardTargetBytes  int64                     `json:"shard_target_bytes"`
-	ShardMaxBytes     int64                     `json:"shard_max_bytes"`
-	Filter            model.ConversationLogQuery `json:"filter"`
-	Totals            TopManifestTotals         `json:"totals"`
-	Summary           ConversationExportSummary `json:"summary"`
-	Shards            []TopManifestShard        `json:"shards"`
+	JobID            string                     `json:"job_id"`
+	SchemaVersion    string                     `json:"schema_version"`
+	Mode             string                     `json:"mode"`
+	PackageFormat    string                     `json:"package_format"`
+	DataFilePath     string                     `json:"data_file_path"`
+	PathDescription  string                     `json:"path_description"`
+	CreatedAt        int64                      `json:"created_at"`
+	FinishedAt       int64                      `json:"finished_at"`
+	ShardTargetBytes int64                      `json:"shard_target_bytes"`
+	ShardMaxBytes    int64                      `json:"shard_max_bytes"`
+	Filter           model.ConversationLogQuery `json:"filter"`
+	Totals           TopManifestTotals          `json:"totals"`
+	Summary          ConversationExportSummary  `json:"summary"`
+	Shards           []TopManifestShard         `json:"shards"`
 }
 
 // ExportJobCreateRequest is the request payload for POST /export_jobs.
@@ -108,7 +130,7 @@ type ExportJobCreateRequest struct {
 }
 
 var (
-	exportJobMu        sync.Mutex
+	exportJobMu          sync.Mutex
 	ErrJobAlreadyRunning = errors.New("another export job is already running")
 )
 
@@ -158,7 +180,7 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 	if strings.TrimSpace(req.OutputRoot) != "" {
 		exportRoot = req.OutputRoot
 	}
-	outputDir := filepath.Join(exportRoot, jobID)
+	outputDir := filepath.Join(exportRoot, buildExportJobOutputDirName(mode, now, jobID))
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
 	}
@@ -327,6 +349,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		JobID:            job.JobId,
 		SchemaVersion:    "1",
 		Mode:             job.Mode,
+		PackageFormat:    "tar.gz",
+		DataFilePath:     "shard-000N/data.jsonl",
+		PathDescription:  "Each shard tar.gz contains data.jsonl, shard-manifest.json, and path-manifest.json under a shard-000N directory.",
 		CreatedAt:        job.CreatedAt,
 		FinishedAt:       common.GetTimestamp(),
 		ShardTargetBytes: job.ShardTargetBytes,
@@ -581,10 +606,14 @@ func (s *shardWriterState) closeCurrentShard() error {
 	if err != nil {
 		return err
 	}
+	pathManifestBytes, err := common.Marshal(buildShardPathManifest(innerName))
+	if err != nil {
+		return err
+	}
 
 	// 3. Stream the temp .jsonl into tar.gz, then atomically rename.
 	tmpTarPath := filepath.Join(s.tmpDir, fileBase+".tar.gz")
-	if err := streamShardTarGz(tmpTarPath, innerName, s.currentJSONLPath, uncompressed, manifestBytes); err != nil {
+	if err := streamShardTarGz(tmpTarPath, innerName, s.currentJSONLPath, uncompressed, manifestBytes, pathManifestBytes); err != nil {
 		return err
 	}
 	compressedInfo, err := os.Stat(tmpTarPath)
@@ -662,10 +691,43 @@ func (s *shardWriterState) closeCurrentShard() error {
 	return nil
 }
 
+func buildShardPathManifest(shardName string) ShardPathManifest {
+	return ShardPathManifest{
+		FormatVersion: "1",
+		PackageFormat: "tar.gz",
+		DataFormat:    "jsonl",
+		Encoding:      "UTF-8",
+		ShardRoot:     shardName + "/",
+		Entries: []ShardPathManifestEntry{
+			{
+				Path:        shardName + "/data.jsonl",
+				Required:    true,
+				Description: "Official traj delivery data. Each line is one valid JSON record in the selected export mode.",
+			},
+			{
+				Path:        shardName + "/shard-manifest.json",
+				Required:    true,
+				Description: "Shard-level counts, time range, record id range, and SHA-256 checksum for data.jsonl.",
+			},
+			{
+				Path:        shardName + "/path-manifest.json",
+				Required:    true,
+				Description: "This path description file for the tar.gz package.",
+			},
+		},
+		Notes: []string{
+			"Use data.jsonl as the canonical dataset file.",
+			"The SHA-256 checksum in shard-manifest.json is computed over raw data.jsonl bytes before compression.",
+			"In session_jsonl mode, a reconstructed session is kept within one shard.",
+		},
+	}
+}
+
 // streamShardTarGz writes a tar.gz containing data.jsonl (streamed from
-// jsonlPath) and shard-manifest.json. The tar header carries the precomputed
-// uncompressed size, so we never have to load the whole jsonl into memory.
-func streamShardTarGz(tarPath, shardName, jsonlPath string, jsonlSize int64, shardManifestJSON []byte) error {
+// jsonlPath), shard-manifest.json, and path-manifest.json. The tar header
+// carries the precomputed uncompressed size, so we never have to load the whole
+// jsonl into memory.
+func streamShardTarGz(tarPath, shardName, jsonlPath string, jsonlSize int64, shardManifestJSON []byte, pathManifestJSON []byte) error {
 	in, err := os.Open(jsonlPath)
 	if err != nil {
 		return err
@@ -710,6 +772,19 @@ func streamShardTarGz(tarPath, shardName, jsonlPath string, jsonlSize int64, sha
 		return err
 	}
 	if _, err := tw.Write(shardManifestJSON); err != nil {
+		return err
+	}
+
+	// path-manifest.json (small, bytes)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:    shardName + "/path-manifest.json",
+		Mode:    0o644,
+		Size:    int64(len(pathManifestJSON)),
+		ModTime: now,
+	}); err != nil {
+		return err
+	}
+	if _, err := tw.Write(pathManifestJSON); err != nil {
 		return err
 	}
 	return nil
@@ -766,9 +841,10 @@ type sessionPending struct {
 
 func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) error {
 	pending := make(map[string]*sessionPending)
+	candidates := make([]sessionCandidate, 0)
 	currentScanID := 0
 
-	flushSession := func(sessionID string) error {
+	collectSession := func(sessionID string) error {
 		entry, ok := pending[sessionID]
 		if !ok {
 			return nil
@@ -781,30 +857,7 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 			// could re-include them.
 			return nil
 		}
-		line, err := common.Marshal(candidate.Trajectory)
-		if err != nil {
-			return err
-		}
-		lineLen := int64(len(line) + 1)
-		// One session must fit in one shard. If even an empty shard cannot hold
-		// it (e.g. a 30 GiB session) we still write it but log a warning — the
-		// alternative would be data loss.
-		if state.wouldOverflowMax(lineLen) {
-			if err := state.closeCurrentShard(); err != nil {
-				return err
-			}
-		}
-		if lineLen > state.shardMaxBytes {
-			common.SysLog(fmt.Sprintf("export job: session %s exceeds shard_max_bytes (%d > %d), shard will be oversize", sessionID, lineLen, state.shardMaxBytes))
-		}
-		if err := state.appendLine(line, candidate.RecordIDs, 1, entry.earliestReqTS, entry.latestReqTS); err != nil {
-			return err
-		}
-		if state.shouldRotateAfter() {
-			if err := state.closeCurrentShard(); err != nil {
-				return err
-			}
-		}
+		candidates = append(candidates, candidate)
 		return nil
 	}
 
@@ -820,7 +873,7 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 		}
 		sort.Strings(stable)
 		for _, sid := range stable {
-			if err := flushSession(sid); err != nil {
+			if err := collectSession(sid); err != nil {
 				return err
 			}
 		}
@@ -838,7 +891,7 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 			overflow := len(pending) - shardPendingSessionsCap
 			common.SysLog(fmt.Sprintf("export job: pending sessions exceed cap (%d), force-flushing oldest %d", len(pending), overflow))
 			for i := 0; i < overflow; i++ {
-				if err := flushSession(pairs[i].id); err != nil {
+				if err := collectSession(pairs[i].id); err != nil {
 					return err
 				}
 			}
@@ -891,9 +944,47 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 	}
 	sort.Strings(remaining)
 	for _, sid := range remaining {
-		if err := flushSession(sid); err != nil {
+		if err := collectSession(sid); err != nil {
 			return err
 		}
+	}
+
+	summary := &ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
+	exportable, duplicateRemoved, subsequenceRemoved := filterSessionCandidates(candidates, summary)
+	if duplicateRemoved > 0 || subsequenceRemoved > 0 {
+		common.SysLog(fmt.Sprintf("export job: removed %d exact duplicate session(s), %d continuous-subsequence session(s)", duplicateRemoved, subsequenceRemoved))
+	}
+	updateJobProgress(state.jobID, map[string]interface{}{
+		"total_sessions": int64(len(candidates)),
+		"progress":       fmt.Sprintf("deduplicated sessions: %d exportable of %d", len(exportable), len(candidates)),
+	})
+
+	for _, candidate := range exportable {
+		line, err := common.Marshal(candidate.Trajectory)
+		if err != nil {
+			return err
+		}
+		lineLen := int64(len(line) + 1)
+		// One session must fit in one shard. If even an empty shard cannot hold
+		// it (e.g. a 30 GiB session) we still write it but log a warning — the
+		// alternative would be data loss.
+		if state.wouldOverflowMax(lineLen) {
+			if err := state.closeCurrentShard(); err != nil {
+				return err
+			}
+		}
+		if lineLen > state.shardMaxBytes {
+			common.SysLog(fmt.Sprintf("export job: session %s exceeds shard_max_bytes (%d > %d), shard will be oversize", candidate.Trajectory.TrajectoryID, lineLen, state.shardMaxBytes))
+		}
+		if err := state.appendLine(line, candidate.RecordIDs, 1, candidate.RequestTimeMin, candidate.ResponseTimeMax); err != nil {
+			return err
+		}
+		if state.shouldRotateAfter() {
+			if err := state.closeCurrentShard(); err != nil {
+				return err
+			}
+		}
+		state.maybePushProgress(false)
 	}
 	return nil
 }
@@ -987,6 +1078,26 @@ func buildShardFilename(jobID, mode, trigger string, createdAt int64, shardIndex
 		short = short[:8]
 	}
 	return fmt.Sprintf("conversation-logs-%s-%s-%s-%s-shard%04d", modeTag, triggerTag, ts, short, shardIndex)
+}
+
+func buildExportJobOutputDirName(mode string, createdAt int64, jobID string) string {
+	modeTag := strings.TrimSpace(mode)
+	if modeTag == "" {
+		modeTag = "export"
+	}
+	modeTag = strings.NewReplacer("/", "_", "\\", "_", " ", "_").Replace(modeTag)
+	ts := "00000000T000000"
+	if createdAt > 0 {
+		ts = time.Unix(createdAt, 0).UTC().Format("20060102T150405")
+	}
+	short := strings.TrimSpace(jobID)
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	if short == "" {
+		return fmt.Sprintf("%s-%s", modeTag, ts)
+	}
+	return fmt.Sprintf("%s-%s-%s", modeTag, ts, short)
 }
 
 // DeleteExportJobArtifacts wipes the on-disk directory for a job (used by

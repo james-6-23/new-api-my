@@ -94,11 +94,13 @@ type ConversationExportSummary struct {
 }
 
 type sessionCandidate struct {
-	Trajectory SessionTrajectory
-	RecordIDs  []int
-	Reasons    []string
-	Signature  string
-	Messages   []string
+	Trajectory      SessionTrajectory
+	RecordIDs       []int
+	Reasons         []string
+	Signature       string
+	Messages        []string
+	RequestTimeMin  int64
+	ResponseTimeMax int64
 }
 
 func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
@@ -350,7 +352,7 @@ const summaryTotalRecordsCap = 200000
 
 func BuildConversationLogExportSummary(ctx context.Context, query model.ConversationLogQuery, mode string) (ConversationExportSummary, error) {
 	if !conversation_log_setting.IsValidExportMode(mode) {
-		mode = conversation_log_setting.ExportModeAPIHijackJSONL
+		mode = conversation_log_setting.ExportModeSessionJSONL
 	}
 	summary := ConversationExportSummary{
 		Mode:                     mode,
@@ -433,7 +435,7 @@ func BuildConversationLogExportSummary(ctx context.Context, query model.Conversa
 
 func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query model.ConversationLogQuery, mode string) ([]int, ConversationExportSummary, error) {
 	if !conversation_log_setting.IsValidExportMode(mode) {
-		mode = conversation_log_setting.ExportModeAPIHijackJSONL
+		mode = conversation_log_setting.ExportModeSessionJSONL
 	}
 	summary, err := BuildConversationLogExportSummary(ctx, query, mode)
 	if err != nil {
@@ -964,13 +966,22 @@ func buildSessionCandidates(records []*model.ConversationLog) []sessionCandidate
 }
 
 func buildSessionCandidate(sessionID string, records []*model.ConversationLog) sessionCandidate {
+	records = sortedConversationRecords(records)
 	toolsByName := make(map[string]SessionTool)
 	messages := make([]SessionMessage, 0)
 	recordIDs := make([]int, 0, len(records))
 	systemPrompt := ""
 	provider := ""
+	requestTimeMin := int64(0)
+	responseTimeMax := int64(0)
 	for _, record := range records {
 		recordIDs = append(recordIDs, record.Id)
+		if record.RequestTime > 0 && (requestTimeMin == 0 || record.RequestTime < requestTimeMin) {
+			requestTimeMin = record.RequestTime
+		}
+		if record.ResponseTime > responseTimeMax {
+			responseTimeMax = record.ResponseTime
+		}
 		if provider == "" {
 			provider = record.Provider
 		}
@@ -1010,13 +1021,29 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 		Meta:             meta,
 	}
 	candidate := sessionCandidate{
-		Trajectory: trajectory,
-		RecordIDs:  recordIDs,
-		Signature:  sessionSignature(trajectory),
-		Messages:   messageSignatureList(messages),
+		Trajectory:      trajectory,
+		RecordIDs:       recordIDs,
+		Signature:       sessionSignature(trajectory),
+		Messages:        messageSignatureList(messages),
+		RequestTimeMin:  requestTimeMin,
+		ResponseTimeMax: responseTimeMax,
 	}
 	candidate.Reasons = validateSessionTrajectory(trajectory)
 	return candidate
+}
+
+func sortedConversationRecords(records []*model.ConversationLog) []*model.ConversationLog {
+	if len(records) <= 1 {
+		return records
+	}
+	out := append([]*model.ConversationLog(nil), records...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].RequestTime == out[j].RequestTime {
+			return out[i].Id < out[j].Id
+		}
+		return out[i].RequestTime < out[j].RequestTime
+	})
+	return out
 }
 
 func filterSessionCandidates(candidates []sessionCandidate, summary *ConversationExportSummary) ([]sessionCandidate, int, int) {
@@ -1076,9 +1103,16 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 	}
 	toolNames := make(map[string]struct{}, len(trajectory.Tools))
 	for _, tool := range trajectory.Tools {
-		if tool.Name != "" {
-			toolNames[tool.Name] = struct{}{}
+		if strings.TrimSpace(tool.Name) == "" || strings.TrimSpace(tool.Description) == "" || strings.TrimSpace(tool.Parameters) == "" {
+			reasons = append(reasons, "tool_schema_incomplete")
+			continue
 		}
+		var parameters map[string]interface{}
+		if err := common.Unmarshal([]byte(tool.Parameters), &parameters); err != nil || len(parameters) == 0 {
+			reasons = append(reasons, "tool_schema_incomplete")
+			continue
+		}
+		toolNames[tool.Name] = struct{}{}
 	}
 	toolCallCount := 0
 	pairedToolCalls := 0
@@ -1798,7 +1832,7 @@ func dedupeAdjacentMessages(messages []SessionMessage) []SessionMessage {
 }
 
 func sessionSignature(trajectory SessionTrajectory) string {
-	return shortHash(mustJSONString(trajectory.Tools) + "|" + stringPtrValue(trajectory.SystemPrompt) + "|" + messageListSignature(trajectory.Messages))
+	return shortHash(stringPtrValue(trajectory.SystemPrompt) + "|" + messageListSignature(trajectory.Messages))
 }
 
 func messageListSignature(messages []SessionMessage) string {
@@ -1814,7 +1848,17 @@ func messageSignatureList(messages []SessionMessage) []string {
 }
 
 func messageSignature(msg SessionMessage) string {
-	return mustJSONString(msg)
+	return mustJSONString(struct {
+		Role       string            `json:"role"`
+		Content    *string           `json:"content"`
+		ToolCalls  []SessionToolCall `json:"tool_calls"`
+		ToolCallID *string           `json:"tool_call_id"`
+	}{
+		Role:       msg.Role,
+		Content:    msg.Content,
+		ToolCalls:  msg.ToolCalls,
+		ToolCallID: msg.ToolCallID,
+	})
 }
 
 func isContinuousSubsequence(shorter []string, longer []string) bool {

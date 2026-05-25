@@ -1,8 +1,8 @@
-# traj v2.0 会话数据任务文档
+# traj v3.0 会话数据任务文档
 
 来源计划：[plan.md](plan.md)
 
-目标：在 `new-api` 中实现严格符合 traj v2.0 PDF 要求的会话数据采集、存储、校验、导出和本地 Docker 验证。UI 目标为旧版 `web/classic`，本地 Docker 验证端口固定为 `1145`，数据库固定使用 PostgreSQL/PGSQL。
+目标：在 `new-api` 中实现严格符合 traj v3.0 PDF 要求的会话数据采集、存储、校验、导出和本地 Docker 验证。UI 目标为旧版 `web/classic`，本地 Docker 验证端口固定为 `1145`，数据库固定使用 PostgreSQL/PGSQL。
 
 ---
 
@@ -12,6 +12,8 @@
 - `demo/new-api-radical` 只借鉴临时文件和流式 chunk 缓冲设计，不把 Recent Calls 当作数据集来源。
 - 严格 API Hijack 导出只允许顶层字段：`session_id`、`provider`、`request_body`、`response_body`、`request_time`、`response_time`。
 - 严格 Session 导出必须包含：`trajectory_id`、`dataset`、`environment`、`auto_allowed_tools`、`system_prompt`、`tools`、`messages`、`meta`。
+- 正式交付统一使用 `tar.gz`，包内数据文件使用 `data.jsonl`，并附 `path-manifest.json` 说明路径。
+- 直接 `.jsonl` 下载只作为调试/小样本预览，不作为 v3.0 正式交付包。
 - 流式响应不能直接导出 raw SSE，必须重建为完整可解析 JSON。
 - JSON 编解码必须使用 `common` 包装函数。
 - 数据库代码必须兼容 SQLite、MySQL、PostgreSQL；但本地 Docker 验证固定使用 PostgreSQL。
@@ -23,7 +25,7 @@
 
 - [ ] 阅读 `plan.md`，确认 strict schema、demo 取舍、旧版 UI、Docker 端口和 PGSQL 要求。
 - [ ] 对照两个 PDF 再确认交付字段：
-  - [ ] `demo/traj 标准 v2.0（勿外传）.pdf`
+  - [ ] `demo/traj 标准 v3.0.pdf`
   - [ ] `demo/traj 格式参考（勿外传）.pdf`
 - [ ] 检查当前工作区状态，确认只修改本任务相关文件。
 - [ ] 确认旧版 UI 目录为 `web/classic`。
@@ -69,7 +71,7 @@
   - [ ] retention days
   - [ ] max storage
   - [ ] export directory
-  - [ ] default export mode = `api_hijack_jsonl`
+  - [ ] default formal export mode = `session_jsonl`
   - [ ] optional S3 transport settings
 - [ ] 配置不允许改变 strict export 顶层字段。
 - [ ] 配置保存接入现有 option/config 机制。
@@ -185,9 +187,23 @@
 
 ## 阶段 4：导出与管理 API
 
+### 4.0 正式交付 tar.gz 包
+
+- [ ] 正式交付入口使用异步 `export_jobs`。
+- [ ] 每个分片输出 `.tar.gz`。
+- [ ] 自动导出目录使用可读作业名：`session_jsonl-YYYYMMDDTHHMMSS-短job_id`。
+- [ ] 每个 `.tar.gz` 内包含：
+  - [ ] `shard-000N/data.jsonl`
+  - [ ] `shard-000N/shard-manifest.json`
+  - [ ] `shard-000N/path-manifest.json`
+- [ ] `path-manifest.json` 说明包内路径、数据格式、UTF-8 编码、校验口径。
+- [ ] 顶层 `manifest.json` 记录每个分片文件名、行数、字节数、checksum。
+- [ ] 同一个 session 在 `session_jsonl` 模式下不跨分片。
+- [ ] 直接 `.jsonl` 下载标记为调试/小样本预览，不作为正式交付。
+
 ### 4.1 Strict API JSONL 导出
 
-- [ ] 实现 `api_hijack_jsonl` 导出。
+- [ ] 实现 `api_hijack_jsonl` 数据行导出。
 - [ ] 每行只包含六个字段：
   - [ ] `session_id`
   - [ ] `provider`
@@ -201,7 +217,7 @@
 
 ### 4.2 Strict Session JSONL 导出
 
-- [ ] 实现 `session_jsonl` 导出。
+- [ ] 实现 `session_jsonl` 数据行导出。
 - [ ] 每行包含：
   - [ ] `trajectory_id`
   - [ ] `dataset`
@@ -234,8 +250,13 @@
   - [ ] `GET /api/conversation_logs`
   - [ ] `GET /api/conversation_logs/:id`
   - [ ] `GET /api/conversation_logs/export_summary?mode=api_hijack_jsonl`
-  - [ ] `GET /api/conversation_logs/export.jsonl?mode=api_hijack_jsonl`
-  - [ ] `GET /api/conversation_logs/export.jsonl?mode=session_jsonl`
+  - [ ] `GET /api/conversation_logs/export.jsonl?mode=api_hijack_jsonl`（调试/小样本预览）
+  - [ ] `GET /api/conversation_logs/export.jsonl?mode=session_jsonl`（调试/小样本预览）
+  - [ ] `GET /api/conversation_logs/export_jobs`
+  - [ ] `POST /api/conversation_logs/export_jobs`
+  - [ ] `GET /api/conversation_logs/export_jobs/:id`
+  - [ ] `GET /api/conversation_logs/export_jobs/:id/manifest`
+  - [ ] `GET /api/conversation_logs/export_jobs/:id/shards/:n`
   - [ ] `POST /api/conversation_logs/export_and_delete`
   - [ ] `DELETE /api/conversation_logs`
   - [ ] `PUT /api/conversation_logs/settings`
@@ -245,7 +266,7 @@
 ### 4.5 Optional S3
 
 - [ ] S3 只作为上传 transport。
-- [ ] S3 上传 strict JSONL 和 summary JSON。
+- [ ] S3 上传正式 `tar.gz` 分片和顶层 `manifest.json`。
 - [ ] 不上传内部自定义 JSONL 作为 traj 数据。
 
 交付物：
@@ -268,7 +289,8 @@
   - [ ] API Hijack JSONL
   - [ ] Session JSONL
 - [ ] 展示 export summary。
-- [ ] 没有合规数据时禁用下载按钮。
+- [ ] 没有合规数据时禁用预览下载和分片导出按钮。
+- [ ] 将正式交付入口明确指向 `tar.gz` 分片导出任务。
 - [ ] S3 设置明确标记为上传方式，不是数据格式。
 
 ### 5.2 渠道编辑 UI
@@ -415,6 +437,10 @@ docker logs --tail=100 new-api-traj-local
 
 - [ ] `api_hijack_jsonl` 严格只输出六个 PDF 标准字段。
 - [ ] `session_jsonl` 输出符合 session-level schema。
+- [ ] 正式交付文件统一为 `.tar.gz`。
+- [ ] 每个 `.tar.gz` 分片包含 `data.jsonl`、`shard-manifest.json`、`path-manifest.json`。
+- [ ] `path-manifest.json` 已说明复杂路径和编码。
+- [ ] 顶层 `manifest.json` 可定位每个分片和校验和。
 - [ ] 所有导出 JSONL 每行可解析。
 - [ ] 流式响应导出前已重建为完整 JSON。
 - [ ] invalid/truncated/raw SSE 记录被排除并进入 summary。

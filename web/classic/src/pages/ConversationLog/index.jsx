@@ -65,14 +65,14 @@ import ExportJobs from './ExportJobs';
 
 const { Text, Title } = Typography;
 
-const exportModes = ['api_hijack_jsonl', 'session_jsonl'];
+const exportModes = ['session_jsonl', 'api_hijack_jsonl'];
 
 const defaultSettings = {
   capture_enabled: true,
   retention_days: 30,
   max_storage_gb: 50,
   export_directory: 'data/conversation_exports',
-  default_export_mode: 'api_hijack_jsonl',
+  default_export_mode: 'session_jsonl',
   s3: {
     enabled: false,
     endpoint: '',
@@ -85,7 +85,7 @@ const defaultSettings = {
   auto_export_enabled: false,
   auto_export_threshold_bytes: 10 * 1024 * 1024 * 1024,
   auto_export_shard_max_bytes: 10 * 1024 * 1024 * 1024,
-  auto_export_mode: 'api_hijack_jsonl',
+  auto_export_mode: 'session_jsonl',
   auto_export_directory: 'data/conversation_exports/auto',
   auto_export_check_interval_seconds: 300,
   auto_export_delete_after: true,
@@ -208,7 +208,7 @@ const ConversationLog = () => {
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [exportLoading, setExportLoading] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
-  const [mode, setMode] = useState('api_hijack_jsonl');
+  const [mode, setMode] = useState('session_jsonl');
   const [settings, setSettings] = useState(defaultSettings);
   const [summary, setSummary] = useState(null);
   const [exportSummary, setExportSummary] = useState(null);
@@ -370,7 +370,7 @@ const ConversationLog = () => {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `conversation-logs-${mode}.jsonl`;
+      link.download = `conversation-logs-preview-${mode}.jsonl`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -810,7 +810,7 @@ const ConversationLog = () => {
           disabled={compliantCount <= 0}
           onClick={exportJSONL}
         >
-          {t('导出 JSONL')}
+          {t('预览导出 JSONL')}
         </Button>
         <Button
           type='danger'
@@ -1086,7 +1086,7 @@ const ConversationLog = () => {
                         disabled={compliantCount <= 0}
                         onClick={exportJSONL}
                       >
-                        {t('导出 JSONL')}
+                        {t('预览导出 JSONL')}
                       </Button>
                     </Space>
                   </div>
@@ -1215,7 +1215,7 @@ const ConversationLog = () => {
           </div>
         </Tabs.TabPane>
         <Tabs.TabPane tab={t('分片导出任务')} itemKey='export_jobs'>
-          <ExportJobs />
+          <ExportJobs defaultMode={settings.default_export_mode} />
         </Tabs.TabPane>
         <Tabs.TabPane
           tab={
@@ -1304,11 +1304,11 @@ const ConversationLog = () => {
                         field='default_export_mode'
                         label={t('默认导出模式')}
                         optionList={[
+                          { label: t('Session JSONL'), value: 'session_jsonl' },
                           {
                             label: t('API Hijack JSONL'),
                             value: 'api_hijack_jsonl',
                           },
-                          { label: t('Session JSONL'), value: 'session_jsonl' },
                         ]}
                         onChange={(value) =>
                           setSettings({
@@ -1397,11 +1397,11 @@ const ConversationLog = () => {
                         field='auto_export_mode'
                         label={t('自动导出模式')}
                         optionList={[
+                          { label: t('Session JSONL'), value: 'session_jsonl' },
                           {
                             label: t('API Hijack JSONL'),
                             value: 'api_hijack_jsonl',
                           },
-                          { label: t('Session JSONL'), value: 'session_jsonl' },
                         ]}
                         onChange={(value) =>
                           setSettings({ ...settings, auto_export_mode: value })

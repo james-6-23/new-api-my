@@ -92,11 +92,11 @@ function computeJobPercent(job) {
 }
 
 const modeOptions = [
-  { value: 'api_hijack_jsonl', label: 'API Hijack JSONL' },
   { value: 'session_jsonl', label: 'Session JSONL' },
+  { value: 'api_hijack_jsonl', label: 'API Hijack JSONL' },
 ];
 
-const ExportJobs = () => {
+const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
   const { t } = useTranslation();
   const createFormRef = useRef();
   const [loading, setLoading] = useState(false);
@@ -418,7 +418,7 @@ const ExportJobs = () => {
             </Title>
             <Text type='tertiary'>
               {t(
-                '按 MB 粒度配置分片大小,把合规数据打包成 tar.gz 异步导出。同一个会话不会跨分片。',
+                '按 MB 粒度配置分片大小,把合规数据打包成 v3.0 正式交付 tar.gz。包内包含 data.jsonl、shard-manifest.json 和 path-manifest.json。',
               )}
             </Text>
           </div>
@@ -436,7 +436,7 @@ const ExportJobs = () => {
               icon={<IconPlay />}
               onClick={() => setCreateVisible(true)}
             >
-              {t('新建分片导出任务')}
+              {t('新建正式交付任务')}
             </Button>
           </Space>
         </div>
@@ -455,17 +455,18 @@ const ExportJobs = () => {
       </Card>
 
       <Modal
-        title={t('新建分片导出任务')}
+        title={t('新建正式交付任务')}
         visible={createVisible}
         onCancel={() => setCreateVisible(false)}
         footer={null}
         width={520}
       >
         <Form
+          key={defaultMode || 'session_jsonl'}
           getFormApi={(api) => (createFormRef.current = api)}
           onSubmit={onCreate}
           initValues={{
-            mode: 'api_hijack_jsonl',
+            mode: defaultMode || 'session_jsonl',
             shard_target_mb: 10240,
             shard_max_mb: 10240,
             delete_after_export: true,
