@@ -153,6 +153,30 @@ func TestBuildSessionCandidatePassesQualityGate(t *testing.T) {
 	require.NotEmpty(t, candidate.Trajectory.Meta)
 }
 
+func TestBuildSessionCandidatePrefersCallIDForOpenAIToolCalls(t *testing.T) {
+	requestBody := `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"read main.go"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"fc_read","call_id":"call_read","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"/repo/main.go\"}"}}]},
+			{"role":"tool","tool_call_id":"call_read","content":"package main"},
+			{"role":"user","content":"summarize it"}
+		],
+		"tools":[{"type":"function","function":{"name":"Read","description":"Reads a file.","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]
+	}`
+	responseBody := `{"choices":[{"message":{"role":"assistant","content":"It is a Go entrypoint."},"finish_reason":"stop"}],"usage":{"total_tokens":10}}`
+
+	candidate := buildSessionCandidate("sess_call_id", []*model.ConversationLog{
+		validConversationLog(1, "sess_call_id", "openai", requestBody, responseBody),
+	})
+
+	require.Empty(t, candidate.Reasons)
+	require.Len(t, candidate.Trajectory.Messages, 5)
+	require.Len(t, candidate.Trajectory.Messages[1].ToolCalls, 1)
+	require.Equal(t, "call_read", candidate.Trajectory.Messages[1].ToolCalls[0].CallID)
+	require.Equal(t, "call_read", stringPtrValue(candidate.Trajectory.Messages[2].ToolCallID))
+}
+
 func TestBuildClaudeSessionCandidatePassesQualityGate(t *testing.T) {
 	requestBody := `{
 		"model":"claude-sonnet",

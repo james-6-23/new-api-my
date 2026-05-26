@@ -1272,7 +1272,7 @@ func extractOpenAIRequestMessages(request map[string]interface{}, systemPrompt *
 			Role:       normalizeRole(role),
 			Content:    nullableString(contentToString(msg["content"])),
 			Thinking:   nullableString(asString(msg["reasoning_content"])),
-			ToolCallID: nullableString(asString(msg["tool_call_id"])),
+			ToolCallID: nullableString(conversationToolResultID(msg)),
 		}
 		for _, callValue := range asSlice(msg["tool_calls"]) {
 			if call := openAIToolCall(callValue); call.Name != "" {
@@ -1342,10 +1342,10 @@ func extractClaudeRequestMessages(request map[string]interface{}) []SessionMessa
 				toolCalls = append(toolCalls, SessionToolCall{
 					Name:      asString(part["name"]),
 					Arguments: mustJSONString(part["input"]),
-					CallID:    asString(part["id"]),
+					CallID:    conversationToolCallID(part),
 				})
 			case "tool_result":
-				toolID := asString(part["tool_use_id"])
+				toolID := conversationToolResultID(part)
 				messages = append(messages, SessionMessage{
 					Role:       "tool",
 					Content:    nullableString(contentToString(part["content"])),
@@ -1465,7 +1465,7 @@ func extractResponsesOutputMessages(response map[string]interface{}) []SessionMe
 				ToolCalls: []SessionToolCall{{
 					Name:      asString(item["name"]),
 					Arguments: asString(item["arguments"]),
-					CallID:    firstNonEmpty(asString(item["call_id"]), asString(item["id"])),
+					CallID:    conversationToolCallID(item),
 				}},
 			})
 			continue
@@ -1492,7 +1492,7 @@ func extractClaudeResponseMessages(response map[string]interface{}) []SessionMes
 		case "thinking":
 			thinkingParts = append(thinkingParts, asString(part["thinking"]))
 		case "tool_use":
-			toolCalls = append(toolCalls, SessionToolCall{Name: asString(part["name"]), Arguments: mustJSONString(part["input"]), CallID: asString(part["id"])})
+			toolCalls = append(toolCalls, SessionToolCall{Name: asString(part["name"]), Arguments: mustJSONString(part["input"]), CallID: conversationToolCallID(part)})
 		}
 	}
 	if len(textParts) == 0 && len(thinkingParts) == 0 && len(toolCalls) == 0 {
@@ -1545,8 +1545,28 @@ func openAIToolCall(value interface{}) SessionToolCall {
 	return SessionToolCall{
 		Name:      asString(fn["name"]),
 		Arguments: asString(fn["arguments"]),
-		CallID:    firstNonEmpty(asString(call["id"]), asString(call["call_id"])),
+		CallID:    conversationToolCallID(call),
 	}
+}
+
+func conversationToolCallID(item map[string]interface{}) string {
+	return firstNonEmpty(
+		asString(item["call_id"]),
+		asString(item["id"]),
+		asString(item["tool_call_id"]),
+		asString(item["tool_use_id"]),
+		asString(item["tool_id"]),
+	)
+}
+
+func conversationToolResultID(item map[string]interface{}) string {
+	return firstNonEmpty(
+		asString(item["tool_use_id"]),
+		asString(item["tool_call_id"]),
+		asString(item["call_id"]),
+		asString(item["id"]),
+		asString(item["tool_id"]),
+	)
 }
 
 func requestHasConversationField(request map[string]interface{}) bool {
