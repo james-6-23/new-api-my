@@ -225,6 +225,7 @@ func SetApiRouter(router *gin.Engine) {
 			conversationLogRoute.GET("/export_jobs/:id/shards/:n", controller.DownloadExportJobShard)
 			conversationLogRoute.POST("/export_jobs/:id/cancel", controller.CancelExportJob)
 			conversationLogRoute.DELETE("/export_jobs/:id", controller.DeleteExportJob)
+			conversationLogRoute.GET("/s3_uploads", controller.ListS3UploadLogs)
 			conversationLogRoute.GET("", controller.GetConversationLogs)
 			conversationLogRoute.GET("/", controller.GetConversationLogs)
 			conversationLogRoute.GET("/:id", controller.GetConversationLog)

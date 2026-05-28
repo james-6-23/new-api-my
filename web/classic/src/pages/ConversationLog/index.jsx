@@ -62,6 +62,7 @@ import {
   timestamp2string,
 } from '../../helpers';
 import ExportJobs from './ExportJobs';
+import S3UploadLogs from './S3UploadLogs';
 
 const { Text, Title } = Typography;
 
@@ -1214,9 +1215,13 @@ const ConversationLog = () => {
             </Modal>
           </div>
         </Tabs.TabPane>
+        <Tabs.TabPane tab={t('S3 上传记录')} itemKey='s3_uploads'>
+          <S3UploadLogs />
+        </Tabs.TabPane>
         <Tabs.TabPane tab={t('分片导出任务')} itemKey='export_jobs'>
           <ExportJobs
             defaultMode={settings.default_export_mode}
+            defaultS3Upload={settings.s3?.enabled === true}
             getFilterParams={getFilterParams}
           />
         </Tabs.TabPane>

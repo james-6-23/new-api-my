@@ -39,12 +39,13 @@ func CreateExportJob(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, gin.H{
-		"job_id":           job.JobId,
-		"status":           job.Status,
-		"output_directory": job.OutputDirectory,
-		"mode":             job.Mode,
+		"job_id":             job.JobId,
+		"status":             job.Status,
+		"output_directory":   job.OutputDirectory,
+		"mode":               job.Mode,
 		"shard_target_bytes": job.ShardTargetBytes,
 		"shard_max_bytes":    job.ShardMaxBytes,
+		"s3_upload":          job.S3Upload,
 	})
 }
 
@@ -57,6 +58,18 @@ func ListExportJobs(c *gin.Context) {
 	}
 	page.SetTotal(int(total))
 	page.SetItems(jobs)
+	common.ApiSuccess(c, page)
+}
+
+func ListS3UploadLogs(c *gin.Context) {
+	page := common.GetPageQuery(c)
+	logs, total, err := model.ListConversationS3UploadLogs(page.GetStartIdx(), page.GetPageSize(), c.Query("job_id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	page.SetTotal(int(total))
+	page.SetItems(logs)
 	common.ApiSuccess(c, page)
 }
 

@@ -134,7 +134,11 @@ function normalizeExportJobFilter(filter = {}) {
   return next;
 }
 
-const ExportJobs = ({ defaultMode = 'session_jsonl', getFilterParams }) => {
+const ExportJobs = ({
+  defaultMode = 'session_jsonl',
+  defaultS3Upload = false,
+  getFilterParams,
+}) => {
   const { t } = useTranslation();
   const createFormRef = useRef();
   const [loading, setLoading] = useState(false);
@@ -191,6 +195,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl', getFilterParams }) => {
         shard_target_bytes: Math.round((values.shard_target_mb || 10240) * MB),
         shard_max_bytes: Math.round((values.shard_max_mb || 10240) * MB),
         delete_after_export: !!values.delete_after_export,
+        s3_upload: !!values.s3_upload,
       };
       const res = await API.post('/api/conversation_logs/export_jobs', payload);
       const { success, message } = res.data;
@@ -373,6 +378,13 @@ const ExportJobs = ({ defaultMode = 'session_jsonl', getFilterParams }) => {
       align: 'right',
     },
     {
+      title: 'S3',
+      dataIndex: 's3_upload',
+      width: 80,
+      render: (v) =>
+        v ? <Tag color='green'>{t('上传')}</Tag> : <Tag>{t('本地')}</Tag>,
+    },
+    {
       title: t('记录数'),
       dataIndex: 'exported_records',
       width: 100,
@@ -487,7 +499,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl', getFilterParams }) => {
         width={520}
       >
         <Form
-          key={defaultMode || 'session_jsonl'}
+          key={`${defaultMode || 'session_jsonl'}-${defaultS3Upload ? 's3' : 'local'}`}
           getFormApi={(api) => (createFormRef.current = api)}
           onSubmit={onCreate}
           initValues={{
@@ -495,6 +507,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl', getFilterParams }) => {
             shard_target_mb: 10240,
             shard_max_mb: 10240,
             delete_after_export: true,
+            s3_upload: defaultS3Upload,
           }}
         >
           <Form.Select
@@ -524,6 +537,14 @@ const ExportJobs = ({ defaultMode = 'session_jsonl', getFilterParams }) => {
           <Form.Checkbox field='delete_after_export'>
             {t('导出完成后删除源记录')}
           </Form.Checkbox>
+          <Form.Checkbox field='s3_upload' disabled={!defaultS3Upload}>
+            {t('导出完成后上传到 S3')}
+          </Form.Checkbox>
+          {!defaultS3Upload && (
+            <Text type='tertiary' size='small'>
+              {t('需要先在采集配置中启用并保存 S3 设置')}
+            </Text>
+          )}
           <div className='mt-4 flex justify-end gap-2'>
             <Button onClick={() => setCreateVisible(false)}>{t('取消')}</Button>
             <Button type='primary' htmlType='submit' loading={creating}>

@@ -176,6 +176,11 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 	if maxBytes < targetBytes || maxBytes > maxBound {
 		return nil, fmt.Errorf("shard_max_bytes must be in [shard_target_bytes, %d]", maxBound)
 	}
+	if req.S3Upload {
+		if err := validateConversationS3Setting(settings.S3); err != nil {
+			return nil, err
+		}
+	}
 
 	filterBytes, err := common.Marshal(req.Filter)
 	if err != nil {
@@ -391,6 +396,15 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		"manifest_path": manifestPath,
 		"progress":      "manifest finalized",
 	})
+
+	if job.S3Upload {
+		if err := uploadConversationExportArtifactsToS3(ctx, job, manifestPath, state.shards); err != nil {
+			return err
+		}
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"progress": "S3 upload completed",
+		})
+	}
 
 	if state.totalRecordCount > 0 {
 		updateJobProgress(job.JobId, map[string]interface{}{

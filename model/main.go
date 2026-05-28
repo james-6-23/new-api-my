@@ -283,6 +283,7 @@ func migrateDB() error {
 		&PerfMetric{},
 		&ConversationLog{},
 		&ConversationExportJob{},
+		&ConversationS3UploadLog{},
 	)
 	if err != nil {
 		return err
@@ -337,6 +338,7 @@ func migrateDBFast() error {
 		{&PerfMetric{}, "PerfMetric"},
 		{&ConversationLog{}, "ConversationLog"},
 		{&ConversationExportJob{}, "ConversationExportJob"},
+		{&ConversationS3UploadLog{}, "ConversationS3UploadLog"},
 	}
 	// 动态计算migration数量，确保errChan缓冲区足够大
 	errChan := make(chan error, len(migrations))
@@ -386,6 +388,9 @@ func migrateLOGDB() error {
 		return err
 	}
 	if err = LOG_DB.AutoMigrate(&ConversationExportJob{}); err != nil {
+		return err
+	}
+	if err = LOG_DB.AutoMigrate(&ConversationS3UploadLog{}); err != nil {
 		return err
 	}
 	if err = migrateConversationLogBodyColumns(LOG_DB); err != nil {

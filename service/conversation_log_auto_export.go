@@ -90,6 +90,7 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		ShardTargetBytes:  shardMax,
 		ShardMaxBytes:     shardMax,
 		DeleteAfterExport: settings.AutoExportDeleteAfter,
+		S3Upload:          settings.S3.Enabled,
 		Trigger:           "auto",
 		OutputRoot:        settings.AutoExportDirectory,
 	}
