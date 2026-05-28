@@ -66,6 +66,155 @@ function statusTag(status, t) {
   return <Tag color={cfg.color}>{cfg.text}</Tag>;
 }
 
+function parseQualityReport(job) {
+  const raw = job?.quality_report || job?.quality_report_json;
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function formatRate(rate) {
+  if (typeof rate !== 'number' || Number.isNaN(rate)) return '-';
+  const value = rate * 100;
+  return `${value >= 99.95 ? '100' : value.toFixed(1)}%`;
+}
+
+function formatInteger(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) ? number.toLocaleString() : '0';
+}
+
+function QualityReportPanel({ job, t }) {
+  const report = parseQualityReport(job);
+  if (!report) {
+    const emptyText =
+      job?.mode === 'session_jsonl'
+        ? t('该任务暂无达标快照，请使用新版导出任务重新生成后查看。')
+        : t('API Hijack JSONL 不生成 session 级 H1-H4/D1/D3 达标快照。');
+    return (
+      <div className='rounded-lg border border-dashed border-[var(--semi-color-border)] bg-[var(--semi-color-fill-0)] p-4'>
+        <Text type='tertiary'>{emptyText}</Text>
+      </div>
+    );
+  }
+
+  const rules = Array.isArray(report.rules) ? report.rules : [];
+  return (
+    <div className='rounded-lg border border-[var(--semi-color-border)] bg-[var(--semi-color-bg-1)] p-4'>
+      <div className='mb-3 flex flex-wrap items-start justify-between gap-2'>
+        <div>
+          <Title heading={6} style={{ margin: 0 }}>
+            {t('准入项总览')}
+          </Title>
+          <Text type='tertiary' size='small'>
+            {t('导出时生成的质量快照，源记录删除后仍可复查。')}
+          </Text>
+        </div>
+        <Space wrap>
+          <Tag color='blue'>
+            {t('候选')} {formatInteger(report.candidate_count)}
+          </Tag>
+          <Tag color='green'>
+            {t('交付')} {formatInteger(report.exported_sessions)}
+          </Tag>
+          <Tag color='orange'>
+            {t('剔除')} {formatInteger(report.rejected_sessions)}
+          </Tag>
+        </Space>
+      </div>
+
+      <div className='overflow-x-auto'>
+        <table className='w-full min-w-[760px] border-collapse text-sm'>
+          <thead>
+            <tr className='border-b border-[var(--semi-color-border)] text-left text-[var(--semi-color-text-2)]'>
+              <th className='py-2 pr-3 font-medium'>{t('准入项')}</th>
+              <th className='py-2 pr-3 font-medium'>{t('要求')}</th>
+              <th className='py-2 pr-3 text-right font-medium'>
+                {t('候选通过')}
+              </th>
+              <th className='py-2 pr-3 text-right font-medium'>
+                {t('通过率')}
+              </th>
+              <th className='py-2 pr-3 text-right font-medium'>
+                {t('剔除/去重')}
+              </th>
+              <th className='py-2 font-medium'>{t('结论')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rules.map((rule) => (
+              <tr
+                key={rule.key || rule.name}
+                className='border-b border-[var(--semi-color-border)] last:border-b-0'
+              >
+                <td className='py-2 pr-3 font-medium'>
+                  {rule.name || rule.key}
+                </td>
+                <td className='py-2 pr-3 text-[var(--semi-color-text-1)]'>
+                  {rule.requirement || '-'}
+                </td>
+                <td className='py-2 pr-3 text-right font-mono'>
+                  {formatInteger(rule.passed_count)} /{' '}
+                  {formatInteger(rule.candidate_count)}
+                </td>
+                <td className='py-2 pr-3 text-right font-mono'>
+                  {formatRate(rule.pass_rate)}
+                </td>
+                <td className='py-2 pr-3 text-right font-mono'>
+                  {formatInteger(rule.removed_count)}
+                </td>
+                <td className='py-2'>
+                  <Tag color={rule.pass ? 'green' : 'red'}>
+                    {rule.conclusion || (rule.pass ? t('达标') : t('需关注'))}
+                  </Tag>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {(report.undefined_tools?.length > 0 ||
+        report.incomplete_tools?.length > 0) && (
+        <div className='mt-3 flex flex-col gap-2'>
+          {report.undefined_tools?.length > 0 && (
+            <div>
+              <Text type='tertiary' size='small'>
+                {t('未定义工具 Top')}
+              </Text>
+              <div className='mt-1 flex flex-wrap gap-1'>
+                {report.undefined_tools.slice(0, 12).map((item) => (
+                  <Tag key={`u-${item.name}`} color='red'>
+                    {item.name} x{item.count}
+                  </Tag>
+                ))}
+              </div>
+            </div>
+          )}
+          {report.incomplete_tools?.length > 0 && (
+            <div>
+              <Text type='tertiary' size='small'>
+                {t('schema 不完整工具 Top')}
+              </Text>
+              <div className='mt-1 flex flex-wrap gap-1'>
+                {report.incomplete_tools.slice(0, 12).map((item) => (
+                  <Tag key={`i-${item.name}`} color='orange'>
+                    {item.name} x{item.count}
+                  </Tag>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // computeJobPercent infers a 0-100 progress hint from whatever the backend
 // has reported. Prefers records, falls back to bytes, falls back to status
 // (running ⇒ small non-zero so the bar shows movement; completed ⇒ 100).
@@ -459,7 +608,7 @@ const ExportJobs = ({
             </Title>
             <Text type='tertiary'>
               {t(
-                '按 MB 粒度配置分片大小,把合规数据打包成 v3.0 正式交付 tar.gz。包内包含 data.jsonl、shard-manifest.json 和 path-manifest.json。',
+                '按 MB 粒度配置分片大小,把合规数据打包成 v3.0 正式交付 tar.gz。包内包含分类 data jsonl、shard-manifest.json 和 path-manifest.json。',
               )}
             </Text>
           </div>
@@ -487,6 +636,10 @@ const ExportJobs = ({
             pagination={false}
             scroll={{ x: 1300 }}
             empty={t('暂无任务')}
+            expandRowByClick
+            expandedRowRender={(record) => (
+              <QualityReportPanel job={record} t={t} />
+            )}
           />
         </Spin>
       </Card>
@@ -615,6 +768,7 @@ const ExportJobs = ({
                 { key: t('输出目录'), value: detail.output_directory },
               ]}
             />
+            <QualityReportPanel job={detail} t={t} />
             {detail.error_message && (
               <Card
                 className='!rounded-lg'

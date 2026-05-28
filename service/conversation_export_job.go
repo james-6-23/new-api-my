@@ -123,20 +123,179 @@ type TopManifestTotals struct {
 }
 
 type TopManifest struct {
-	JobID            string                     `json:"job_id"`
-	SchemaVersion    string                     `json:"schema_version"`
-	Mode             string                     `json:"mode"`
-	PackageFormat    string                     `json:"package_format"`
-	DataFilePath     string                     `json:"data_file_path"`
-	PathDescription  string                     `json:"path_description"`
-	CreatedAt        int64                      `json:"created_at"`
-	FinishedAt       int64                      `json:"finished_at"`
-	ShardTargetBytes int64                      `json:"shard_target_bytes"`
-	ShardMaxBytes    int64                      `json:"shard_max_bytes"`
-	Filter           model.ConversationLogQuery `json:"filter"`
-	Totals           TopManifestTotals          `json:"totals"`
-	Summary          ConversationExportSummary  `json:"summary"`
-	Shards           []TopManifestShard         `json:"shards"`
+	JobID            string                           `json:"job_id"`
+	SchemaVersion    string                           `json:"schema_version"`
+	Mode             string                           `json:"mode"`
+	PackageFormat    string                           `json:"package_format"`
+	DataFilePath     string                           `json:"data_file_path"`
+	PathDescription  string                           `json:"path_description"`
+	CreatedAt        int64                            `json:"created_at"`
+	FinishedAt       int64                            `json:"finished_at"`
+	ShardTargetBytes int64                            `json:"shard_target_bytes"`
+	ShardMaxBytes    int64                            `json:"shard_max_bytes"`
+	Filter           model.ConversationLogQuery       `json:"filter"`
+	Totals           TopManifestTotals                `json:"totals"`
+	Summary          ConversationExportSummary        `json:"summary"`
+	QualityReport    *ConversationExportQualityReport `json:"quality_report,omitempty"`
+	Shards           []TopManifestShard               `json:"shards"`
+}
+
+type ConversationExportQualityReport struct {
+	Mode             string                          `json:"mode"`
+	Scope            string                          `json:"scope"`
+	CandidateCount   int64                           `json:"candidate_count"`
+	ExportedSessions int64                           `json:"exported_sessions"`
+	RejectedSessions int64                           `json:"rejected_sessions"`
+	RequiredPassRate float64                         `json:"required_pass_rate"`
+	GeneratedAt      int64                           `json:"generated_at"`
+	Rules            []ConversationExportQualityRule `json:"rules"`
+	FailureReasons   []ConversationQualityReason     `json:"failure_reasons,omitempty"`
+	UndefinedTools   []ConversationH2ToolCount       `json:"undefined_tools,omitempty"`
+	IncompleteTools  []ConversationH2ToolCount       `json:"incomplete_tools,omitempty"`
+}
+
+type ConversationExportQualityRule struct {
+	Key              string  `json:"key"`
+	Name             string  `json:"name"`
+	Requirement      string  `json:"requirement"`
+	CandidateCount   int64   `json:"candidate_count"`
+	PassedCount      int64   `json:"passed_count"`
+	FailedCount      int64   `json:"failed_count"`
+	RemovedCount     int64   `json:"removed_count"`
+	PassRate         float64 `json:"pass_rate"`
+	RequiredPassRate float64 `json:"required_pass_rate"`
+	Pass             bool    `json:"pass"`
+	Conclusion       string  `json:"conclusion"`
+}
+
+func buildConversationExportQualityReport(mode string, preflight ConversationQualityPreflightReport, summary ConversationExportSummary, exportedSessions int64) *ConversationExportQualityReport {
+	if mode != conversation_log_setting.ExportModeSessionJSONL {
+		return nil
+	}
+	report := &ConversationExportQualityReport{
+		Mode:             mode,
+		Scope:            "session_jsonl_export",
+		CandidateCount:   preflight.CandidateCount,
+		ExportedSessions: exportedSessions,
+		RequiredPassRate: preflight.RequiredPassRate,
+		GeneratedAt:      common.GetTimestamp(),
+		FailureReasons:   preflight.FailureReasons,
+		UndefinedTools:   preflight.UndefinedTools,
+		IncompleteTools:  preflight.IncompleteTools,
+	}
+	if report.CandidateCount > exportedSessions {
+		report.RejectedSessions = report.CandidateCount - exportedSessions
+	}
+
+	report.Rules = append(report.Rules,
+		conversationExportRuleFromMetric(
+			"h1",
+			"H1 有效交互轮次",
+			"每条 session 有效交互轮次 >= 2",
+			preflight.H1,
+			preflight.H1.FailedCount,
+		),
+		conversationExportRuleFromMetric(
+			"h2",
+			"H2 工具归属定义",
+			"所有被调用工具必须有完整 tools/schema 定义",
+			preflight.H2,
+			preflight.H2.FailedCount,
+		),
+		conversationExportRuleFromMetric(
+			"h3",
+			"H3 结构化工具调用",
+			"每条 session 至少一次结构化工具调用",
+			preflight.H3,
+			preflight.H3.FailedCount,
+		),
+		conversationExportRuleFromMetric(
+			"h4",
+			"H4 tool result 配对",
+			"每条 session 的 tool result/tool call 配对率 >= 0.5",
+			preflight.H4,
+			preflight.H4.FailedCount,
+		),
+	)
+
+	dedupeInput := exportedSessions + summary.DuplicateRemovedCount + summary.SubsequenceRemovedCount
+	d1Removed := summary.RejectedSessionsByReason["exact_duplicate"] + summary.RejectedSessionsByReason["message_subsequence_duplicate"]
+	report.Rules = append(report.Rules, conversationExportDedupeRule(
+		"d1",
+		"D1 精确重复 + 子集去重",
+		"完全一致或连续子序列 session 只保留最完整版本",
+		dedupeInput,
+		d1Removed,
+	))
+
+	d3Removed := summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"]
+	report.Rules = append(report.Rules, conversationExportDedupeRule(
+		"d3",
+		"D3 同源去重",
+		"按 tool_use_id 序列识别同源子集并去重",
+		exportedSessions+d3Removed,
+		d3Removed,
+	))
+
+	return report
+}
+
+func conversationExportRuleFromMetric(key, name, requirement string, metric ConversationQualityMetric, removedCount int64) ConversationExportQualityRule {
+	return ConversationExportQualityRule{
+		Key:              key,
+		Name:             name,
+		Requirement:      requirement,
+		CandidateCount:   metric.CandidateCount,
+		PassedCount:      metric.PassedCount,
+		FailedCount:      metric.FailedCount,
+		RemovedCount:     removedCount,
+		PassRate:         metric.PassRate,
+		RequiredPassRate: metric.RequiredPassRate,
+		Pass:             metric.Pass,
+		Conclusion:       conversationExportQualityConclusion(metric.Pass, metric.FailedCount, removedCount),
+	}
+}
+
+func conversationExportDedupeRule(key, name, requirement string, total, removed int64) ConversationExportQualityRule {
+	passed := total - removed
+	if passed < 0 {
+		passed = 0
+	}
+	passRate := float64(1)
+	if total > 0 {
+		passRate = float64(passed) / float64(total)
+	}
+	conclusion := "无重复"
+	if removed > 0 {
+		conclusion = fmt.Sprintf("已去重 %d 条", removed)
+	}
+	return ConversationExportQualityRule{
+		Key:              key,
+		Name:             name,
+		Requirement:      requirement,
+		CandidateCount:   total,
+		PassedCount:      passed,
+		FailedCount:      removed,
+		RemovedCount:     removed,
+		PassRate:         passRate,
+		RequiredPassRate: 1,
+		Pass:             true,
+		Conclusion:       conclusion,
+	}
+}
+
+func conversationExportQualityConclusion(pass bool, failedCount int64, removedCount int64) string {
+	if pass && failedCount == 0 && removedCount == 0 {
+		return "全部达标"
+	}
+	if failedCount > 0 || removedCount > 0 {
+		count := failedCount
+		if removedCount > count {
+			count = removedCount
+		}
+		return fmt.Sprintf("需关注 %d 条", count)
+	}
+	return "达标"
 }
 
 // ExportJobCreateRequest is the request payload for POST /export_jobs.
@@ -366,10 +525,17 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	}()
 
 	var processErr error
+	exportSummary := ConversationExportSummary{
+		Mode:                     job.Mode,
+		APIExportableRecords:     recordsEligible,
+		TotalSessions:            sessionsEligible,
+		RejectedSessionsByReason: map[string]int64{},
+	}
+	var qualityPreflight ConversationQualityPreflightReport
 	if job.Mode == conversation_log_setting.ExportModeAPIHijackJSONL {
 		processErr = exportAPIHijackSharded(ctx, query, state)
 	} else {
-		processErr = exportSessionsSharded(ctx, query, state)
+		exportSummary, qualityPreflight, processErr = exportSessionsSharded(ctx, query, state)
 	}
 	if processErr != nil {
 		return processErr
@@ -378,10 +544,26 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	if err := state.closeCurrentShard(); err != nil {
 		return err
 	}
+	exportSummary.Mode = job.Mode
+	exportSummary.APIExportableRecords = recordsEligible
+	exportSummary.TotalSessions = sessionsEligible
+	exportSummary.SessionExportableSessions = state.totalSessionCount
+	if exportSummary.RejectedSessionsByReason == nil {
+		exportSummary.RejectedSessionsByReason = map[string]int64{}
+	}
+	qualityReport := buildConversationExportQualityReport(job.Mode, qualityPreflight, exportSummary, state.totalSessionCount)
+	qualityReportJSON := ""
+	if qualityReport != nil {
+		qualityReportBytes, err := common.Marshal(qualityReport)
+		if err != nil {
+			return err
+		}
+		qualityReportJSON = string(qualityReportBytes)
+	}
 
-	// Write top-level manifest. Summary is intentionally minimal — the rich
-	// in-memory summary (per-reason breakdowns, dedup analysis) is too
-	// expensive to compute for a 50 GiB shard run.
+	// Write top-level manifest. The quality summary is accumulated while the
+	// exporter already rebuilds each session, so it does not require an extra
+	// full-table pass or retaining source rows after delete-after-export.
 	manifest := TopManifest{
 		JobID:            job.JobId,
 		SchemaVersion:    "1",
@@ -394,12 +576,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		ShardTargetBytes: job.ShardTargetBytes,
 		ShardMaxBytes:    job.ShardMaxBytes,
 		Filter:           query,
-		Summary: ConversationExportSummary{
-			Mode:                 job.Mode,
-			APIExportableRecords: recordsEligible,
-			TotalSessions:        sessionsEligible,
-		},
-		Shards: state.shards,
+		Summary:          exportSummary,
+		QualityReport:    qualityReport,
+		Shards:           state.shards,
 		Totals: TopManifestTotals{
 			RecordsEligible:   recordsEligible,
 			RecordsExported:   state.totalRecordCount,
@@ -419,8 +598,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	}
 
 	updateJobProgress(job.JobId, map[string]interface{}{
-		"manifest_path": manifestPath,
-		"progress":      "manifest finalized",
+		"manifest_path":       manifestPath,
+		"progress":            "manifest finalized",
+		"quality_report_json": qualityReportJSON,
 	})
 
 	if job.S3Upload {
@@ -466,15 +646,16 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	}
 
 	updateJobProgress(job.JobId, map[string]interface{}{
-		"manifest_path":      manifestPath,
-		"total_records":      recordsEligible,
-		"exported_records":   state.totalRecordCount,
-		"total_sessions":     sessionsEligible,
-		"exported_sessions":  state.totalSessionCount,
-		"uncompressed_bytes": state.totalUncompressed,
-		"compressed_bytes":   state.totalCompressed,
-		"shard_count":        len(state.shards),
-		"progress":           fmt.Sprintf("done: %d shard(s), %d record(s)", len(state.shards), state.totalRecordCount),
+		"manifest_path":       manifestPath,
+		"total_records":       recordsEligible,
+		"exported_records":    state.totalRecordCount,
+		"total_sessions":      sessionsEligible,
+		"exported_sessions":   state.totalSessionCount,
+		"uncompressed_bytes":  state.totalUncompressed,
+		"compressed_bytes":    state.totalCompressed,
+		"shard_count":         len(state.shards),
+		"quality_report_json": qualityReportJSON,
+		"progress":            fmt.Sprintf("done: %d shard(s), %d record(s)", len(state.shards), state.totalRecordCount),
 	})
 
 	return nil
@@ -1776,7 +1957,7 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 	return manager.sortedPaths(), eligible, nil
 }
 
-func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spool *sessionExportSpool, summary *ConversationExportSummary, state *shardWriterState) (int64, error) {
+func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spool *sessionExportSpool, summary *ConversationExportSummary, state *shardWriterState, qualityAcc *qualityPreflightAccumulator) (int64, error) {
 	var totalSessions int64
 	for bucketIndex, path := range bucketPaths {
 		if err := ctx.Err(); err != nil {
@@ -1792,9 +1973,15 @@ func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spo
 			group := groups[sessionID]
 			if group.overflow {
 				summary.RejectedSessionsByReason["session_payload_too_large"]++
+				if qualityAcc != nil {
+					qualityAcc.report.RejectedOversized++
+				}
 				continue
 			}
 			candidate := buildSessionCandidate(sessionID, group.records)
+			if qualityAcc != nil {
+				qualityAcc.addSession(sessionID, candidate)
+			}
 			if len(candidate.Reasons) > 0 {
 				for _, reason := range candidate.Reasons {
 					summary.RejectedSessionsByReason[reason]++
@@ -1869,11 +2056,15 @@ func readSessionBucketGroups(path string) (map[string]*sessionBucketGroup, error
 	return groups, nil
 }
 
-func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) error {
-	summary := &ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
+func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) (ConversationExportSummary, ConversationQualityPreflightReport, error) {
+	summary := &ConversationExportSummary{
+		Mode:                     conversation_log_setting.ExportModeSessionJSONL,
+		RejectedSessionsByReason: map[string]int64{},
+	}
+	qualityAcc := newQualityPreflightAccumulator(conversation_log_setting.ExportModeSessionJSONL)
 	spool, err := newSessionExportSpool(state.tmpDir)
 	if err != nil {
-		return err
+		return *summary, qualityAcc.finalize(), err
 	}
 	defer spool.close()
 
@@ -1882,27 +2073,34 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 	})
 	bucketPaths, eligibleRecords, err := writeSessionBuckets(ctx, query, state)
 	if err != nil {
-		return err
+		return *summary, qualityAcc.finalize(), err
 	}
+	summary.APIExportableRecords = eligibleRecords
 	updateJobProgress(state.jobID, map[string]interface{}{
 		"total_records": eligibleRecords,
 		"progress":      fmt.Sprintf("bucketed %d record(s) into %d session bucket(s)", eligibleRecords, len(bucketPaths)),
 	})
 	if len(bucketPaths) == 0 {
-		return nil
+		return *summary, qualityAcc.finalize(), nil
 	}
 
-	totalSessions, err := buildSessionSpoolFromBuckets(ctx, bucketPaths, spool, summary, state)
+	totalSessions, err := buildSessionSpoolFromBuckets(ctx, bucketPaths, spool, summary, state, qualityAcc)
 	if err != nil {
-		return err
+		return *summary, qualityAcc.finalize(), err
 	}
+	summary.TotalSessions = totalSessions
+	qualityAcc.report.CheckedRecords = eligibleRecords
+	qualityAcc.report.CheckedSessions = totalSessions
 	if err := spool.close(); err != nil {
-		return err
+		return *summary, qualityAcc.finalize(), err
 	}
 	keep, duplicateRemoved, subsequenceRemoved, err := dedupeSessionSpool(ctx, spool.metaPath, summary)
 	if err != nil {
-		return err
+		return *summary, qualityAcc.finalize(), err
 	}
+	summary.DuplicateRemovedCount = int64(duplicateRemoved)
+	summary.SubsequenceRemovedCount = int64(subsequenceRemoved)
+	summary.SessionExportableSessions = int64(len(keep))
 	if duplicateRemoved > 0 || subsequenceRemoved > 0 {
 		common.SysLog(fmt.Sprintf("export job: removed %d exact duplicate session(s), %d D2/D3 subsequence session(s)", duplicateRemoved, subsequenceRemoved))
 	}
@@ -1911,7 +2109,10 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 		"progress":       fmt.Sprintf("deduplicated sessions: %d exportable of %d", len(keep), spool.count),
 	})
 
-	return streamSessionSpoolToShards(ctx, spool, keep, state)
+	if err := streamSessionSpoolToShards(ctx, spool, keep, state); err != nil {
+		return *summary, qualityAcc.finalize(), err
+	}
+	return *summary, qualityAcc.finalize(), nil
 }
 
 // CleanupOrphanedExportJobs is called on service startup to mark jobs that were

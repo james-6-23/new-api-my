@@ -12,6 +12,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -272,6 +273,64 @@ func TestSessionSpoolDedupRemovesD1D2AndD3WithoutLoadingBodies(t *testing.T) {
 	require.EqualValues(t, 1, summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"])
 }
 
+func TestBuildConversationExportQualityReportIncludesRulesAndDedupe(t *testing.T) {
+	preflight := ConversationQualityPreflightReport{
+		Mode:             conversation_log_setting.ExportModeSessionJSONL,
+		Scope:            "reconstructed_session",
+		CandidateCount:   10,
+		RequiredPassRate: 0.95,
+		H1: ConversationQualityMetric{
+			CandidateCount:   10,
+			PassedCount:      9,
+			FailedCount:      1,
+			PassRate:         0.9,
+			RequiredPassRate: 0.95,
+			Pass:             false,
+		},
+		H2: ConversationQualityMetric{
+			CandidateCount:   10,
+			PassedCount:      10,
+			PassRate:         1,
+			RequiredPassRate: 0.95,
+			Pass:             true,
+		},
+		H3: ConversationQualityMetric{
+			CandidateCount:   10,
+			PassedCount:      10,
+			PassRate:         1,
+			RequiredPassRate: 0.95,
+			Pass:             true,
+		},
+		H4: ConversationQualityMetric{
+			CandidateCount:   10,
+			PassedCount:      10,
+			PassRate:         1,
+			RequiredPassRate: 0.95,
+			Pass:             true,
+		},
+	}
+	summary := ConversationExportSummary{
+		RejectedSessionsByReason: map[string]int64{
+			"exact_duplicate":               1,
+			"message_subsequence_duplicate": 2,
+			"tool_id_subsequence_duplicate": 1,
+		},
+		DuplicateRemovedCount:   1,
+		SubsequenceRemovedCount: 3,
+	}
+
+	report := buildConversationExportQualityReport(conversation_log_setting.ExportModeSessionJSONL, preflight, summary, 6)
+
+	require.NotNil(t, report)
+	require.EqualValues(t, 10, report.CandidateCount)
+	require.EqualValues(t, 6, report.ExportedSessions)
+	require.Len(t, report.Rules, 6)
+	require.Equal(t, "h1", report.Rules[0].Key)
+	require.False(t, report.Rules[0].Pass)
+	require.EqualValues(t, 3, report.Rules[4].RemovedCount)
+	require.EqualValues(t, 1, report.Rules[5].RemovedCount)
+}
+
 func TestSessionBucketRebuildKeepsInterleavedSessionComplete(t *testing.T) {
 	dir := t.TempDir()
 	manager, err := newSessionBucketWriterManager(dir)
@@ -300,10 +359,14 @@ func TestSessionBucketRebuildKeepsInterleavedSessionComplete(t *testing.T) {
 	spool, err := newSessionExportSpool(dir)
 	require.NoError(t, err)
 	summary := ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
-	totalSessions, err := buildSessionSpoolFromBuckets(context.Background(), manager.sortedPaths(), spool, &summary, nil)
+	qualityAcc := newQualityPreflightAccumulator(conversation_log_setting.ExportModeSessionJSONL)
+	totalSessions, err := buildSessionSpoolFromBuckets(context.Background(), manager.sortedPaths(), spool, &summary, nil, qualityAcc)
 	require.NoError(t, err)
 	require.NoError(t, spool.close())
 	require.EqualValues(t, 2, totalSessions)
+	qualityReport := qualityAcc.finalize()
+	require.EqualValues(t, 2, qualityReport.CandidateCount)
+	require.EqualValues(t, 2, qualityReport.H1.PassedCount)
 
 	metaFile, err := os.Open(spool.metaPath)
 	require.NoError(t, err)
