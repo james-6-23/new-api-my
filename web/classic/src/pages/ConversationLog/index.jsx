@@ -215,6 +215,7 @@ const ConversationLog = () => {
   const [settings, setSettings] = useState(defaultSettings);
   const [summary, setSummary] = useState(null);
   const [exportSummary, setExportSummary] = useState(null);
+  const [exportSummaryLoading, setExportSummaryLoading] = useState(false);
   const [logs, setLogs] = useState([]);
   const [logCount, setLogCount] = useState(0);
   const [activePage, setActivePage] = useState(1);
@@ -223,18 +224,19 @@ const ConversationLog = () => {
   const [detailVisible, setDetailVisible] = useState(false);
   const [detail, setDetail] = useState(null);
 
-  const compliantCount =
-    mode === 'session_jsonl'
+  const hasExportSummary = !!exportSummary;
+  const compliantCount = hasExportSummary
+    ? mode === 'session_jsonl'
       ? exportSummary?.session_exportable_sessions || 0
-      : exportSummary?.api_exportable_records || 0;
+      : exportSummary?.api_exportable_records || 0
+    : 0;
 
   const getFilterParams = () =>
     normalizeFilterParams(filterFormRef.current?.getValues() || {});
 
-  const loadSummary = async (targetMode = mode) => {
+  const loadSummary = async () => {
     setSummaryLoading(true);
     try {
-      const filters = getFilterParams();
       const summaryRes = await API.get('/api/conversation_logs/summary', {
         disableDuplicate: true,
       });
@@ -267,28 +269,29 @@ const ConversationLog = () => {
       } else {
         showError(summaryRes.data.message);
       }
-
-      try {
-        const exportRes = await API.get(
-          '/api/conversation_logs/export_summary',
-          {
-            params: { ...filters, mode: targetMode },
-            disableDuplicate: true,
-          },
-        );
-
-        if (exportRes.data.success) {
-          setExportSummary(exportRes.data.data);
-        } else {
-          showError(exportRes.data.message);
-        }
-      } catch (exportError) {
-        showError(exportError.message || t('刷新失败'));
-      }
     } catch (error) {
       showError(error.message || t('刷新失败'));
     } finally {
       setSummaryLoading(false);
+    }
+  };
+
+  const loadExportSummary = async (targetMode = mode) => {
+    setExportSummaryLoading(true);
+    try {
+      const exportRes = await API.get('/api/conversation_logs/export_summary', {
+        params: { ...getFilterParams(), mode: targetMode },
+        disableDuplicate: true,
+      });
+      if (exportRes.data.success) {
+        setExportSummary(exportRes.data.data);
+      } else {
+        showError(exportRes.data.message);
+      }
+    } catch (error) {
+      showError(error.message || t('刷新失败'));
+    } finally {
+      setExportSummaryLoading(false);
     }
   };
 
@@ -318,7 +321,7 @@ const ConversationLog = () => {
   };
 
   const refreshAll = async (nextPage = activePage, nextPageSize = pageSize) => {
-    await Promise.all([loadSummary(mode), loadLogs(nextPage, nextPageSize)]);
+    await Promise.all([loadSummary(), loadLogs(nextPage, nextPageSize)]);
   };
 
   const saveSettings = async () => {
@@ -347,7 +350,7 @@ const ConversationLog = () => {
       };
       settingsFormRef.current?.setValues(formValues);
       showSuccess(t('保存成功'));
-      await loadSummary(mode);
+      await loadSummary();
     } catch (error) {
       showError(error.message || t('保存失败，请重试'));
     } finally {
@@ -387,6 +390,10 @@ const ConversationLog = () => {
   };
 
   const exportJSONL = async () => {
+    if (!hasExportSummary) {
+      showWarning(t('请先刷新统计'));
+      return;
+    }
     if (compliantCount <= 0) {
       showWarning(t('当前模式没有可导出的合规数据'));
       return;
@@ -410,6 +417,7 @@ const ConversationLog = () => {
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
       showSuccess(t('导出成功'));
+      setExportSummary(null);
       await refreshAll(1, pageSize);
       setActivePage(1);
     } catch (error) {
@@ -444,6 +452,7 @@ const ConversationLog = () => {
             ),
           );
           setActivePage(1);
+          setExportSummary(null);
           await refreshAll(1, pageSize);
         } catch (error) {
           showError(error.message || t('删除失败'));
@@ -456,17 +465,19 @@ const ConversationLog = () => {
 
   const handleModeChange = (value) => {
     setMode(value);
-    loadSummary(value);
+    setExportSummary(null);
   };
 
   const handleSearch = async () => {
     setActivePage(1);
+    setExportSummary(null);
     await refreshAll(1, pageSize);
   };
 
   const handleReset = async () => {
     filterFormRef.current?.reset();
     setActivePage(1);
+    setExportSummary(null);
     await refreshAll(1, pageSize);
   };
 
@@ -1060,7 +1071,7 @@ const ConversationLog = () => {
                 title={t('导出概览')}
                 bordered
               >
-                <Spin spinning={summaryLoading}>
+                <Spin spinning={exportSummaryLoading}>
                   <div className='flex flex-col gap-4'>
                     <Form layout='vertical'>
                       <Form.Select
@@ -1084,7 +1095,7 @@ const ConversationLog = () => {
                           {t('当前筛选可导出')}
                         </Text>
                         <Text strong className='text-sm'>
-                          {compliantCount}
+                          {hasExportSummary ? compliantCount : '-'}
                         </Text>
                       </div>
                       <div className='flex xl:flex-row flex-col justify-between xl:items-center'>
@@ -1092,7 +1103,9 @@ const ConversationLog = () => {
                           {t('API 合规记录')}
                         </Text>
                         <Text strong className='text-sm'>
-                          {exportSummary?.api_exportable_records ?? 0}
+                          {hasExportSummary
+                            ? (exportSummary?.api_exportable_records ?? 0)
+                            : '-'}
                         </Text>
                       </div>
                       <div className='flex xl:flex-row flex-col justify-between xl:items-center'>
@@ -1100,7 +1113,9 @@ const ConversationLog = () => {
                           {t('Session 合规会话')}
                         </Text>
                         <Text strong className='text-sm'>
-                          {exportSummary?.session_exportable_sessions ?? 0}
+                          {hasExportSummary
+                            ? (exportSummary?.session_exportable_sessions ?? 0)
+                            : '-'}
                         </Text>
                       </div>
                     </div>
@@ -1108,7 +1123,8 @@ const ConversationLog = () => {
                       <Button
                         size='small'
                         icon={<IconRefresh />}
-                        onClick={() => loadSummary(mode)}
+                        loading={exportSummaryLoading}
+                        onClick={() => loadExportSummary(mode)}
                       >
                         {t('刷新统计')}
                       </Button>
@@ -1117,7 +1133,7 @@ const ConversationLog = () => {
                         type='primary'
                         icon={<IconDownload />}
                         loading={exportLoading}
-                        disabled={compliantCount <= 0}
+                        disabled={!hasExportSummary || compliantCount <= 0}
                         onClick={exportJSONL}
                       >
                         {t('预览导出 JSONL')}

@@ -34,7 +34,7 @@ type conversationLogFilterPayload struct {
 }
 
 func GetConversationLogSummary(c *gin.Context) {
-	summary, err := model.GetConversationLogSummary()
+	summary, err := model.GetConversationLogSummaryCached()
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -47,7 +47,7 @@ func GetConversationLogSummary(c *gin.Context) {
 
 func GetConversationLogExportSummary(c *gin.Context) {
 	mode := conversationLogMode(c.Query("mode"))
-	exportSummary, err := service.BuildConversationLogExportSummary(c.Request.Context(), parseConversationLogQuery(c), mode)
+	exportSummary, err := service.BuildConversationLogExportSummaryCached(c.Request.Context(), parseConversationLogQuery(c), mode)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -78,7 +78,7 @@ func GetConversationLogQualityPreflight(c *gin.Context) {
 func GetConversationLogs(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	query := parseConversationLogQuery(c)
-	logs, total, err := model.GetConversationLogs(query, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	logs, total, err := model.GetConversationLogsWithCachedCount(query, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
 		common.ApiError(c, err)
 		return

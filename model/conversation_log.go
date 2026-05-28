@@ -2,15 +2,26 @@ package model
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/cachex"
+
+	"github.com/samber/hot"
 	"gorm.io/gorm"
 )
 
 type ConversationLog struct {
-	Id                      int    `json:"id" gorm:"index:idx_conversation_logs_created_id,priority:2"`
-	CreatedAt               int64  `json:"created_at" gorm:"bigint;index:idx_conversation_logs_created_id,priority:1"`
+	Id                      int    `json:"id" gorm:"index:idx_conversation_logs_created_id,priority:2;index:idx_conversation_logs_validation_created_id,priority:3;index:idx_conversation_logs_exported_created_id,priority:3;index:idx_conversation_logs_session_created_id,priority:3"`
+	CreatedAt               int64  `json:"created_at" gorm:"bigint;index:idx_conversation_logs_created_id,priority:1;index:idx_conversation_logs_validation_created_id,priority:2;index:idx_conversation_logs_exported_created_id,priority:2;index:idx_conversation_logs_session_created_id,priority:2"`
 	RequestId               string `json:"request_id" gorm:"type:varchar(64);index;default:''"`
 	UserId                  int    `json:"user_id" gorm:"index"`
 	Username                string `json:"username" gorm:"index;default:''"`
@@ -23,7 +34,7 @@ type ConversationLog struct {
 	RelayFormat             string `json:"relay_format" gorm:"type:varchar(64);index;default:''"`
 	FinalRequestFormat      string `json:"final_request_format" gorm:"type:varchar(64);index;default:''"`
 	RequestPath             string `json:"request_path" gorm:"type:varchar(255);default:''"`
-	SessionId               string `json:"session_id" gorm:"type:varchar(128);index;default:''"`
+	SessionId               string `json:"session_id" gorm:"type:varchar(128);index;index:idx_conversation_logs_validation_session,priority:2;index:idx_conversation_logs_session_created_id,priority:1;default:''"`
 	SessionIdSource         string `json:"session_id_source" gorm:"type:varchar(64);default:''"`
 	SessionIdConfidence     string `json:"session_id_confidence" gorm:"type:varchar(16);index;default:''"`
 	Provider                string `json:"provider" gorm:"type:varchar(64);index;default:''"`
@@ -39,10 +50,10 @@ type ConversationLog struct {
 	IsStream                bool   `json:"is_stream" gorm:"index"`
 	StatusCode              int    `json:"status_code" gorm:"default:200"`
 	UsageJSON               string `json:"usage_json,omitempty" gorm:"type:text"`
-	ValidationStatus        string `json:"validation_status" gorm:"type:varchar(32);index;default:''"`
+	ValidationStatus        string `json:"validation_status" gorm:"type:varchar(32);index;index:idx_conversation_logs_validation_created_id,priority:1;index:idx_conversation_logs_validation_session,priority:1;default:''"`
 	InvalidReason           string `json:"invalid_reason,omitempty" gorm:"type:text"`
 	StorageBytes            int64  `json:"storage_bytes" gorm:"bigint;index"`
-	ExportedAt              int64  `json:"exported_at" gorm:"bigint;index;default:0"`
+	ExportedAt              int64  `json:"exported_at" gorm:"bigint;index;index:idx_conversation_logs_exported_created_id,priority:1;default:0"`
 	ExportBatchId           string `json:"export_batch_id" gorm:"type:varchar(64);index;default:''"`
 	DeletedAfterExport      bool   `json:"deleted_after_export" gorm:"default:false"`
 }
@@ -71,6 +82,191 @@ type ConversationLogSummary struct {
 	InvalidCount       int64 `json:"invalid_count"`
 	EarliestCreatedAt  int64 `json:"earliest_created_at"`
 	LatestCreatedAt    int64 `json:"latest_created_at"`
+}
+
+type ConversationLogEligibleCounts struct {
+	Records  int64 `json:"records"`
+	Sessions int64 `json:"sessions"`
+}
+
+const (
+	conversationLogStatsCacheTTL                = 30 * time.Second
+	conversationLogCreateInvalidationInterval   = 30 * time.Second
+	conversationLogMutationInvalidationInterval = 5 * time.Second
+)
+
+var (
+	conversationLogSummaryCacheOnce sync.Once
+	conversationLogSummaryCache     *cachex.HybridCache[ConversationLogSummary]
+	conversationLogCountCacheOnce   sync.Once
+	conversationLogCountCache       *cachex.HybridCache[int64]
+	conversationLogEligibleOnce     sync.Once
+	conversationLogEligibleCache    *cachex.HybridCache[ConversationLogEligibleCounts]
+
+	conversationLogSummaryCacheMu  sync.Mutex
+	conversationLogCountCacheMu    sync.Mutex
+	conversationLogEligibleCacheMu sync.Mutex
+	conversationLogLastInvalidate  atomic.Int64
+)
+
+type conversationLogSummaryCodec struct{}
+
+func (conversationLogSummaryCodec) Encode(v ConversationLogSummary) (string, error) {
+	data, err := common.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (conversationLogSummaryCodec) Decode(s string) (ConversationLogSummary, error) {
+	var v ConversationLogSummary
+	if strings.TrimSpace(s) == "" {
+		return v, fmt.Errorf("empty conversation log summary cache value")
+	}
+	if err := common.Unmarshal([]byte(s), &v); err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+type conversationLogEligibleCountsCodec struct{}
+
+func (conversationLogEligibleCountsCodec) Encode(v ConversationLogEligibleCounts) (string, error) {
+	data, err := common.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (conversationLogEligibleCountsCodec) Decode(s string) (ConversationLogEligibleCounts, error) {
+	var v ConversationLogEligibleCounts
+	if strings.TrimSpace(s) == "" {
+		return v, fmt.Errorf("empty conversation log eligible count cache value")
+	}
+	if err := common.Unmarshal([]byte(s), &v); err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+type int64CacheCodec struct{}
+
+func (int64CacheCodec) Encode(v int64) (string, error) {
+	return strconv.FormatInt(v, 10), nil
+}
+
+func (int64CacheCodec) Decode(s string) (int64, error) {
+	return strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+}
+
+func getConversationLogSummaryCache() *cachex.HybridCache[ConversationLogSummary] {
+	conversationLogSummaryCacheOnce.Do(func() {
+		conversationLogSummaryCache = cachex.NewHybridCache[ConversationLogSummary](cachex.HybridCacheConfig[ConversationLogSummary]{
+			Namespace:  cachex.Namespace("conversation_logs:summary:v1"),
+			Redis:      common.RDB,
+			RedisCodec: conversationLogSummaryCodec{},
+			RedisEnabled: func() bool {
+				return common.RedisEnabled && common.RDB != nil
+			},
+			Memory: func() *hot.HotCache[string, ConversationLogSummary] {
+				return hot.NewHotCache[string, ConversationLogSummary](hot.LRU, 8).
+					WithTTL(conversationLogStatsCacheTTL).
+					WithJanitor().
+					Build()
+			},
+		})
+	})
+	return conversationLogSummaryCache
+}
+
+func getConversationLogCountCache() *cachex.HybridCache[int64] {
+	conversationLogCountCacheOnce.Do(func() {
+		conversationLogCountCache = cachex.NewHybridCache[int64](cachex.HybridCacheConfig[int64]{
+			Namespace:  cachex.Namespace("conversation_logs:count:v1"),
+			Redis:      common.RDB,
+			RedisCodec: int64CacheCodec{},
+			RedisEnabled: func() bool {
+				return common.RedisEnabled && common.RDB != nil
+			},
+			Memory: func() *hot.HotCache[string, int64] {
+				return hot.NewHotCache[string, int64](hot.LRU, 2048).
+					WithTTL(conversationLogStatsCacheTTL).
+					WithJanitor().
+					Build()
+			},
+		})
+	})
+	return conversationLogCountCache
+}
+
+func getConversationLogEligibleCache() *cachex.HybridCache[ConversationLogEligibleCounts] {
+	conversationLogEligibleOnce.Do(func() {
+		conversationLogEligibleCache = cachex.NewHybridCache[ConversationLogEligibleCounts](cachex.HybridCacheConfig[ConversationLogEligibleCounts]{
+			Namespace:  cachex.Namespace("conversation_logs:eligible:v1"),
+			Redis:      common.RDB,
+			RedisCodec: conversationLogEligibleCountsCodec{},
+			RedisEnabled: func() bool {
+				return common.RedisEnabled && common.RDB != nil
+			},
+			Memory: func() *hot.HotCache[string, ConversationLogEligibleCounts] {
+				return hot.NewHotCache[string, ConversationLogEligibleCounts](hot.LRU, 1024).
+					WithTTL(conversationLogStatsCacheTTL).
+					WithJanitor().
+					Build()
+			},
+		})
+	})
+	return conversationLogEligibleCache
+}
+
+func conversationLogQueryCacheKey(prefix string, query ConversationLogQuery, extras ...string) string {
+	payload := struct {
+		Query  ConversationLogQuery `json:"query"`
+		Extras []string             `json:"extras,omitempty"`
+	}{
+		Query:  query,
+		Extras: extras,
+	}
+	data, err := common.Marshal(payload)
+	if err != nil {
+		return prefix
+	}
+	sum := sha256.Sum256(data)
+	return prefix + ":" + hex.EncodeToString(sum[:])
+}
+
+func InvalidateConversationLogStatsCache() {
+	conversationLogLastInvalidate.Store(time.Now().Unix())
+	for name, purge := range map[string]func() error{
+		"summary":  getConversationLogSummaryCache().Purge,
+		"count":    getConversationLogCountCache().Purge,
+		"eligible": getConversationLogEligibleCache().Purge,
+	} {
+		if err := purge(); err != nil {
+			common.SysLog(fmt.Sprintf("conversation log %s cache purge failed: %v", name, err))
+		}
+	}
+}
+
+func invalidateConversationLogStatsCacheThrottled(interval time.Duration) {
+	now := time.Now().Unix()
+	last := conversationLogLastInvalidate.Load()
+	if now-last < int64(interval/time.Second) {
+		return
+	}
+	if conversationLogLastInvalidate.CompareAndSwap(last, now) {
+		for name, purge := range map[string]func() error{
+			"summary":  getConversationLogSummaryCache().Purge,
+			"count":    getConversationLogCountCache().Purge,
+			"eligible": getConversationLogEligibleCache().Purge,
+		} {
+			if err := purge(); err != nil {
+				common.SysLog(fmt.Sprintf("conversation log %s cache purge failed: %v", name, err))
+			}
+		}
+	}
 }
 
 func applyConversationLogQuery(db *gorm.DB, query ConversationLogQuery) *gorm.DB {
@@ -128,7 +324,11 @@ func conversationLogDBWithContext(ctx context.Context) *gorm.DB {
 }
 
 func CreateConversationLog(log *ConversationLog) error {
-	return LOG_DB.Create(log).Error
+	err := LOG_DB.Create(log).Error
+	if err == nil {
+		invalidateConversationLogStatsCacheThrottled(conversationLogCreateInvalidationInterval)
+	}
+	return err
 }
 
 func GetConversationLogByID(id int) (*ConversationLog, error) {
@@ -148,13 +348,40 @@ func GetConversationLogsByIDs(ids []int) ([]*ConversationLog, error) {
 	return logs, err
 }
 
-func GetConversationLogs(query ConversationLogQuery, startIdx int, num int) ([]*ConversationLog, int64, error) {
+func countConversationLogs(query ConversationLogQuery) (int64, error) {
 	var total int64
 	base := applyConversationLogQuery(LOG_DB.Model(&ConversationLog{}), query)
 	if err := base.Count(&total).Error; err != nil {
-		return nil, 0, err
+		return 0, err
+	}
+	return total, nil
+}
+
+func countConversationLogsCached(query ConversationLogQuery) (int64, error) {
+	key := conversationLogQueryCacheKey("total", query)
+	cache := getConversationLogCountCache()
+	if total, found, err := cache.Get(key); err == nil && found {
+		return total, nil
+	} else if err != nil {
+		common.SysLog("conversation log count cache get failed: " + err.Error())
 	}
 
+	conversationLogCountCacheMu.Lock()
+	defer conversationLogCountCacheMu.Unlock()
+	if total, found, err := cache.Get(key); err == nil && found {
+		return total, nil
+	}
+	total, err := countConversationLogs(query)
+	if err != nil {
+		return 0, err
+	}
+	if err := cache.SetWithTTL(key, total, conversationLogStatsCacheTTL); err != nil {
+		common.SysLog("conversation log count cache set failed: " + err.Error())
+	}
+	return total, nil
+}
+
+func listConversationLogs(query ConversationLogQuery, startIdx int, num int) ([]*ConversationLog, error) {
 	var logs []*ConversationLog
 	err := applyConversationLogQuery(LOG_DB.Model(&ConversationLog{}), query).
 		Select("id, created_at, request_id, user_id, username, token_id, token_name, channel_id, " + logGroupCol + ", model_name, upstream_model_name, relay_format, final_request_format, request_path, session_id, session_id_source, session_id_confidence, provider, request_time, response_time, is_stream, status_code, validation_status, invalid_reason, storage_bytes, exported_at, export_batch_id, deleted_after_export").
@@ -162,6 +389,24 @@ func GetConversationLogs(query ConversationLogQuery, startIdx int, num int) ([]*
 		Offset(startIdx).
 		Limit(num).
 		Find(&logs).Error
+	return logs, err
+}
+
+func GetConversationLogs(query ConversationLogQuery, startIdx int, num int) ([]*ConversationLog, int64, error) {
+	total, err := countConversationLogs(query)
+	if err != nil {
+		return nil, 0, err
+	}
+	logs, err := listConversationLogs(query, startIdx, num)
+	return logs, total, err
+}
+
+func GetConversationLogsWithCachedCount(query ConversationLogQuery, startIdx int, num int) ([]*ConversationLog, int64, error) {
+	total, err := countConversationLogsCached(query)
+	if err != nil {
+		return nil, 0, err
+	}
+	logs, err := listConversationLogs(query, startIdx, num)
 	return logs, total, err
 }
 
@@ -203,6 +448,30 @@ func GetConversationLogSummary() (ConversationLogSummary, error) {
 	return summary, nil
 }
 
+func GetConversationLogSummaryCached() (ConversationLogSummary, error) {
+	const key = "global"
+	cache := getConversationLogSummaryCache()
+	if summary, found, err := cache.Get(key); err == nil && found {
+		return summary, nil
+	} else if err != nil {
+		common.SysLog("conversation log summary cache get failed: " + err.Error())
+	}
+
+	conversationLogSummaryCacheMu.Lock()
+	defer conversationLogSummaryCacheMu.Unlock()
+	if summary, found, err := cache.Get(key); err == nil && found {
+		return summary, nil
+	}
+	summary, err := GetConversationLogSummary()
+	if err != nil {
+		return summary, err
+	}
+	if err := cache.SetWithTTL(key, summary, conversationLogStatsCacheTTL); err != nil {
+		common.SysLog("conversation log summary cache set failed: " + err.Error())
+	}
+	return summary, nil
+}
+
 // CountEligibleConversationLogs returns (records, distinct_sessions) for
 // validation_status = "valid" rows matching the query. Used by export jobs
 // that need totals without instantiating every row in memory.
@@ -231,6 +500,36 @@ func CountEligibleConversationLogs(ctx context.Context, query ConversationLogQue
 		Where("session_id <> ?", "")
 	if err := sessionDB.Distinct("session_id").Count(&sessions).Error; err != nil {
 		return records, 0, err
+	}
+	return records, sessions, nil
+}
+
+func CountEligibleConversationLogsCached(ctx context.Context, query ConversationLogQuery, countSessions bool) (int64, int64, error) {
+	key := conversationLogQueryCacheKey("eligible", query, "sessions="+strconv.FormatBool(countSessions))
+	cache := getConversationLogEligibleCache()
+	if counts, found, err := cache.Get(key); err == nil && found {
+		if !countSessions {
+			return counts.Records, 0, nil
+		}
+		return counts.Records, counts.Sessions, nil
+	} else if err != nil {
+		common.SysLog("conversation log eligible cache get failed: " + err.Error())
+	}
+
+	conversationLogEligibleCacheMu.Lock()
+	defer conversationLogEligibleCacheMu.Unlock()
+	if counts, found, err := cache.Get(key); err == nil && found {
+		if !countSessions {
+			return counts.Records, 0, nil
+		}
+		return counts.Records, counts.Sessions, nil
+	}
+	records, sessions, err := CountEligibleConversationLogs(ctx, query, countSessions)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := cache.SetWithTTL(key, ConversationLogEligibleCounts{Records: records, Sessions: sessions}, conversationLogStatsCacheTTL); err != nil {
+		common.SysLog("conversation log eligible cache set failed: " + err.Error())
 	}
 	return records, sessions, nil
 }
@@ -269,12 +568,16 @@ func MarkConversationLogsExported(ids []int, batchID string, exportedAt int64) e
 	if len(ids) == 0 {
 		return nil
 	}
-	return LOG_DB.Model(&ConversationLog{}).
+	err := LOG_DB.Model(&ConversationLog{}).
 		Where("id IN ?", ids).
 		Updates(map[string]interface{}{
 			"exported_at":     exportedAt,
 			"export_batch_id": batchID,
 		}).Error
+	if err == nil {
+		invalidateConversationLogStatsCacheThrottled(conversationLogMutationInvalidationInterval)
+	}
+	return err
 }
 
 func DeleteConversationLogsByIDs(ids []int) (int64, error) {
@@ -282,6 +585,9 @@ func DeleteConversationLogsByIDs(ids []int) (int64, error) {
 		return 0, nil
 	}
 	result := LOG_DB.Where("id IN ?", ids).Delete(&ConversationLog{})
+	if result.Error == nil && result.RowsAffected > 0 {
+		invalidateConversationLogStatsCacheThrottled(conversationLogMutationInvalidationInterval)
+	}
 	return result.RowsAffected, result.Error
 }
 
@@ -311,6 +617,9 @@ func DeleteConversationLogsByExportBatchID(ctx context.Context, batchID string, 
 			return total, err
 		}
 		if len(logs) == 0 {
+			if total > 0 {
+				InvalidateConversationLogStatsCache()
+			}
 			return total, nil
 		}
 		ids := make([]int, 0, len(logs))
@@ -339,6 +648,9 @@ func DeleteConversationLogsByQuery(ctx context.Context, query ConversationLogQue
 		total += rows
 		return nil
 	})
+	if err == nil && total > 0 {
+		InvalidateConversationLogStatsCache()
+	}
 	return total, err
 }
 
@@ -410,6 +722,9 @@ func TrimConversationLogsByStorageLimit(ctx context.Context, maxBytes int64, bat
 		if err := deleteBatch(false); err != nil {
 			return deleted, err
 		}
+	}
+	if deleted > 0 {
+		InvalidateConversationLogStatsCache()
 	}
 	return deleted, nil
 }

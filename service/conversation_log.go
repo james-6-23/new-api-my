@@ -382,6 +382,14 @@ const summaryInMemoryRecordCap = 50000
 const summaryTotalRecordsCap = 200000
 
 func BuildConversationLogExportSummary(ctx context.Context, query model.ConversationLogQuery, mode string) (ConversationExportSummary, error) {
+	return buildConversationLogExportSummary(ctx, query, mode, false)
+}
+
+func BuildConversationLogExportSummaryCached(ctx context.Context, query model.ConversationLogQuery, mode string) (ConversationExportSummary, error) {
+	return buildConversationLogExportSummary(ctx, query, mode, true)
+}
+
+func buildConversationLogExportSummary(ctx context.Context, query model.ConversationLogQuery, mode string, useCachedCounts bool) (ConversationExportSummary, error) {
 	if !conversation_log_setting.IsValidExportMode(mode) {
 		mode = conversation_log_setting.ExportModeSessionJSONL
 	}
@@ -396,7 +404,11 @@ func BuildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	// gets the headline numbers it cares about (eligible records / sessions);
 	// callers that need per-reason breakdowns must narrow their filter first.
 	needSessions := mode == conversation_log_setting.ExportModeSessionJSONL
-	records, sessions, cerr := model.CountEligibleConversationLogs(ctx, query, needSessions)
+	countFn := model.CountEligibleConversationLogs
+	if useCachedCounts {
+		countFn = model.CountEligibleConversationLogsCached
+	}
+	records, sessions, cerr := countFn(ctx, query, needSessions)
 	if cerr == nil && records > summaryTotalRecordsCap {
 		summary.TotalCapturedRecords = records
 		summary.APIExportableRecords = records
