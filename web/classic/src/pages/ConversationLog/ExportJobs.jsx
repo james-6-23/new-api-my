@@ -88,31 +88,144 @@ function formatInteger(value) {
   return Number.isFinite(number) ? number.toLocaleString() : '0';
 }
 
-function QualityReportPanel({ job, t }) {
-  const report = parseQualityReport(job);
-  if (!report) {
-    const emptyText =
-      job?.mode === 'session_jsonl'
-        ? t('该任务暂无达标快照，请使用新版导出任务重新生成后查看。')
-        : t('API Hijack JSONL 不生成 session 级 H1-H4/D1/D3 达标快照。');
-    return (
-      <div className='rounded-lg border border-dashed border-[var(--semi-color-border)] bg-[var(--semi-color-fill-0)] p-4'>
-        <Text type='tertiary'>{emptyText}</Text>
-      </div>
-    );
+function QualityToolWarnings({ report, t }) {
+  if (
+    !report ||
+    ((report.undefined_tools?.length || 0) === 0 &&
+      (report.incomplete_tools?.length || 0) === 0)
+  ) {
+    return null;
   }
+  return (
+    <div className='mt-3 flex flex-col gap-2'>
+      {report.undefined_tools?.length > 0 && (
+        <div>
+          <Text type='tertiary' size='small'>
+            {t('未定义工具 Top')}
+          </Text>
+          <div className='mt-1 flex flex-wrap gap-1'>
+            {report.undefined_tools.slice(0, 12).map((item) => (
+              <Tag key={`u-${item.name}`} color='red'>
+                {item.name} x{item.count}
+              </Tag>
+            ))}
+          </div>
+        </div>
+      )}
+      {report.incomplete_tools?.length > 0 && (
+        <div>
+          <Text type='tertiary' size='small'>
+            {t('schema 不完整工具 Top')}
+          </Text>
+          <div className='mt-1 flex flex-wrap gap-1'>
+            {report.incomplete_tools.slice(0, 12).map((item) => (
+              <Tag key={`i-${item.name}`} color='orange'>
+                {item.name} x{item.count}
+              </Tag>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
+function QualityRuleTable({ rules, t }) {
+  return (
+    <div className='overflow-x-auto'>
+      <table className='w-full min-w-[760px] border-collapse text-sm'>
+        <thead>
+          <tr className='border-b border-[var(--semi-color-border)] text-left text-[var(--semi-color-text-2)]'>
+            <th className='py-2 pr-3 font-medium'>{t('准入项')}</th>
+            <th className='py-2 pr-3 font-medium'>{t('要求')}</th>
+            <th className='py-2 pr-3 text-right font-medium'>
+              {t('候选通过')}
+            </th>
+            <th className='py-2 pr-3 text-right font-medium'>
+              {t('通过率')}
+            </th>
+            <th className='py-2 pr-3 text-right font-medium'>
+              {t('剔除/去重')}
+            </th>
+            <th className='py-2 font-medium'>{t('结论')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rules.map((rule) => (
+            <tr
+              key={rule.key || rule.name}
+              className='border-b border-[var(--semi-color-border)] last:border-b-0'
+            >
+              <td className='py-2 pr-3 font-medium'>
+                {rule.name || rule.key}
+              </td>
+              <td className='py-2 pr-3 text-[var(--semi-color-text-1)]'>
+                {rule.requirement || '-'}
+              </td>
+              <td className='py-2 pr-3 text-right font-mono'>
+                {formatInteger(rule.passed_count)} /{' '}
+                {formatInteger(rule.candidate_count)}
+              </td>
+              <td className='py-2 pr-3 text-right font-mono'>
+                {formatRate(rule.pass_rate)}
+              </td>
+              <td className='py-2 pr-3 text-right font-mono'>
+                {formatInteger(rule.removed_count)}
+              </td>
+              <td className='py-2'>
+                <Tag color={rule.pass ? 'green' : 'red'}>
+                  {rule.conclusion || (rule.pass ? t('达标') : t('需关注'))}
+                </Tag>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function QualityRuleList({ rules, t }) {
+  return (
+    <div className='flex flex-col divide-y divide-[var(--semi-color-border)]'>
+      {rules.map((rule) => (
+        <div
+          key={rule.key || rule.name}
+          className='grid grid-cols-[1fr_auto] gap-2 py-2 text-sm'
+        >
+          <div className='min-w-0'>
+            <div className='truncate font-medium'>{rule.name || rule.key}</div>
+            <div className='mt-0.5 text-xs text-[var(--semi-color-text-2)]'>
+              {formatInteger(rule.passed_count)} /{' '}
+              {formatInteger(rule.candidate_count)} · {formatRate(rule.pass_rate)}
+              {Number(rule.removed_count || 0) > 0
+                ? ` · ${t('剔除/去重')} ${formatInteger(rule.removed_count)}`
+                : ''}
+            </div>
+          </div>
+          <Tag color={rule.pass ? 'green' : 'red'}>
+            {rule.conclusion || (rule.pass ? t('达标') : t('需关注'))}
+          </Tag>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function QualityReportCard({ report, title, subtitle, compact = false, t }) {
   const rules = Array.isArray(report.rules) ? report.rules : [];
   return (
     <div className='rounded-lg border border-[var(--semi-color-border)] bg-[var(--semi-color-bg-1)] p-4'>
       <div className='mb-3 flex flex-wrap items-start justify-between gap-2'>
         <div>
           <Title heading={6} style={{ margin: 0 }}>
-            {t('准入项总览')}
+            {title}
           </Title>
-          <Text type='tertiary' size='small'>
-            {t('导出时生成的质量快照，源记录删除后仍可复查。')}
-          </Text>
+          {subtitle && (
+            <Text type='tertiary' size='small'>
+              {subtitle}
+            </Text>
+          )}
         </div>
         <Space wrap>
           <Tag color='blue'>
@@ -127,88 +240,60 @@ function QualityReportPanel({ job, t }) {
         </Space>
       </div>
 
-      <div className='overflow-x-auto'>
-        <table className='w-full min-w-[760px] border-collapse text-sm'>
-          <thead>
-            <tr className='border-b border-[var(--semi-color-border)] text-left text-[var(--semi-color-text-2)]'>
-              <th className='py-2 pr-3 font-medium'>{t('准入项')}</th>
-              <th className='py-2 pr-3 font-medium'>{t('要求')}</th>
-              <th className='py-2 pr-3 text-right font-medium'>
-                {t('候选通过')}
-              </th>
-              <th className='py-2 pr-3 text-right font-medium'>
-                {t('通过率')}
-              </th>
-              <th className='py-2 pr-3 text-right font-medium'>
-                {t('剔除/去重')}
-              </th>
-              <th className='py-2 font-medium'>{t('结论')}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rules.map((rule) => (
-              <tr
-                key={rule.key || rule.name}
-                className='border-b border-[var(--semi-color-border)] last:border-b-0'
-              >
-                <td className='py-2 pr-3 font-medium'>
-                  {rule.name || rule.key}
-                </td>
-                <td className='py-2 pr-3 text-[var(--semi-color-text-1)]'>
-                  {rule.requirement || '-'}
-                </td>
-                <td className='py-2 pr-3 text-right font-mono'>
-                  {formatInteger(rule.passed_count)} /{' '}
-                  {formatInteger(rule.candidate_count)}
-                </td>
-                <td className='py-2 pr-3 text-right font-mono'>
-                  {formatRate(rule.pass_rate)}
-                </td>
-                <td className='py-2 pr-3 text-right font-mono'>
-                  {formatInteger(rule.removed_count)}
-                </td>
-                <td className='py-2'>
-                  <Tag color={rule.pass ? 'green' : 'red'}>
-                    {rule.conclusion || (rule.pass ? t('达标') : t('需关注'))}
-                  </Tag>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {compact ? (
+        <QualityRuleList rules={rules} t={t} />
+      ) : (
+        <QualityRuleTable rules={rules} t={t} />
+      )}
 
-      {(report.undefined_tools?.length > 0 ||
-        report.incomplete_tools?.length > 0) && (
-        <div className='mt-3 flex flex-col gap-2'>
-          {report.undefined_tools?.length > 0 && (
-            <div>
-              <Text type='tertiary' size='small'>
-                {t('未定义工具 Top')}
-              </Text>
-              <div className='mt-1 flex flex-wrap gap-1'>
-                {report.undefined_tools.slice(0, 12).map((item) => (
-                  <Tag key={`u-${item.name}`} color='red'>
-                    {item.name} x{item.count}
-                  </Tag>
-                ))}
-              </div>
-            </div>
-          )}
-          {report.incomplete_tools?.length > 0 && (
-            <div>
-              <Text type='tertiary' size='small'>
-                {t('schema 不完整工具 Top')}
-              </Text>
-              <div className='mt-1 flex flex-wrap gap-1'>
-                {report.incomplete_tools.slice(0, 12).map((item) => (
-                  <Tag key={`i-${item.name}`} color='orange'>
-                    {item.name} x{item.count}
-                  </Tag>
-                ))}
-              </div>
-            </div>
-          )}
+      <QualityToolWarnings report={report} t={t} />
+    </div>
+  );
+}
+
+function qualityGroupTitle(group) {
+  if (group?.kind_label) return group.kind_label;
+  if (group?.kind) return group.kind;
+  return '';
+}
+
+function QualityReportPanel({ job, t }) {
+  const report = parseQualityReport(job);
+  if (!report) {
+    const emptyText =
+      job?.mode === 'session_jsonl'
+        ? t('该任务暂无达标快照，请使用新版导出任务重新生成后查看。')
+        : t('API Hijack JSONL 不生成 session 级 H1-H4/D1/D3 达标快照。');
+    return (
+      <div className='rounded-lg border border-dashed border-[var(--semi-color-border)] bg-[var(--semi-color-fill-0)] p-4'>
+        <Text type='tertiary'>{emptyText}</Text>
+      </div>
+    );
+  }
+
+  const groups = Array.isArray(report.groups)
+    ? report.groups.filter((group) => Number(group?.candidate_count || 0) > 0)
+    : [];
+  return (
+    <div className='flex flex-col gap-3'>
+      <QualityReportCard
+        report={report}
+        title={t('准入项总览')}
+        subtitle={t('导出时生成的质量快照，源记录删除后仍可复查。')}
+        t={t}
+      />
+      {groups.length > 0 && (
+        <div className='grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-3'>
+          {groups.map((group) => (
+            <QualityReportCard
+              key={group.kind || qualityGroupTitle(group)}
+              report={group}
+              title={qualityGroupTitle(group)}
+              subtitle={t('按请求类型拆分的准入项快照')}
+              compact
+              t={t}
+            />
+          ))}
         </div>
       )}
     </div>

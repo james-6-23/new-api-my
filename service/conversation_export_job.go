@@ -141,17 +141,20 @@ type TopManifest struct {
 }
 
 type ConversationExportQualityReport struct {
-	Mode             string                          `json:"mode"`
-	Scope            string                          `json:"scope"`
-	CandidateCount   int64                           `json:"candidate_count"`
-	ExportedSessions int64                           `json:"exported_sessions"`
-	RejectedSessions int64                           `json:"rejected_sessions"`
-	RequiredPassRate float64                         `json:"required_pass_rate"`
-	GeneratedAt      int64                           `json:"generated_at"`
-	Rules            []ConversationExportQualityRule `json:"rules"`
-	FailureReasons   []ConversationQualityReason     `json:"failure_reasons,omitempty"`
-	UndefinedTools   []ConversationH2ToolCount       `json:"undefined_tools,omitempty"`
-	IncompleteTools  []ConversationH2ToolCount       `json:"incomplete_tools,omitempty"`
+	Mode             string                            `json:"mode"`
+	Scope            string                            `json:"scope"`
+	Kind             string                            `json:"kind,omitempty"`
+	KindLabel        string                            `json:"kind_label,omitempty"`
+	CandidateCount   int64                             `json:"candidate_count"`
+	ExportedSessions int64                             `json:"exported_sessions"`
+	RejectedSessions int64                             `json:"rejected_sessions"`
+	RequiredPassRate float64                           `json:"required_pass_rate"`
+	GeneratedAt      int64                             `json:"generated_at"`
+	Rules            []ConversationExportQualityRule   `json:"rules"`
+	Groups           []ConversationExportQualityReport `json:"groups,omitempty"`
+	FailureReasons   []ConversationQualityReason       `json:"failure_reasons,omitempty"`
+	UndefinedTools   []ConversationH2ToolCount         `json:"undefined_tools,omitempty"`
+	IncompleteTools  []ConversationH2ToolCount         `json:"incomplete_tools,omitempty"`
 }
 
 type ConversationExportQualityRule struct {
@@ -168,13 +171,102 @@ type ConversationExportQualityRule struct {
 	Conclusion       string  `json:"conclusion"`
 }
 
-func buildConversationExportQualityReport(mode string, preflight ConversationQualityPreflightReport, summary ConversationExportSummary, exportedSessions int64) *ConversationExportQualityReport {
+type sessionExportQualityGroup struct {
+	Preflight        ConversationQualityPreflightReport
+	Summary          ConversationExportSummary
+	ExportedSessions int64
+}
+
+type sessionDedupKindStats struct {
+	Exported                  int64
+	ExactDuplicateRemoved     int64
+	MessageSubsequenceRemoved int64
+	ToolIDSubsequenceRemoved  int64
+}
+
+type sessionDedupResult struct {
+	Keep               map[int64]struct{}
+	DuplicateRemoved   int
+	SubsequenceRemoved int
+	ByKind             map[string]sessionDedupKindStats
+}
+
+func ensureSessionDedupKindStats(stats map[string]*sessionDedupKindStats, kind string) *sessionDedupKindStats {
+	kind = normalizeConversationDataKind(kind)
+	if existing := stats[kind]; existing != nil {
+		return existing
+	}
+	next := &sessionDedupKindStats{}
+	stats[kind] = next
+	return next
+}
+
+func flattenSessionDedupKindStats(stats map[string]*sessionDedupKindStats) map[string]sessionDedupKindStats {
+	out := make(map[string]sessionDedupKindStats, len(stats))
+	for kind, value := range stats {
+		if value == nil {
+			continue
+		}
+		out[kind] = *value
+	}
+	return out
+}
+
+func ensureSessionExportSummaryByKind(summaries map[string]*ConversationExportSummary, kind string) *ConversationExportSummary {
+	kind = normalizeConversationDataKind(kind)
+	if existing := summaries[kind]; existing != nil {
+		return existing
+	}
+	next := &ConversationExportSummary{
+		Mode:                     conversation_log_setting.ExportModeSessionJSONL,
+		RejectedSessionsByReason: map[string]int64{},
+	}
+	summaries[kind] = next
+	return next
+}
+
+func ensureQualityAccumulatorByKind(accs map[string]*qualityPreflightAccumulator, kind string) *qualityPreflightAccumulator {
+	kind = normalizeConversationDataKind(kind)
+	if existing := accs[kind]; existing != nil {
+		return existing
+	}
+	next := newQualityPreflightAccumulator(conversation_log_setting.ExportModeSessionJSONL)
+	accs[kind] = next
+	return next
+}
+
+func buildConversationExportQualityReport(mode string, preflight ConversationQualityPreflightReport, summary ConversationExportSummary, exportedSessions int64, groups map[string]sessionExportQualityGroup) *ConversationExportQualityReport {
 	if mode != conversation_log_setting.ExportModeSessionJSONL {
 		return nil
 	}
+	report := buildConversationExportQualityReportForScope(mode, "overall", "总览", preflight, summary, exportedSessions)
+	for _, kind := range orderedConversationDataKinds() {
+		group, ok := groups[kind]
+		if !ok || group.Preflight.CandidateCount == 0 {
+			continue
+		}
+		groupReport := buildConversationExportQualityReportForScope(
+			mode,
+			kind,
+			conversationDataKindLabel(kind),
+			group.Preflight,
+			group.Summary,
+			group.ExportedSessions,
+		)
+		if groupReport == nil {
+			continue
+		}
+		report.Groups = append(report.Groups, *groupReport)
+	}
+	return report
+}
+
+func buildConversationExportQualityReportForScope(mode string, kind string, kindLabel string, preflight ConversationQualityPreflightReport, summary ConversationExportSummary, exportedSessions int64) *ConversationExportQualityReport {
 	report := &ConversationExportQualityReport{
 		Mode:             mode,
 		Scope:            "session_jsonl_export",
+		Kind:             kind,
+		KindLabel:        kindLabel,
 		CandidateCount:   preflight.CandidateCount,
 		ExportedSessions: exportedSessions,
 		RequiredPassRate: preflight.RequiredPassRate,
@@ -532,10 +624,11 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		RejectedSessionsByReason: map[string]int64{},
 	}
 	var qualityPreflight ConversationQualityPreflightReport
+	var qualityGroups map[string]sessionExportQualityGroup
 	if job.Mode == conversation_log_setting.ExportModeAPIHijackJSONL {
 		processErr = exportAPIHijackSharded(ctx, query, state)
 	} else {
-		exportSummary, qualityPreflight, processErr = exportSessionsSharded(ctx, query, state)
+		exportSummary, qualityPreflight, qualityGroups, processErr = exportSessionsSharded(ctx, query, state)
 	}
 	if processErr != nil {
 		return processErr
@@ -551,7 +644,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	if exportSummary.RejectedSessionsByReason == nil {
 		exportSummary.RejectedSessionsByReason = map[string]int64{}
 	}
-	qualityReport := buildConversationExportQualityReport(job.Mode, qualityPreflight, exportSummary, state.totalSessionCount)
+	qualityReport := buildConversationExportQualityReport(job.Mode, qualityPreflight, exportSummary, state.totalSessionCount, qualityGroups)
 	qualityReportJSON := ""
 	if qualityReport != nil {
 		qualityReportBytes, err := common.Marshal(qualityReport)
@@ -1096,6 +1189,32 @@ func normalizeConversationDataKind(kind string) string {
 	}
 }
 
+func conversationDataKindLabel(kind string) string {
+	switch normalizeConversationDataKind(kind) {
+	case conversationDataKindResponses:
+		return "Responses"
+	case conversationDataKindMessages:
+		return "Messages"
+	case conversationDataKindCompletions:
+		return "Completions"
+	default:
+		return "Mixed"
+	}
+}
+
+func mergeConversationDataKind(current, next string) string {
+	next = normalizeConversationDataKind(next)
+	current = strings.TrimSpace(current)
+	if current == "" {
+		return next
+	}
+	current = normalizeConversationDataKind(current)
+	if current == next {
+		return current
+	}
+	return conversationDataKindMixed
+}
+
 func conversationDataKindForPath(path string) string {
 	path = strings.ToLower(strings.TrimSpace(path))
 	switch {
@@ -1412,9 +1531,10 @@ type sessionSeqEntry struct {
 }
 
 type sessionDedupEntry struct {
-	LineNo int64
-	D2Seq  []uint64
-	D3Seq  []uint64
+	LineNo   int64
+	DataKind string
+	D2Seq    []uint64
+	D3Seq    []uint64
 }
 
 type sessionBucketRecord struct {
@@ -1448,6 +1568,7 @@ type sessionBucketWriterManager struct {
 type sessionBucketGroup struct {
 	records     []*model.ConversationLog
 	approxBytes int64
+	dataKind    string
 	overflow    bool
 }
 
@@ -1591,6 +1712,19 @@ func conversationLogFromSessionBucketRecord(record sessionBucketRecord) *model.C
 	}
 }
 
+func conversationDataKindForSessionBucketRecord(record sessionBucketRecord) string {
+	if kind := conversationDataKindForPath(record.RequestPath); kind != conversationDataKindMixed {
+		return kind
+	}
+	if kind := conversationDataKindForRelayFormat(record.RelayFormat); kind != conversationDataKindMixed {
+		return kind
+	}
+	if kind := conversationDataKindForRelayFormat(record.FinalFormat); kind != conversationDataKindMixed {
+		return kind
+	}
+	return conversationDataKindMixed
+}
+
 func newSessionExportSpool(tmpDir string) (*sessionExportSpool, error) {
 	dataPath := filepath.Join(tmpDir, "session-candidates.jsonl")
 	metaPath := filepath.Join(tmpDir, "session-candidates.meta.jsonl")
@@ -1680,58 +1814,66 @@ func (s *sessionExportSpool) close() error {
 	return nil
 }
 
-func dedupeSessionSpool(ctx context.Context, metaPath string, summary *ConversationExportSummary) (map[int64]struct{}, int, int, error) {
-	if summary.RejectedSessionsByReason == nil {
+func dedupeSessionSpool(ctx context.Context, metaPath string, summary *ConversationExportSummary) (sessionDedupResult, error) {
+	result := sessionDedupResult{
+		Keep:   make(map[int64]struct{}),
+		ByKind: make(map[string]sessionDedupKindStats),
+	}
+	kindStats := make(map[string]*sessionDedupKindStats)
+	if summary != nil && summary.RejectedSessionsByReason == nil {
 		summary.RejectedSessionsByReason = make(map[string]int64)
 	}
 	file, err := os.Open(metaPath)
 	if err != nil {
-		return nil, 0, 0, err
+		return result, err
 	}
 	defer file.Close()
 
 	reader := bufio.NewReaderSize(file, 1<<20)
 	seenD1 := make(map[string]int64)
-	keep := make(map[int64]struct{})
 	entries := make([]sessionDedupEntry, 0)
-	duplicateRemoved := 0
 	sequenceTokens := int64(0)
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, 0, 0, err
+			return result, err
 		}
 		line, err := readJSONLLine(reader)
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, 0, 0, err
+			return result, err
 		}
 		if len(line) == 0 {
 			continue
 		}
 		var meta sessionSpoolMeta
 		if err := common.Unmarshal(line, &meta); err != nil {
-			return nil, 0, 0, err
+			return result, err
 		}
+		kind := normalizeConversationDataKind(meta.DataKind)
 		if _, ok := seenD1[meta.D1Hash]; ok {
-			duplicateRemoved++
-			summary.RejectedSessionsByReason["exact_duplicate"]++
+			result.DuplicateRemoved++
+			ensureSessionDedupKindStats(kindStats, kind).ExactDuplicateRemoved++
+			if summary != nil {
+				summary.RejectedSessionsByReason["exact_duplicate"]++
+			}
 			continue
 		}
 		seenD1[meta.D1Hash] = meta.LineNo
-		keep[meta.LineNo] = struct{}{}
+		result.Keep[meta.LineNo] = struct{}{}
 		if len(entries) >= maxSessionDedupEntries {
-			return nil, 0, 0, fmt.Errorf("session dedup candidate count exceeds safety limit (%d); narrow the export range or lower auto-export threshold", maxSessionDedupEntries)
+			return result, fmt.Errorf("session dedup candidate count exceeds safety limit (%d); narrow the export range or lower auto-export threshold", maxSessionDedupEntries)
 		}
 		sequenceTokens += int64(len(meta.D2Seq) + len(meta.D3Seq))
 		if sequenceTokens > maxSessionDedupSequenceTokens {
-			return nil, 0, 0, fmt.Errorf("session dedup sequence index exceeds safety limit (%d tokens); narrow the export range or lower auto-export threshold", maxSessionDedupSequenceTokens)
+			return result, fmt.Errorf("session dedup sequence index exceeds safety limit (%d tokens); narrow the export range or lower auto-export threshold", maxSessionDedupSequenceTokens)
 		}
 		entries = append(entries, sessionDedupEntry{
-			LineNo: meta.LineNo,
-			D2Seq:  meta.D2Seq,
-			D3Seq:  meta.D3Seq,
+			LineNo:   meta.LineNo,
+			DataKind: kind,
+			D2Seq:    meta.D2Seq,
+			D3Seq:    meta.D3Seq,
 		})
 	}
 
@@ -1740,28 +1882,48 @@ func dedupeSessionSpool(ctx context.Context, metaPath string, summary *Conversat
 		d2Entries = append(d2Entries, sessionSeqEntry{LineNo: entry.LineNo, Seq: entry.D2Seq})
 	}
 	d2Duplicates := findSessionSubsequenceDuplicates(d2Entries, sessionD2MinSequenceLen)
-	for lineNo := range d2Duplicates {
-		if _, ok := keep[lineNo]; ok {
-			delete(keep, lineNo)
-			summary.RejectedSessionsByReason["message_subsequence_duplicate"]++
+	for _, entry := range entries {
+		if _, duplicate := d2Duplicates[entry.LineNo]; !duplicate {
+			continue
+		}
+		if _, ok := result.Keep[entry.LineNo]; ok {
+			delete(result.Keep, entry.LineNo)
+			result.SubsequenceRemoved++
+			ensureSessionDedupKindStats(kindStats, entry.DataKind).MessageSubsequenceRemoved++
+			if summary != nil {
+				summary.RejectedSessionsByReason["message_subsequence_duplicate"]++
+			}
 		}
 	}
 
 	d3Entries := make([]sessionSeqEntry, 0, len(entries)-len(d2Duplicates))
 	for _, entry := range entries {
-		if _, ok := keep[entry.LineNo]; !ok {
+		if _, ok := result.Keep[entry.LineNo]; !ok {
 			continue
 		}
 		d3Entries = append(d3Entries, sessionSeqEntry{LineNo: entry.LineNo, Seq: entry.D3Seq})
 	}
 	d3Duplicates := findSessionSubsequenceDuplicates(d3Entries, sessionD3MinSequenceLen)
-	for lineNo := range d3Duplicates {
-		if _, ok := keep[lineNo]; ok {
-			delete(keep, lineNo)
-			summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"]++
+	for _, entry := range entries {
+		if _, duplicate := d3Duplicates[entry.LineNo]; !duplicate {
+			continue
+		}
+		if _, ok := result.Keep[entry.LineNo]; ok {
+			delete(result.Keep, entry.LineNo)
+			result.SubsequenceRemoved++
+			ensureSessionDedupKindStats(kindStats, entry.DataKind).ToolIDSubsequenceRemoved++
+			if summary != nil {
+				summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"]++
+			}
 		}
 	}
-	return keep, duplicateRemoved, len(d2Duplicates) + len(d3Duplicates), nil
+	for _, entry := range entries {
+		if _, ok := result.Keep[entry.LineNo]; ok {
+			ensureSessionDedupKindStats(kindStats, entry.DataKind).Exported++
+		}
+	}
+	result.ByKind = flattenSessionDedupKindStats(kindStats)
+	return result, nil
 }
 
 func streamSessionSpoolToShards(ctx context.Context, spool *sessionExportSpool, keep map[int64]struct{}, state *shardWriterState) error {
@@ -1957,7 +2119,7 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 	return manager.sortedPaths(), eligible, nil
 }
 
-func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spool *sessionExportSpool, summary *ConversationExportSummary, state *shardWriterState, qualityAcc *qualityPreflightAccumulator) (int64, error) {
+func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spool *sessionExportSpool, summary *ConversationExportSummary, state *shardWriterState, qualityAcc *qualityPreflightAccumulator, qualityAccByKind map[string]*qualityPreflightAccumulator, summaryByKind map[string]*ConversationExportSummary) (int64, error) {
 	var totalSessions int64
 	for bucketIndex, path := range bucketPaths {
 		if err := ctx.Err(); err != nil {
@@ -1971,20 +2133,37 @@ func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spo
 		totalSessions += int64(len(sessionIDs))
 		for _, sessionID := range sessionIDs {
 			group := groups[sessionID]
+			kind := normalizeConversationDataKind(group.dataKind)
+			if summaryByKind != nil {
+				ensureSessionExportSummaryByKind(summaryByKind, kind).TotalSessions++
+			}
 			if group.overflow {
 				summary.RejectedSessionsByReason["session_payload_too_large"]++
+				if summaryByKind != nil {
+					ensureSessionExportSummaryByKind(summaryByKind, kind).RejectedSessionsByReason["session_payload_too_large"]++
+				}
 				if qualityAcc != nil {
 					qualityAcc.report.RejectedOversized++
+				}
+				if qualityAccByKind != nil {
+					ensureQualityAccumulatorByKind(qualityAccByKind, kind).report.RejectedOversized++
 				}
 				continue
 			}
 			candidate := buildSessionCandidate(sessionID, group.records)
+			kind = normalizeConversationDataKind(candidate.DataKind)
 			if qualityAcc != nil {
 				qualityAcc.addSession(sessionID, candidate)
+			}
+			if qualityAccByKind != nil {
+				ensureQualityAccumulatorByKind(qualityAccByKind, kind).addSession(sessionID, candidate)
 			}
 			if len(candidate.Reasons) > 0 {
 				for _, reason := range candidate.Reasons {
 					summary.RejectedSessionsByReason[reason]++
+					if summaryByKind != nil {
+						ensureSessionExportSummaryByKind(summaryByKind, kind).RejectedSessionsByReason[reason]++
+					}
 				}
 				continue
 			}
@@ -2032,6 +2211,7 @@ func readSessionBucketGroups(path string) (map[string]*sessionBucketGroup, error
 			group = &sessionBucketGroup{}
 			groups[record.SessionID] = group
 		}
+		group.dataKind = mergeConversationDataKind(group.dataKind, conversationDataKindForSessionBucketRecord(record))
 		recordBytes := sessionBucketRecordBytes(record)
 		previousGroupBytes := group.approxBytes
 		group.approxBytes += recordBytes
@@ -2056,15 +2236,65 @@ func readSessionBucketGroups(path string) (map[string]*sessionBucketGroup, error
 	return groups, nil
 }
 
-func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) (ConversationExportSummary, ConversationQualityPreflightReport, error) {
+func buildSessionExportQualityGroups(accByKind map[string]*qualityPreflightAccumulator, summaryByKind map[string]*ConversationExportSummary, dedupByKind map[string]sessionDedupKindStats) map[string]sessionExportQualityGroup {
+	groups := make(map[string]sessionExportQualityGroup)
+	for _, kind := range orderedConversationDataKinds() {
+		acc := accByKind[kind]
+		summary := ConversationExportSummary{
+			Mode:                     conversation_log_setting.ExportModeSessionJSONL,
+			RejectedSessionsByReason: map[string]int64{},
+		}
+		if existing := summaryByKind[kind]; existing != nil {
+			summary = *existing
+			if summary.RejectedSessionsByReason == nil {
+				summary.RejectedSessionsByReason = map[string]int64{}
+			} else {
+				reasons := make(map[string]int64, len(summary.RejectedSessionsByReason)+3)
+				for reason, count := range summary.RejectedSessionsByReason {
+					reasons[reason] = count
+				}
+				summary.RejectedSessionsByReason = reasons
+			}
+		}
+		stats := dedupByKind[kind]
+		if stats.ExactDuplicateRemoved > 0 {
+			summary.RejectedSessionsByReason["exact_duplicate"] += stats.ExactDuplicateRemoved
+		}
+		if stats.MessageSubsequenceRemoved > 0 {
+			summary.RejectedSessionsByReason["message_subsequence_duplicate"] += stats.MessageSubsequenceRemoved
+		}
+		if stats.ToolIDSubsequenceRemoved > 0 {
+			summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"] += stats.ToolIDSubsequenceRemoved
+		}
+		summary.DuplicateRemovedCount = stats.ExactDuplicateRemoved
+		summary.SubsequenceRemovedCount = stats.MessageSubsequenceRemoved + stats.ToolIDSubsequenceRemoved
+		summary.SessionExportableSessions = stats.Exported
+		if acc == nil {
+			if summary.TotalSessions == 0 && stats.Exported == 0 && summary.DuplicateRemovedCount == 0 && summary.SubsequenceRemovedCount == 0 {
+				continue
+			}
+			acc = newQualityPreflightAccumulator(conversation_log_setting.ExportModeSessionJSONL)
+		}
+		groups[kind] = sessionExportQualityGroup{
+			Preflight:        acc.finalize(),
+			Summary:          summary,
+			ExportedSessions: stats.Exported,
+		}
+	}
+	return groups
+}
+
+func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) (ConversationExportSummary, ConversationQualityPreflightReport, map[string]sessionExportQualityGroup, error) {
 	summary := &ConversationExportSummary{
 		Mode:                     conversation_log_setting.ExportModeSessionJSONL,
 		RejectedSessionsByReason: map[string]int64{},
 	}
 	qualityAcc := newQualityPreflightAccumulator(conversation_log_setting.ExportModeSessionJSONL)
+	qualityAccByKind := make(map[string]*qualityPreflightAccumulator)
+	summaryByKind := make(map[string]*ConversationExportSummary)
 	spool, err := newSessionExportSpool(state.tmpDir)
 	if err != nil {
-		return *summary, qualityAcc.finalize(), err
+		return *summary, qualityAcc.finalize(), nil, err
 	}
 	defer spool.close()
 
@@ -2073,7 +2303,7 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 	})
 	bucketPaths, eligibleRecords, err := writeSessionBuckets(ctx, query, state)
 	if err != nil {
-		return *summary, qualityAcc.finalize(), err
+		return *summary, qualityAcc.finalize(), nil, err
 	}
 	summary.APIExportableRecords = eligibleRecords
 	updateJobProgress(state.jobID, map[string]interface{}{
@@ -2081,38 +2311,39 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 		"progress":      fmt.Sprintf("bucketed %d record(s) into %d session bucket(s)", eligibleRecords, len(bucketPaths)),
 	})
 	if len(bucketPaths) == 0 {
-		return *summary, qualityAcc.finalize(), nil
+		return *summary, qualityAcc.finalize(), nil, nil
 	}
 
-	totalSessions, err := buildSessionSpoolFromBuckets(ctx, bucketPaths, spool, summary, state, qualityAcc)
+	totalSessions, err := buildSessionSpoolFromBuckets(ctx, bucketPaths, spool, summary, state, qualityAcc, qualityAccByKind, summaryByKind)
 	if err != nil {
-		return *summary, qualityAcc.finalize(), err
+		return *summary, qualityAcc.finalize(), buildSessionExportQualityGroups(qualityAccByKind, summaryByKind, nil), err
 	}
 	summary.TotalSessions = totalSessions
 	qualityAcc.report.CheckedRecords = eligibleRecords
 	qualityAcc.report.CheckedSessions = totalSessions
 	if err := spool.close(); err != nil {
-		return *summary, qualityAcc.finalize(), err
+		return *summary, qualityAcc.finalize(), buildSessionExportQualityGroups(qualityAccByKind, summaryByKind, nil), err
 	}
-	keep, duplicateRemoved, subsequenceRemoved, err := dedupeSessionSpool(ctx, spool.metaPath, summary)
+	dedupResult, err := dedupeSessionSpool(ctx, spool.metaPath, summary)
 	if err != nil {
-		return *summary, qualityAcc.finalize(), err
+		return *summary, qualityAcc.finalize(), buildSessionExportQualityGroups(qualityAccByKind, summaryByKind, nil), err
 	}
-	summary.DuplicateRemovedCount = int64(duplicateRemoved)
-	summary.SubsequenceRemovedCount = int64(subsequenceRemoved)
-	summary.SessionExportableSessions = int64(len(keep))
-	if duplicateRemoved > 0 || subsequenceRemoved > 0 {
-		common.SysLog(fmt.Sprintf("export job: removed %d exact duplicate session(s), %d D2/D3 subsequence session(s)", duplicateRemoved, subsequenceRemoved))
+	summary.DuplicateRemovedCount = int64(dedupResult.DuplicateRemoved)
+	summary.SubsequenceRemovedCount = int64(dedupResult.SubsequenceRemoved)
+	summary.SessionExportableSessions = int64(len(dedupResult.Keep))
+	qualityGroups := buildSessionExportQualityGroups(qualityAccByKind, summaryByKind, dedupResult.ByKind)
+	if dedupResult.DuplicateRemoved > 0 || dedupResult.SubsequenceRemoved > 0 {
+		common.SysLog(fmt.Sprintf("export job: removed %d exact duplicate session(s), %d D2/D3 subsequence session(s)", dedupResult.DuplicateRemoved, dedupResult.SubsequenceRemoved))
 	}
 	updateJobProgress(state.jobID, map[string]interface{}{
 		"total_sessions": totalSessions,
-		"progress":       fmt.Sprintf("deduplicated sessions: %d exportable of %d", len(keep), spool.count),
+		"progress":       fmt.Sprintf("deduplicated sessions: %d exportable of %d", len(dedupResult.Keep), spool.count),
 	})
 
-	if err := streamSessionSpoolToShards(ctx, spool, keep, state); err != nil {
-		return *summary, qualityAcc.finalize(), err
+	if err := streamSessionSpoolToShards(ctx, spool, dedupResult.Keep, state); err != nil {
+		return *summary, qualityAcc.finalize(), qualityGroups, err
 	}
-	return *summary, qualityAcc.finalize(), nil
+	return *summary, qualityAcc.finalize(), qualityGroups, nil
 }
 
 // CleanupOrphanedExportJobs is called on service startup to mark jobs that were

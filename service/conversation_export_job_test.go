@@ -257,20 +257,33 @@ func TestSessionSpoolDedupRemovesD1D2AndD3WithoutLoadingBodies(t *testing.T) {
 		sessionCandidateForMessages(d3ChildMessages),
 	} {
 		candidate.RecordIDs = []int{i + 1}
+		switch i {
+		case 0, 1:
+			candidate.DataKind = conversationDataKindResponses
+		case 2:
+			candidate.DataKind = conversationDataKindMessages
+		default:
+			candidate.DataKind = conversationDataKindCompletions
+		}
 		require.NoError(t, spool.appendCandidate(candidate))
 	}
 	require.NoError(t, spool.close())
 
 	summary := ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
-	keep, duplicateRemoved, subsequenceRemoved, err := dedupeSessionSpool(context.Background(), spool.metaPath, &summary)
+	result, err := dedupeSessionSpool(context.Background(), spool.metaPath, &summary)
 	require.NoError(t, err)
 
-	require.Equal(t, 1, duplicateRemoved)
-	require.Equal(t, 2, subsequenceRemoved)
-	require.Len(t, keep, 2)
+	require.Equal(t, 1, result.DuplicateRemoved)
+	require.Equal(t, 2, result.SubsequenceRemoved)
+	require.Len(t, result.Keep, 2)
 	require.EqualValues(t, 1, summary.RejectedSessionsByReason["exact_duplicate"])
 	require.EqualValues(t, 1, summary.RejectedSessionsByReason["message_subsequence_duplicate"])
 	require.EqualValues(t, 1, summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"])
+	require.EqualValues(t, 1, result.ByKind[conversationDataKindResponses].Exported)
+	require.EqualValues(t, 1, result.ByKind[conversationDataKindResponses].ExactDuplicateRemoved)
+	require.EqualValues(t, 1, result.ByKind[conversationDataKindMessages].MessageSubsequenceRemoved)
+	require.EqualValues(t, 1, result.ByKind[conversationDataKindCompletions].Exported)
+	require.EqualValues(t, 1, result.ByKind[conversationDataKindCompletions].ToolIDSubsequenceRemoved)
 }
 
 func TestBuildConversationExportQualityReportIncludesRulesAndDedupe(t *testing.T) {
@@ -319,7 +332,19 @@ func TestBuildConversationExportQualityReportIncludesRulesAndDedupe(t *testing.T
 		SubsequenceRemovedCount: 3,
 	}
 
-	report := buildConversationExportQualityReport(conversation_log_setting.ExportModeSessionJSONL, preflight, summary, 6)
+	report := buildConversationExportQualityReport(
+		conversation_log_setting.ExportModeSessionJSONL,
+		preflight,
+		summary,
+		6,
+		map[string]sessionExportQualityGroup{
+			conversationDataKindResponses: {
+				Preflight:        preflight,
+				Summary:          summary,
+				ExportedSessions: 6,
+			},
+		},
+	)
 
 	require.NotNil(t, report)
 	require.EqualValues(t, 10, report.CandidateCount)
@@ -329,6 +354,10 @@ func TestBuildConversationExportQualityReportIncludesRulesAndDedupe(t *testing.T
 	require.False(t, report.Rules[0].Pass)
 	require.EqualValues(t, 3, report.Rules[4].RemovedCount)
 	require.EqualValues(t, 1, report.Rules[5].RemovedCount)
+	require.Len(t, report.Groups, 1)
+	require.Equal(t, conversationDataKindResponses, report.Groups[0].Kind)
+	require.Equal(t, "Responses", report.Groups[0].KindLabel)
+	require.EqualValues(t, 10, report.Groups[0].CandidateCount)
 }
 
 func TestSessionBucketRebuildKeepsInterleavedSessionComplete(t *testing.T) {
@@ -360,7 +389,7 @@ func TestSessionBucketRebuildKeepsInterleavedSessionComplete(t *testing.T) {
 	require.NoError(t, err)
 	summary := ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
 	qualityAcc := newQualityPreflightAccumulator(conversation_log_setting.ExportModeSessionJSONL)
-	totalSessions, err := buildSessionSpoolFromBuckets(context.Background(), manager.sortedPaths(), spool, &summary, nil, qualityAcc)
+	totalSessions, err := buildSessionSpoolFromBuckets(context.Background(), manager.sortedPaths(), spool, &summary, nil, qualityAcc, nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, spool.close())
 	require.EqualValues(t, 2, totalSessions)
