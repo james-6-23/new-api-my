@@ -219,25 +219,30 @@ func TestBuildGeminiSessionCandidatePairsFunctionResponseByName(t *testing.T) {
 	require.Equal(t, "Read", candidate.Trajectory.Tools[0].Name)
 }
 
-func TestValidateSessionTrajectoryRejectsLowPairingRatio(t *testing.T) {
+func TestValidateSessionTrajectoryAllowsOnlyTrailingToolOrphans(t *testing.T) {
 	toolParameters := `{"type":"object","properties":{"file_path":{"type":"string","description":"Path to read"}}}`
 	trajectory := SessionTrajectory{
 		Tools: []SessionTool{{Name: "Read", Description: "Reads a file.", Parameters: toolParameters}},
 		Messages: []SessionMessage{
 			{Role: "user", Content: nullableString("read one")},
-			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", CallID: "call_1"}, {Name: "Read", CallID: "call_2"}}},
+			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", CallID: "call_1"}}},
 			{Role: "tool", Content: nullableString("one"), ToolCallID: nullableString("call_1")},
-			{Role: "user", Content: nullableString("summarize")},
-			{Role: "assistant", Content: nullableString("done")},
+			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", CallID: "call_2"}}},
 		},
 	}
 
 	reasons := validateSessionTrajectory(trajectory)
 	require.Empty(t, reasons)
 
-	trajectory.Messages[2].ToolCallID = nullableString("other_call")
+	trajectory.Messages = []SessionMessage{
+		{Role: "user", Content: nullableString("read one")},
+		{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", CallID: "call_1"}, {Name: "Read", CallID: "call_2"}}},
+		{Role: "tool", Content: nullableString("one"), ToolCallID: nullableString("call_1")},
+		{Role: "user", Content: nullableString("summarize")},
+		{Role: "assistant", Content: nullableString("done")},
+	}
 	reasons = validateSessionTrajectory(trajectory)
-	require.Contains(t, reasons, "tool_result_pairing_lt_0_5")
+	require.Contains(t, reasons, "tool_result_pairing_not_strict")
 }
 
 func TestValidateSessionTrajectoryRejectsIncompleteToolSchema(t *testing.T) {

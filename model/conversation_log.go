@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"database/sql"
+	"strings"
 
 	"gorm.io/gorm"
 )
@@ -47,19 +48,19 @@ type ConversationLog struct {
 }
 
 type ConversationLogQuery struct {
-	StartTime        int64
-	EndTime          int64
-	UserId           int
-	Username         string
-	TokenName        string
-	ModelName        string
-	ChannelId        int
-	Group            string
-	RequestId        string
-	SessionId        string
-	Provider         string
-	ValidationStatus string
-	Exported         *bool
+	StartTime        int64  `json:"start_timestamp"`
+	EndTime          int64  `json:"end_timestamp"`
+	UserId           int    `json:"user_id"`
+	Username         string `json:"username"`
+	TokenName        string `json:"token_name"`
+	ModelName        string `json:"model_name"`
+	ChannelId        int    `json:"channel_id"`
+	Group            string `json:"group"`
+	RequestId        string `json:"request_id"`
+	SessionId        string `json:"session_id"`
+	Provider         string `json:"provider"`
+	ValidationStatus string `json:"validation_status"`
+	Exported         *bool  `json:"exported"`
 }
 
 type ConversationLogSummary struct {
@@ -282,6 +283,46 @@ func DeleteConversationLogsByIDs(ids []int) (int64, error) {
 	}
 	result := LOG_DB.Where("id IN ?", ids).Delete(&ConversationLog{})
 	return result.RowsAffected, result.Error
+}
+
+func DeleteConversationLogsByExportBatchID(ctx context.Context, batchID string, batchSize int) (int64, error) {
+	batchID = strings.TrimSpace(batchID)
+	if batchID == "" {
+		return 0, nil
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	var total int64
+	for {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return total, err
+			}
+		}
+		var logs []*ConversationLog
+		err := conversationLogDBWithContext(ctx).Model(&ConversationLog{}).
+			Select("id").
+			Where("export_batch_id = ?", batchID).
+			Order("id asc").
+			Limit(batchSize).
+			Find(&logs).Error
+		if err != nil {
+			return total, err
+		}
+		if len(logs) == 0 {
+			return total, nil
+		}
+		ids := make([]int, 0, len(logs))
+		for _, log := range logs {
+			ids = append(ids, log.Id)
+		}
+		rows, err := DeleteConversationLogsByIDs(ids)
+		if err != nil {
+			return total, err
+		}
+		total += rows
+	}
 }
 
 func DeleteConversationLogsByQuery(ctx context.Context, query ConversationLogQuery, batchSize int) (int64, error) {

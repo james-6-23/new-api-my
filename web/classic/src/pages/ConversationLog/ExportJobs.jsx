@@ -96,7 +96,45 @@ const modeOptions = [
   { value: 'api_hijack_jsonl', label: 'API Hijack JSONL' },
 ];
 
-const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
+function normalizeExportJobFilter(filter = {}) {
+  const next = { ...filter };
+  ['start_timestamp', 'end_timestamp', 'user_id', 'channel_id'].forEach(
+    (key) => {
+      if (
+        next[key] === undefined ||
+        next[key] === null ||
+        `${next[key]}`.trim() === ''
+      ) {
+        delete next[key];
+        return;
+      }
+      const parsed = Number(next[key]);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        next[key] = Math.trunc(parsed);
+      } else {
+        delete next[key];
+      }
+    },
+  );
+
+  const exported = next.exported;
+  if (exported === true || exported === false) {
+    return next;
+  }
+  const exportedText = `${exported ?? ''}`.trim().toLowerCase();
+  if (
+    exportedText === 'true' ||
+    exportedText === '1' ||
+    exportedText === 'yes'
+  ) {
+    next.exported = true;
+  } else {
+    next.exported = false;
+  }
+  return next;
+}
+
+const ExportJobs = ({ defaultMode = 'session_jsonl', getFilterParams }) => {
   const { t } = useTranslation();
   const createFormRef = useRef();
   const [loading, setLoading] = useState(false);
@@ -145,17 +183,16 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
   const onCreate = async (values) => {
     setCreating(true);
     try {
+      const currentFilter =
+        typeof getFilterParams === 'function' ? getFilterParams() : {};
       const payload = {
         mode: values.mode,
-        filter: {},
+        filter: normalizeExportJobFilter(currentFilter),
         shard_target_bytes: Math.round((values.shard_target_mb || 10240) * MB),
         shard_max_bytes: Math.round((values.shard_max_mb || 10240) * MB),
         delete_after_export: !!values.delete_after_export,
       };
-      const res = await API.post(
-        '/api/conversation_logs/export_jobs',
-        payload,
-      );
+      const res = await API.post('/api/conversation_logs/export_jobs', payload);
       const { success, message } = res.data;
       if (!success) {
         showError(message);
@@ -166,8 +203,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
       createFormRef.current?.reset?.();
       await loadJobs();
     } catch (e) {
-      const msg =
-        e?.response?.data?.message || e?.message || t('创建任务失败');
+      const msg = e?.response?.data?.message || e?.message || t('创建任务失败');
       showError(msg);
     } finally {
       setCreating(false);
@@ -208,9 +244,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
 
   const openDetail = async (jobId) => {
     try {
-      const res = await API.get(
-        `/api/conversation_logs/export_jobs/${jobId}`,
-      );
+      const res = await API.get(`/api/conversation_logs/export_jobs/${jobId}`);
       if (!res.data.success) {
         showError(res.data.message);
         return;
@@ -255,8 +289,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
         `${String(date.getUTCHours()).padStart(2, '0')}` +
         `${String(date.getUTCMinutes()).padStart(2, '0')}` +
         `${String(date.getUTCSeconds()).padStart(2, '0')}`;
-      const modeTag =
-        job.mode === 'session_jsonl' ? 'session' : 'api';
+      const modeTag = job.mode === 'session_jsonl' ? 'session' : 'api';
       const trigger = job.trigger?.trim() || 'manual';
       const short = (job.job_id || '').slice(0, 8);
       name = `conversation-logs-${modeTag}-${trigger}-${ts}-${short}-shard${String(n).padStart(4, '0')}.tar.gz`;
@@ -384,11 +417,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
               title={t('确认取消该任务？')}
               onConfirm={() => onCancel(record.job_id)}
             >
-              <Button
-                size='small'
-                type='warning'
-                icon={<IconStop />}
-              >
+              <Button size='small' type='warning' icon={<IconStop />}>
                 {t('取消')}
               </Button>
             </Popconfirm>
@@ -423,11 +452,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
             </Text>
           </div>
           <Space>
-            <Button
-              icon={<IconRefresh />}
-              onClick={loadJobs}
-              loading={loading}
-            >
+            <Button icon={<IconRefresh />} onClick={loadJobs} loading={loading}>
               {t('刷新')}
             </Button>
             <Button
@@ -500,9 +525,7 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
             {t('导出完成后删除源记录')}
           </Form.Checkbox>
           <div className='mt-4 flex justify-end gap-2'>
-            <Button onClick={() => setCreateVisible(false)}>
-              {t('取消')}
-            </Button>
+            <Button onClick={() => setCreateVisible(false)}>{t('取消')}</Button>
             <Button type='primary' htmlType='submit' loading={creating}>
               {t('创建')}
             </Button>
@@ -572,7 +595,10 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
               ]}
             />
             {detail.error_message && (
-              <Card className='!rounded-lg' style={{ background: 'var(--semi-color-danger-light-default)' }}>
+              <Card
+                className='!rounded-lg'
+                style={{ background: 'var(--semi-color-danger-light-default)' }}
+              >
                 <Text type='danger'>{detail.error_message}</Text>
               </Card>
             )}
@@ -588,17 +614,18 @@ const ExportJobs = ({ defaultMode = 'session_jsonl' }) => {
               <div>
                 <Title heading={6}>{t('分片下载')}</Title>
                 <Space wrap>
-                  {Array.from({ length: detail.shard_count }, (_, i) => i + 1).map(
-                    (n) => (
-                      <Button
-                        key={n}
-                        icon={<IconDownload />}
-                        onClick={() => downloadShard(detail.job_id, n)}
-                      >
-                        shard-{String(n).padStart(4, '0')}.tar.gz
-                      </Button>
-                    ),
-                  )}
+                  {Array.from(
+                    { length: detail.shard_count },
+                    (_, i) => i + 1,
+                  ).map((n) => (
+                    <Button
+                      key={n}
+                      icon={<IconDownload />}
+                      onClick={() => downloadShard(detail.job_id, n)}
+                    >
+                      shard-{String(n).padStart(4, '0')}.tar.gz
+                    </Button>
+                  ))}
                 </Space>
               </div>
             )}

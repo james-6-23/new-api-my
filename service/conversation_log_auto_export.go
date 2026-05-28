@@ -66,7 +66,7 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		return
 	}
 
-	hasRunning, err := model.HasRunningConversationExportJob()
+	hasRunning, err := model.HasActiveConversationExportJob()
 	if err != nil {
 		common.SysError("auto export: running job check failed: " + err.Error())
 		return

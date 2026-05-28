@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,6 +103,27 @@ type sessionCandidate struct {
 	RequestTimeMin  int64
 	ResponseTimeMax int64
 }
+
+type sessionH4Message struct {
+	Message SessionMessage
+	Echo    bool
+}
+
+type sessionH4Info struct {
+	ToolCallCount       int
+	ToolResultCount     int
+	TrailingOrphanCount int
+	MiddleOrphanCount   int
+	OrphanResultCount   int
+	DuplicateIDCount    int
+	PairedCount         int
+	PairStrict          bool
+}
+
+var (
+	systemReminderPattern = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+	whitespacePattern     = regexp.MustCompile(`\s+`)
+)
 
 func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
 	if c == nil || relayInfo == nil || relayInfo.ChannelMeta == nil {
@@ -474,6 +496,10 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 			return nil
 		})
 		return exportedIDs, summary, err
+	}
+
+	if summary.APIExportableRecords > summaryInMemoryRecordCap {
+		return nil, summary, fmt.Errorf("session_jsonl direct export is limited to %d eligible records; use sharded export jobs for large exports", summaryInMemoryRecordCap)
 	}
 
 	validRecords := make([]*model.ConversationLog, 0)
@@ -1115,23 +1141,11 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 		toolNames[tool.Name] = struct{}{}
 	}
 	toolCallCount := 0
-	pairedToolCalls := 0
-	toolResults := make(map[string]struct{})
-	for _, msg := range trajectory.Messages {
-		if msg.Role == "tool" && msg.ToolCallID != nil && *msg.ToolCallID != "" {
-			toolResults[*msg.ToolCallID] = struct{}{}
-		}
-	}
 	for _, msg := range trajectory.Messages {
 		for _, call := range msg.ToolCalls {
 			toolCallCount++
 			if _, ok := toolNames[call.Name]; !ok {
 				reasons = append(reasons, "tool_definition_missing")
-			}
-			if call.CallID != "" {
-				if _, ok := toolResults[call.CallID]; ok {
-					pairedToolCalls++
-				}
 			}
 		}
 	}
@@ -1144,29 +1158,58 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 	if toolCallCount > 0 && len(trajectory.Tools) == 0 {
 		reasons = append(reasons, "tools_missing")
 	}
-	if toolCallCount > 0 && float64(pairedToolCalls)/float64(toolCallCount) < 0.5 {
+	h4 := checkSessionToolPairingStrict(trajectory.Messages)
+	if toolCallCount > 0 && h4.ToolCallCount > 0 && float64(h4.PairedCount)/float64(h4.ToolCallCount) < 0.5 {
 		reasons = append(reasons, "tool_result_pairing_lt_0_5")
+	}
+	if toolCallCount > 0 && !h4.PairStrict {
+		reasons = append(reasons, "tool_result_pairing_not_strict")
 	}
 	return uniqueStrings(reasons)
 }
 
 func effectiveTurnCount(messages []SessionMessage) int {
-	turns := 0
-	hasUser := false
-	for _, msg := range messages {
+	deduped := deduplicateAccumulatedSessionMessages(messages)
+	userAssistantRounds := 0
+	toolPairRounds := 0
+	userRevisionRounds := 0
+	previousWasAssistant := false
+	seenFirstUser := false
+
+	for i := 0; i < len(deduped); {
+		msg := deduped[i]
 		switch msg.Role {
 		case "user":
-			if stringPtrValue(msg.Content) != "" {
-				hasUser = true
+			if previousWasAssistant && seenFirstUser {
+				userRevisionRounds++
 			}
+			seenFirstUser = true
+			j := i + 1
+			for j < len(deduped) && deduped[j].Role == "user" {
+				j++
+			}
+			if j < len(deduped) && deduped[j].Role == "assistant" {
+				userAssistantRounds++
+				previousWasAssistant = false
+			}
+			i = j
+			continue
 		case "assistant":
-			if hasUser && (stringPtrValue(msg.Content) != "" || len(msg.ToolCalls) > 0) {
-				turns++
-				hasUser = false
+			if len(msg.ToolCalls) > 0 {
+				j := i + 1
+				for j < len(deduped) && deduped[j].Role == "tool" {
+					toolPairRounds++
+					j++
+				}
+				previousWasAssistant = true
+				i = j
+				continue
 			}
+			previousWasAssistant = true
 		}
+		i++
 	}
-	return turns
+	return userAssistantRounds + toolPairRounds + userRevisionRounds
 }
 
 func extractSessionTools(request map[string]interface{}, provider string) []SessionTool {
@@ -1849,6 +1892,388 @@ func dedupeAdjacentMessages(messages []SessionMessage) []SessionMessage {
 		last = sig
 	}
 	return out
+}
+
+func deduplicateAccumulatedSessionMessages(messages []SessionMessage) []SessionMessage {
+	deduped := make([]SessionMessage, 0, len(messages))
+	seenCallIDs := make(map[string]struct{})
+	seenResultIDs := make(map[string]struct{})
+	seenAssistantHashes := make(map[string]struct{})
+	previousUserContent := ""
+	for _, msg := range messages {
+		switch msg.Role {
+		case "user":
+			content := stringPtrValue(msg.Content)
+			if content == previousUserContent && len(deduped) > 0 && deduped[len(deduped)-1].Role != "tool" {
+				continue
+			}
+			previousUserContent = content
+			deduped = append(deduped, msg)
+		case "assistant":
+			if len(msg.ToolCalls) > 0 {
+				hasNewCall := false
+				for _, call := range msg.ToolCalls {
+					if call.CallID == "" {
+						hasNewCall = true
+						continue
+					}
+					if _, ok := seenCallIDs[call.CallID]; ok {
+						continue
+					}
+					seenCallIDs[call.CallID] = struct{}{}
+					hasNewCall = true
+				}
+				if !hasNewCall {
+					continue
+				}
+				deduped = append(deduped, msg)
+			} else {
+				hashInput := stringPtrValue(msg.Content) + stringPtrValue(msg.Thinking)
+				h := sha256Hex(hashInput)
+				if _, ok := seenAssistantHashes[h]; ok {
+					continue
+				}
+				seenAssistantHashes[h] = struct{}{}
+				deduped = append(deduped, msg)
+			}
+		case "tool":
+			resultID := sessionToolResultID(msg)
+			if resultID != "" {
+				if _, ok := seenResultIDs[resultID]; ok {
+					continue
+				}
+				seenResultIDs[resultID] = struct{}{}
+			}
+			deduped = append(deduped, msg)
+		default:
+			deduped = append(deduped, msg)
+		}
+	}
+	return deduped
+}
+
+func deduplicateSessionMessagesForH4(messages []SessionMessage) []sessionH4Message {
+	deduped := make([]sessionH4Message, 0, len(messages))
+	seenCallIDs := make(map[string]struct{})
+	seenResultIDs := make(map[string]struct{})
+	for _, msg := range messages {
+		switch msg.Role {
+		case "assistant":
+			if len(msg.ToolCalls) == 0 {
+				deduped = append(deduped, sessionH4Message{Message: msg})
+				continue
+			}
+			allIDsPresent := true
+			hasNewID := false
+			for _, call := range msg.ToolCalls {
+				id := call.CallID
+				if id == "" {
+					allIDsPresent = false
+					hasNewID = true
+					continue
+				}
+				if _, ok := seenCallIDs[id]; !ok {
+					hasNewID = true
+				}
+			}
+			if !hasNewID && allIDsPresent {
+				if strings.TrimSpace(stringPtrValue(msg.Content)) != "" {
+					deduped = append(deduped, sessionH4Message{
+						Message: SessionMessage{Role: "assistant", Content: msg.Content},
+						Echo:    true,
+					})
+				}
+				continue
+			}
+			for _, call := range msg.ToolCalls {
+				if call.CallID != "" {
+					seenCallIDs[call.CallID] = struct{}{}
+				}
+			}
+			deduped = append(deduped, sessionH4Message{Message: msg})
+		case "tool":
+			resultID := sessionToolResultID(msg)
+			if resultID != "" {
+				if _, ok := seenResultIDs[resultID]; ok {
+					continue
+				}
+				seenResultIDs[resultID] = struct{}{}
+			}
+			deduped = append(deduped, sessionH4Message{Message: msg})
+		default:
+			deduped = append(deduped, sessionH4Message{Message: msg})
+		}
+	}
+	return deduped
+}
+
+func checkSessionToolPairingStrict(messages []SessionMessage) sessionH4Info {
+	type event struct {
+		kind string
+		id   string
+	}
+	events := make([]event, 0)
+	for _, item := range deduplicateSessionMessagesForH4(messages) {
+		msg := item.Message
+		if item.Echo {
+			events = append(events, event{kind: "other"})
+			continue
+		}
+		switch msg.Role {
+		case "user":
+			events = append(events, event{kind: "other"})
+		case "assistant":
+			hasTool := false
+			for _, call := range msg.ToolCalls {
+				events = append(events, event{kind: "call", id: call.CallID})
+				hasTool = true
+			}
+			if strings.TrimSpace(stringPtrValue(msg.Content)) != "" || !hasTool {
+				events = append(events, event{kind: "other"})
+			}
+		case "tool":
+			events = append(events, event{kind: "result", id: sessionToolResultID(msg)})
+		}
+	}
+
+	callIndices := make([]int, 0)
+	resultIndices := make([]int, 0)
+	for i, ev := range events {
+		switch ev.kind {
+		case "call":
+			callIndices = append(callIndices, i)
+		case "result":
+			resultIndices = append(resultIndices, i)
+		}
+	}
+	info := sessionH4Info{ToolCallCount: len(callIndices), ToolResultCount: len(resultIndices)}
+	if len(callIndices) == 0 && len(resultIndices) == 0 {
+		info.PairStrict = true
+		return info
+	}
+	if len(callIndices) >= 1 && len(resultIndices) == 0 {
+		info.TrailingOrphanCount = len(callIndices)
+		return info
+	}
+	if len(callIndices) == 0 && len(resultIndices) >= 1 {
+		info.OrphanResultCount = len(resultIndices)
+		return info
+	}
+
+	callIDs := make([]string, 0, len(callIndices))
+	resultIDs := make([]string, 0, len(resultIndices))
+	hasAllCallIDs := true
+	hasAllResultIDs := true
+	for _, idx := range callIndices {
+		id := events[idx].id
+		if id == "" {
+			hasAllCallIDs = false
+		}
+		callIDs = append(callIDs, id)
+	}
+	for _, idx := range resultIndices {
+		id := events[idx].id
+		if id == "" {
+			hasAllResultIDs = false
+		}
+		resultIDs = append(resultIDs, id)
+	}
+
+	unpairedCallIndices := make([]int, 0)
+	if hasAllCallIDs && hasAllResultIDs {
+		callCounts := make(map[string]int)
+		resultCounts := make(map[string]int)
+		callSet := make(map[string]struct{}, len(callIDs))
+		resultSet := make(map[string]struct{}, len(resultIDs))
+		for _, id := range callIDs {
+			callCounts[id]++
+			callSet[id] = struct{}{}
+		}
+		for _, id := range resultIDs {
+			resultCounts[id]++
+			resultSet[id] = struct{}{}
+		}
+		for _, count := range callCounts {
+			if count > 1 {
+				info.DuplicateIDCount += count - 1
+			}
+		}
+		for _, count := range resultCounts {
+			if count > 1 {
+				info.DuplicateIDCount += count - 1
+			}
+		}
+		for _, idx := range callIndices {
+			if _, ok := resultSet[events[idx].id]; ok {
+				info.PairedCount++
+			} else {
+				unpairedCallIndices = append(unpairedCallIndices, idx)
+			}
+		}
+		for _, id := range resultIDs {
+			if _, ok := callSet[id]; !ok {
+				info.OrphanResultCount++
+			}
+		}
+	} else {
+		pending := make([]int, 0)
+		for i, ev := range events {
+			switch ev.kind {
+			case "call":
+				pending = append(pending, i)
+			case "result":
+				if len(pending) > 0 {
+					pending = pending[1:]
+					info.PairedCount++
+				} else {
+					info.OrphanResultCount++
+				}
+			}
+		}
+		unpairedCallIndices = pending
+	}
+
+	unpairedSet := make(map[int]struct{}, len(unpairedCallIndices))
+	for _, idx := range unpairedCallIndices {
+		unpairedSet[idx] = struct{}{}
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].kind == "call" {
+			if _, ok := unpairedSet[i]; ok {
+				info.TrailingOrphanCount++
+				continue
+			}
+		}
+		break
+	}
+	info.MiddleOrphanCount = len(unpairedSet) - info.TrailingOrphanCount
+	info.PairStrict = info.MiddleOrphanCount == 0 &&
+		info.OrphanResultCount == 0 &&
+		info.DuplicateIDCount == 0 &&
+		info.PairedCount >= 1
+	return info
+}
+
+func sessionD1Hash(trajectory SessionTrajectory) string {
+	parts := make([]string, 0, 1+len(trajectory.Tools)+len(trajectory.Messages))
+	if system := canonicalSessionText(stringPtrValue(trajectory.SystemPrompt)); system != "" {
+		parts = append(parts, "SYSTEM:"+system)
+	}
+	tools := append([]SessionTool(nil), trajectory.Tools...)
+	sort.SliceStable(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
+	for _, tool := range tools {
+		parts = append(parts, "TOOL:"+tool.Name+":"+tool.Description)
+	}
+	for _, msg := range deduplicateAccumulatedSessionMessages(trajectory.Messages) {
+		parts = append(parts, sessionMessageCanonical(msg))
+	}
+	return sha256Hex(strings.Join(parts, "\n"))
+}
+
+func buildSessionD2Sequence(messages []SessionMessage) []uint64 {
+	deduped := deduplicateAccumulatedSessionMessages(messages)
+	if len(deduped) == 0 {
+		return nil
+	}
+	seq := make([]uint64, 0, len(deduped)-1)
+	for i := 0; i < len(deduped)-1; i++ {
+		seq = append(seq, hashString64(sessionMessageCanonical(deduped[i])))
+	}
+	return seq
+}
+
+func buildSessionD3Sequence(messages []SessionMessage) []uint64 {
+	seq := make([]uint64, 0)
+	seenIDs := make(map[string]struct{})
+	for _, msg := range messages {
+		switch msg.Role {
+		case "assistant":
+			for _, call := range msg.ToolCalls {
+				if call.CallID == "" {
+					continue
+				}
+				if _, ok := seenIDs[call.CallID]; ok {
+					continue
+				}
+				seenIDs[call.CallID] = struct{}{}
+				seq = append(seq, hashString64("use:"+call.CallID))
+			}
+		case "tool":
+			resultID := sessionToolResultID(msg)
+			if resultID == "" {
+				continue
+			}
+			if _, ok := seenIDs[resultID]; ok {
+				continue
+			}
+			seenIDs[resultID] = struct{}{}
+			seq = append(seq, hashString64("result:"+resultID))
+		}
+	}
+	return seq
+}
+
+func sessionMessageCanonical(msg SessionMessage) string {
+	role := msg.Role
+	text := canonicalSessionText(stringPtrValue(msg.Content))
+	if role == "assistant" && len(msg.ToolCalls) > 0 {
+		parts := make([]string, 0, len(msg.ToolCalls))
+		for _, call := range msg.ToolCalls {
+			parts = append(parts, "TC:"+call.Name+":"+canonicalToolArguments(call.Arguments))
+		}
+		return role + ":" + text + "|" + strings.Join(parts, "|")
+	}
+	if role == "tool" {
+		return role + ":" + sessionToolResultID(msg) + ":" + text
+	}
+	return role + ":" + text
+}
+
+func canonicalToolArguments(arguments string) string {
+	if strings.TrimSpace(arguments) == "" {
+		return arguments
+	}
+	var parsed interface{}
+	if err := common.Unmarshal([]byte(arguments), &parsed); err != nil {
+		return arguments
+	}
+	data, err := common.Marshal(parsed)
+	if err != nil {
+		return arguments
+	}
+	return string(data)
+}
+
+func canonicalSessionText(value string) string {
+	if value == "" {
+		return ""
+	}
+	cleaned := systemReminderPattern.ReplaceAllString(value, "")
+	cleaned = whitespacePattern.ReplaceAllString(cleaned, " ")
+	return strings.TrimSpace(cleaned)
+}
+
+func sessionToolResultID(msg SessionMessage) string {
+	return stringPtrValue(msg.ToolCallID)
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func hashString64(value string) uint64 {
+	sum := sha256.Sum256([]byte(value))
+	return uint64(sum[0])<<56 |
+		uint64(sum[1])<<48 |
+		uint64(sum[2])<<40 |
+		uint64(sum[3])<<32 |
+		uint64(sum[4])<<24 |
+		uint64(sum[5])<<16 |
+		uint64(sum[6])<<8 |
+		uint64(sum[7])
 }
 
 func sessionSignature(trajectory SessionTrajectory) string {

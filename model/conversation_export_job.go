@@ -15,10 +15,10 @@ const (
 )
 
 type ConversationExportJob struct {
-	Id        int   `json:"id" gorm:"primaryKey"`
-	CreatedAt int64 `json:"created_at" gorm:"bigint;index"`
-	UpdatedAt int64 `json:"updated_at" gorm:"bigint"`
-	StartedAt int64 `json:"started_at" gorm:"bigint;default:0"`
+	Id         int   `json:"id" gorm:"primaryKey"`
+	CreatedAt  int64 `json:"created_at" gorm:"bigint;index"`
+	UpdatedAt  int64 `json:"updated_at" gorm:"bigint"`
+	StartedAt  int64 `json:"started_at" gorm:"bigint;default:0"`
 	FinishedAt int64 `json:"finished_at" gorm:"bigint;default:0"`
 
 	JobId           string `json:"job_id" gorm:"type:varchar(64);uniqueIndex"`
@@ -35,13 +35,13 @@ type ConversationExportJob struct {
 	Progress     string `json:"progress" gorm:"type:varchar(255);default:''"`
 	ErrorMessage string `json:"error_message,omitempty" gorm:"type:text"`
 
-	TotalRecords     int64 `json:"total_records" gorm:"bigint;default:0"`
-	ExportedRecords  int64 `json:"exported_records" gorm:"bigint;default:0"`
-	TotalSessions    int64 `json:"total_sessions" gorm:"bigint;default:0"`
-	ExportedSessions int64 `json:"exported_sessions" gorm:"bigint;default:0"`
+	TotalRecords      int64 `json:"total_records" gorm:"bigint;default:0"`
+	ExportedRecords   int64 `json:"exported_records" gorm:"bigint;default:0"`
+	TotalSessions     int64 `json:"total_sessions" gorm:"bigint;default:0"`
+	ExportedSessions  int64 `json:"exported_sessions" gorm:"bigint;default:0"`
 	UncompressedBytes int64 `json:"uncompressed_bytes" gorm:"bigint;default:0"`
 	CompressedBytes   int64 `json:"compressed_bytes" gorm:"bigint;default:0"`
-	ShardCount       int   `json:"shard_count" gorm:"default:0"`
+	ShardCount        int   `json:"shard_count" gorm:"default:0"`
 
 	ManifestPath    string `json:"manifest_path" gorm:"type:text"`
 	OutputDirectory string `json:"output_directory" gorm:"type:text"`
@@ -79,6 +79,14 @@ func HasRunningConversationExportJob() (bool, error) {
 	var count int64
 	err := LOG_DB.Model(&ConversationExportJob{}).
 		Where("status = ?", ConversationExportJobStatusRunning).
+		Count(&count).Error
+	return count > 0, err
+}
+
+func HasActiveConversationExportJob() (bool, error) {
+	var count int64
+	err := LOG_DB.Model(&ConversationExportJob{}).
+		Where("status IN ?", []string{ConversationExportJobStatusPending, ConversationExportJobStatusRunning}).
 		Count(&count).Error
 	return count > 0, err
 }
@@ -165,7 +173,7 @@ func FailOrphanedRunningJobs(ctx context.Context, errorMessage string, finishedA
 		db = db.WithContext(ctx)
 	}
 	result := db.Model(&ConversationExportJob{}).
-		Where("status = ?", ConversationExportJobStatusRunning).
+		Where("status IN ?", []string{ConversationExportJobStatusPending, ConversationExportJobStatusRunning}).
 		Updates(map[string]interface{}{
 			"status":        ConversationExportJobStatusFailed,
 			"error_message": errorMessage,

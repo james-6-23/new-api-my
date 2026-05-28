@@ -3,6 +3,7 @@ package service
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,15 +28,20 @@ import (
 )
 
 const (
-	// shardSessionWindow is the number of records (by ascending id) we look ahead
-	// before considering a pending session "stable" and flushing it. Larger window
-	// = stronger guarantee that a session is fully contained in one shard, at the
-	// cost of memory.
-	shardSessionWindow = 100000
+	sessionBucketCount   = 4096
+	sessionBucketMaxOpen = 128
 
-	// shardPendingSessionsCap bounds the heuristic flush buffer. Exceeding the cap
-	// triggers a forced flush of the oldest pending session.
-	shardPendingSessionsCap = 50000
+	// sessionMaxBufferedBytes rejects a single pathological session before it
+	// can monopolize memory during reconstruction. The source rows remain
+	// unexported, so operators can handle them separately without partial data.
+	sessionMaxBufferedBytes       = int64(256) << 20 // 256 MiB
+	sessionBucketMaxBufferedBytes = int64(512) << 20 // 512 MiB
+
+	maxSessionDedupEntries        = 2000000
+	maxSessionDedupSequenceTokens = 20000000
+
+	sessionD2MinSequenceLen = 1
+	sessionD3MinSequenceLen = 3
 )
 
 // ShardManifest is the per-shard manifest packed inside each tar.gz next to data.jsonl.
@@ -141,7 +148,7 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 	exportJobMu.Lock()
 	defer exportJobMu.Unlock()
 
-	hasRunning, err := model.HasRunningConversationExportJob()
+	hasRunning, err := model.HasActiveConversationExportJob()
 	if err != nil {
 		return nil, err
 	}
@@ -316,16 +323,15 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	defer os.RemoveAll(tmpDir)
 
 	state := &shardWriterState{
-		jobID:             job.JobId,
-		mode:              job.Mode,
-		trigger:           job.Trigger,
-		createdAt:         job.CreatedAt,
-		outputDir:         job.OutputDirectory,
-		tmpDir:            tmpDir,
-		shardTargetBytes:  job.ShardTargetBytes,
-		shardMaxBytes:     job.ShardMaxBytes,
-		deleteAfterExport: job.DeleteAfterExport,
-		totalEligible:     recordsEligible,
+		jobID:            job.JobId,
+		mode:             job.Mode,
+		trigger:          job.Trigger,
+		createdAt:        job.CreatedAt,
+		outputDir:        job.OutputDirectory,
+		tmpDir:           tmpDir,
+		shardTargetBytes: job.ShardTargetBytes,
+		shardMaxBytes:    job.ShardMaxBytes,
+		totalEligible:    recordsEligible,
 	}
 
 	var processErr error
@@ -382,6 +388,33 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	}
 
 	updateJobProgress(job.JobId, map[string]interface{}{
+		"manifest_path": manifestPath,
+		"progress":      "manifest finalized",
+	})
+
+	if state.totalRecordCount > 0 {
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"progress": "marking exported source records",
+		})
+		if err := state.markClosedShardRecordsExported(ctx); err != nil {
+			return err
+		}
+	}
+
+	if job.DeleteAfterExport && state.totalRecordCount > 0 {
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"progress": "deleting exported source records",
+		})
+		deleted, err := model.DeleteConversationLogsByExportBatchID(ctx, job.JobId, 200)
+		if err != nil {
+			return fmt.Errorf("delete exported conversation logs after manifest: %w", err)
+		}
+		if deleted != state.totalRecordCount {
+			common.SysLog(fmt.Sprintf("export job: deleted %d source record(s), expected %d for batch %s", deleted, state.totalRecordCount, job.JobId))
+		}
+	}
+
+	updateJobProgress(job.JobId, map[string]interface{}{
 		"manifest_path":      manifestPath,
 		"total_records":      recordsEligible,
 		"exported_records":   state.totalRecordCount,
@@ -403,15 +436,14 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 // then streams that file into the tar.gz without ever holding the full payload
 // in RAM.
 type shardWriterState struct {
-	jobID             string
-	mode              string
-	trigger           string
-	createdAt         int64
-	outputDir         string
-	tmpDir            string
-	shardTargetBytes  int64
-	shardMaxBytes     int64
-	deleteAfterExport bool
+	jobID            string
+	mode             string
+	trigger          string
+	createdAt        int64
+	outputDir        string
+	tmpDir           string
+	shardTargetBytes int64
+	shardMaxBytes    int64
 	// totalEligible is the DB-side count of rows the job is expected to
 	// process. Used purely for the progress text — the writer never indexes by
 	// it.
@@ -422,9 +454,12 @@ type shardWriterState struct {
 	currentJSONLPath  string
 	currentJSONLFile  *os.File
 	currentJSONLBuf   *bufio.Writer
+	currentIDsPath    string
+	currentIDsFile    *os.File
+	currentIDsBuf     *bufio.Writer
 	currentHasher     hash.Hash
 	currentSize       int64
-	currentRecordIDs  []int
+	currentIDCount    int64
 	currentRecordCnt  int64
 	currentSessionCnt int64
 	currentTimeMin    int64
@@ -434,6 +469,7 @@ type shardWriterState struct {
 
 	// Job totals
 	shards            []TopManifestShard
+	shardIDPaths      []string
 	totalRecordCount  int64
 	totalSessionCount int64
 	totalUncompressed int64
@@ -458,9 +494,19 @@ func (s *shardWriterState) ensureCurrentShard() error {
 	if err != nil {
 		return err
 	}
+	idsPath := filepath.Join(s.tmpDir, fmt.Sprintf("shard-pending-%04d.ids", s.currentIndex+1))
+	idsFile, err := os.Create(idsPath)
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
 	s.currentJSONLPath = path
 	s.currentJSONLFile = f
 	s.currentJSONLBuf = bufio.NewWriterSize(f, 1<<20) // 1 MiB
+	s.currentIDsPath = idsPath
+	s.currentIDsFile = idsFile
+	s.currentIDsBuf = bufio.NewWriterSize(idsFile, 1<<20)
 	s.currentHasher = sha256.New()
 	s.currentSize = 0
 	return nil
@@ -511,7 +557,15 @@ func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount
 	s.currentSize += int64(len(line)) + 1
 	s.currentRecordCnt += int64(len(recordIDs))
 	s.currentSessionCnt += sessionCount
-	s.currentRecordIDs = append(s.currentRecordIDs, recordIDs...)
+	for _, id := range recordIDs {
+		if _, err := s.currentIDsBuf.WriteString(strconv.Itoa(id)); err != nil {
+			return err
+		}
+		if err := s.currentIDsBuf.WriteByte('\n'); err != nil {
+			return err
+		}
+		s.currentIDCount++
+	}
 	return nil
 }
 
@@ -568,6 +622,13 @@ func (s *shardWriterState) closeCurrentShard() error {
 			s.currentJSONLFile = nil
 			s.currentJSONLBuf = nil
 		}
+		if s.currentIDsFile != nil {
+			_ = s.currentIDsBuf.Flush()
+			_ = s.currentIDsFile.Close()
+			_ = os.Remove(s.currentIDsPath)
+			s.currentIDsFile = nil
+			s.currentIDsBuf = nil
+		}
 		return nil
 	}
 
@@ -575,7 +636,13 @@ func (s *shardWriterState) closeCurrentShard() error {
 	if err := s.currentJSONLBuf.Flush(); err != nil {
 		return err
 	}
+	if err := s.currentIDsBuf.Flush(); err != nil {
+		return err
+	}
 	if err := s.currentJSONLFile.Close(); err != nil {
+		return err
+	}
+	if err := s.currentIDsFile.Close(); err != nil {
 		return err
 	}
 
@@ -626,23 +693,13 @@ func (s *shardWriterState) closeCurrentShard() error {
 	// 4. Drop the temp jsonl now that it's fully captured in the tar.gz.
 	_ = os.Remove(s.currentJSONLPath)
 
-	// 5. Mark records exported only after the file exists on disk. If
-	// delete_after_export was requested, also wipe the source rows now (rather
-	// than at the end of the job) so RAM and DB pressure are released per shard.
-	if len(s.currentRecordIDs) > 0 {
-		exportedAt := common.GetTimestamp()
-		for _, chunk := range chunkIntsForExport(s.currentRecordIDs, 200) {
-			if err := model.MarkConversationLogsExported(chunk, s.jobID, exportedAt); err != nil {
-				common.SysError("mark exported (shard close): " + err.Error())
-			}
-		}
-		if s.deleteAfterExport {
-			for _, chunk := range chunkIntsForExport(s.currentRecordIDs, 200) {
-				if _, err := model.DeleteConversationLogsByIDs(chunk); err != nil {
-					common.SysError("delete after export (shard close): " + err.Error())
-				}
-			}
-		}
+	// 5. Keep the sidecar id file until the top-level manifest is finalized.
+	// Records are marked exported only after the full delivery package is
+	// complete; a failed job therefore never hides source rows from a retry.
+	if s.currentIDCount > 0 {
+		s.shardIDPaths = append(s.shardIDPaths, s.currentIDsPath)
+	} else {
+		_ = os.Remove(s.currentIDsPath)
 	}
 
 	// 6. Record the shard in the job's shard list.
@@ -679,15 +736,38 @@ func (s *shardWriterState) closeCurrentShard() error {
 	s.currentJSONLFile = nil
 	s.currentJSONLBuf = nil
 	s.currentJSONLPath = ""
+	s.currentIDsFile = nil
+	s.currentIDsBuf = nil
+	s.currentIDsPath = ""
 	s.currentHasher = nil
 	s.currentSize = 0
-	s.currentRecordIDs = nil
+	s.currentIDCount = 0
 	s.currentRecordCnt = 0
 	s.currentSessionCnt = 0
 	s.currentTimeMin = 0
 	s.currentTimeMax = 0
 	s.currentFirstID = 0
 	s.currentLastID = 0
+	return nil
+}
+
+func (s *shardWriterState) markClosedShardRecordsExported(ctx context.Context) error {
+	if len(s.shardIDPaths) == 0 {
+		return nil
+	}
+	exportedAt := common.GetTimestamp()
+	for i, path := range s.shardIDPaths {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if err := markConversationLogIDsFromFile(path, s.jobID, exportedAt, 200); err != nil {
+			return fmt.Errorf("mark exported records for shard %d: %w", i+1, err)
+		}
+		_ = os.Remove(path)
+	}
+	s.shardIDPaths = nil
 	return nil
 }
 
@@ -831,162 +911,700 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	})
 }
 
-// sessionPending holds in-progress session data during heuristic flush.
-type sessionPending struct {
-	records       []*model.ConversationLog
-	lastSeenID    int
-	earliestReqTS int64
-	latestReqTS   int64
+type sessionExportSpool struct {
+	dataPath string
+	metaPath string
+	dataFile *os.File
+	metaFile *os.File
+	dataBuf  *bufio.Writer
+	metaBuf  *bufio.Writer
+	count    int64
 }
 
-func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) error {
-	pending := make(map[string]*sessionPending)
-	candidates := make([]sessionCandidate, 0)
-	currentScanID := 0
+type sessionSpoolMeta struct {
+	LineNo          int64    `json:"line_no"`
+	RecordIDs       []int    `json:"record_ids"`
+	D1Hash          string   `json:"d1_hash"`
+	D2Seq           []uint64 `json:"d2_seq"`
+	D3Seq           []uint64 `json:"d3_seq"`
+	RequestTimeMin  int64    `json:"request_time_min"`
+	ResponseTimeMax int64    `json:"response_time_max"`
+}
 
-	collectSession := func(sessionID string) error {
-		entry, ok := pending[sessionID]
-		if !ok {
-			return nil
+type sessionSeqEntry struct {
+	LineNo int64
+	Seq    []uint64
+}
+
+type sessionDedupEntry struct {
+	LineNo int64
+	D2Seq  []uint64
+	D3Seq  []uint64
+}
+
+type sessionBucketRecord struct {
+	ID           int    `json:"id"`
+	SessionID    string `json:"session_id"`
+	Provider     string `json:"provider"`
+	RequestBody  string `json:"request_body"`
+	ResponseBody string `json:"response_body"`
+	RequestTime  int64  `json:"request_time"`
+	ResponseTime int64  `json:"response_time"`
+}
+
+type sessionBucketFile struct {
+	index    int
+	path     string
+	file     *os.File
+	writer   *bufio.Writer
+	lastUsed int64
+}
+
+type sessionBucketWriterManager struct {
+	dir     string
+	files   map[int]*sessionBucketFile
+	paths   map[int]string
+	counter int64
+}
+
+type sessionBucketGroup struct {
+	records     []*model.ConversationLog
+	approxBytes int64
+	overflow    bool
+}
+
+func newSessionBucketWriterManager(tmpDir string) (*sessionBucketWriterManager, error) {
+	dir := filepath.Join(tmpDir, "session-buckets")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return &sessionBucketWriterManager{
+		dir:   dir,
+		files: make(map[int]*sessionBucketFile),
+		paths: make(map[int]string),
+	}, nil
+}
+
+func (m *sessionBucketWriterManager) append(record sessionBucketRecord) error {
+	bucket, err := m.open(sessionBucketIndex(record.SessionID))
+	if err != nil {
+		return err
+	}
+	line, err := common.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if _, err := bucket.writer.Write(line); err != nil {
+		return err
+	}
+	return bucket.writer.WriteByte('\n')
+}
+
+func (m *sessionBucketWriterManager) open(index int) (*sessionBucketFile, error) {
+	m.counter++
+	if existing := m.files[index]; existing != nil {
+		existing.lastUsed = m.counter
+		return existing, nil
+	}
+	if len(m.files) >= sessionBucketMaxOpen {
+		if err := m.closeLeastRecentlyUsed(); err != nil {
+			return nil, err
 		}
-		delete(pending, sessionID)
-		candidate := buildSessionCandidate(sessionID, entry.records)
-		if len(candidate.Reasons) > 0 {
-			// Quality gate failed; record IDs are still left as "not exported" so
-			// the operator can review and a future job with adjusted criteria
-			// could re-include them.
-			return nil
+	}
+	path := filepath.Join(m.dir, fmt.Sprintf("bucket-%04d.jsonl", index))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	bucket := &sessionBucketFile{
+		index:    index,
+		path:     path,
+		file:     file,
+		writer:   bufio.NewWriterSize(file, 1<<20),
+		lastUsed: m.counter,
+	}
+	m.files[index] = bucket
+	m.paths[index] = path
+	return bucket, nil
+}
+
+func (m *sessionBucketWriterManager) closeLeastRecentlyUsed() error {
+	oldestIndex := -1
+	oldestUsed := int64(0)
+	for index, bucket := range m.files {
+		if oldestIndex == -1 || bucket.lastUsed < oldestUsed {
+			oldestIndex = index
+			oldestUsed = bucket.lastUsed
 		}
-		candidates = append(candidates, candidate)
+	}
+	if oldestIndex == -1 {
 		return nil
 	}
+	return m.closeBucket(oldestIndex)
+}
 
-	flushStable := func() error {
-		if len(pending) == 0 {
-			return nil
+func (m *sessionBucketWriterManager) closeBucket(index int) error {
+	bucket := m.files[index]
+	if bucket == nil {
+		return nil
+	}
+	if err := bucket.writer.Flush(); err != nil {
+		return err
+	}
+	if err := bucket.file.Close(); err != nil {
+		return err
+	}
+	delete(m.files, index)
+	return nil
+}
+
+func (m *sessionBucketWriterManager) closeAll() error {
+	indexes := make([]int, 0, len(m.files))
+	for index := range m.files {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	for _, index := range indexes {
+		if err := m.closeBucket(index); err != nil {
+			return err
 		}
-		stable := make([]string, 0, len(pending))
-		for sid, entry := range pending {
-			if currentScanID-entry.lastSeenID >= shardSessionWindow {
-				stable = append(stable, sid)
-			}
+	}
+	return nil
+}
+
+func (m *sessionBucketWriterManager) sortedPaths() []string {
+	indexes := make([]int, 0, len(m.paths))
+	for index := range m.paths {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	paths := make([]string, 0, len(indexes))
+	for _, index := range indexes {
+		paths = append(paths, m.paths[index])
+	}
+	return paths
+}
+
+func sessionBucketIndex(sessionID string) int {
+	sum := sha256.Sum256([]byte(sessionID))
+	value := int(sum[0])<<24 | int(sum[1])<<16 | int(sum[2])<<8 | int(sum[3])
+	if value < 0 {
+		value = -value
+	}
+	return value % sessionBucketCount
+}
+
+func sessionBucketRecordBytes(record sessionBucketRecord) int64 {
+	return int64(len(record.SessionID) + len(record.Provider) + len(record.RequestBody) + len(record.ResponseBody) + 128)
+}
+
+func conversationLogFromSessionBucketRecord(record sessionBucketRecord) *model.ConversationLog {
+	return &model.ConversationLog{
+		Id:           record.ID,
+		SessionId:    record.SessionID,
+		Provider:     record.Provider,
+		RequestBody:  record.RequestBody,
+		ResponseBody: record.ResponseBody,
+		RequestTime:  record.RequestTime,
+		ResponseTime: record.ResponseTime,
+	}
+}
+
+func newSessionExportSpool(tmpDir string) (*sessionExportSpool, error) {
+	dataPath := filepath.Join(tmpDir, "session-candidates.jsonl")
+	metaPath := filepath.Join(tmpDir, "session-candidates.meta.jsonl")
+	dataFile, err := os.Create(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	metaFile, err := os.Create(metaPath)
+	if err != nil {
+		_ = dataFile.Close()
+		_ = os.Remove(dataPath)
+		return nil, err
+	}
+	return &sessionExportSpool{
+		dataPath: dataPath,
+		metaPath: metaPath,
+		dataFile: dataFile,
+		metaFile: metaFile,
+		dataBuf:  bufio.NewWriterSize(dataFile, 1<<20),
+		metaBuf:  bufio.NewWriterSize(metaFile, 1<<20),
+	}, nil
+}
+
+func (s *sessionExportSpool) appendCandidate(candidate sessionCandidate) error {
+	line, err := common.Marshal(candidate.Trajectory)
+	if err != nil {
+		return err
+	}
+	meta := sessionSpoolMeta{
+		LineNo:          s.count,
+		RecordIDs:       candidate.RecordIDs,
+		D1Hash:          sessionD1Hash(candidate.Trajectory),
+		D2Seq:           buildSessionD2Sequence(candidate.Trajectory.Messages),
+		D3Seq:           buildSessionD3Sequence(candidate.Trajectory.Messages),
+		RequestTimeMin:  candidate.RequestTimeMin,
+		ResponseTimeMax: candidate.ResponseTimeMax,
+	}
+	metaLine, err := common.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	if _, err := s.dataBuf.Write(line); err != nil {
+		return err
+	}
+	if err := s.dataBuf.WriteByte('\n'); err != nil {
+		return err
+	}
+	if _, err := s.metaBuf.Write(metaLine); err != nil {
+		return err
+	}
+	if err := s.metaBuf.WriteByte('\n'); err != nil {
+		return err
+	}
+	s.count++
+	return nil
+}
+
+func (s *sessionExportSpool) close() error {
+	if s == nil {
+		return nil
+	}
+	if s.dataBuf != nil {
+		if err := s.dataBuf.Flush(); err != nil {
+			return err
 		}
-		sort.Strings(stable)
-		for _, sid := range stable {
-			if err := collectSession(sid); err != nil {
+		s.dataBuf = nil
+	}
+	if s.metaBuf != nil {
+		if err := s.metaBuf.Flush(); err != nil {
+			return err
+		}
+		s.metaBuf = nil
+	}
+	if s.dataFile != nil {
+		if err := s.dataFile.Close(); err != nil {
+			return err
+		}
+		s.dataFile = nil
+	}
+	if s.metaFile != nil {
+		if err := s.metaFile.Close(); err != nil {
+			return err
+		}
+		s.metaFile = nil
+	}
+	return nil
+}
+
+func dedupeSessionSpool(ctx context.Context, metaPath string, summary *ConversationExportSummary) (map[int64]struct{}, int, int, error) {
+	if summary.RejectedSessionsByReason == nil {
+		summary.RejectedSessionsByReason = make(map[string]int64)
+	}
+	file, err := os.Open(metaPath)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer file.Close()
+
+	reader := bufio.NewReaderSize(file, 1<<20)
+	seenD1 := make(map[string]int64)
+	keep := make(map[int64]struct{})
+	entries := make([]sessionDedupEntry, 0)
+	duplicateRemoved := 0
+	sequenceTokens := int64(0)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, 0, err
+		}
+		line, err := readJSONLLine(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var meta sessionSpoolMeta
+		if err := common.Unmarshal(line, &meta); err != nil {
+			return nil, 0, 0, err
+		}
+		if _, ok := seenD1[meta.D1Hash]; ok {
+			duplicateRemoved++
+			summary.RejectedSessionsByReason["exact_duplicate"]++
+			continue
+		}
+		seenD1[meta.D1Hash] = meta.LineNo
+		keep[meta.LineNo] = struct{}{}
+		if len(entries) >= maxSessionDedupEntries {
+			return nil, 0, 0, fmt.Errorf("session dedup candidate count exceeds safety limit (%d); narrow the export range or lower auto-export threshold", maxSessionDedupEntries)
+		}
+		sequenceTokens += int64(len(meta.D2Seq) + len(meta.D3Seq))
+		if sequenceTokens > maxSessionDedupSequenceTokens {
+			return nil, 0, 0, fmt.Errorf("session dedup sequence index exceeds safety limit (%d tokens); narrow the export range or lower auto-export threshold", maxSessionDedupSequenceTokens)
+		}
+		entries = append(entries, sessionDedupEntry{
+			LineNo: meta.LineNo,
+			D2Seq:  meta.D2Seq,
+			D3Seq:  meta.D3Seq,
+		})
+	}
+
+	d2Entries := make([]sessionSeqEntry, 0, len(entries))
+	for _, entry := range entries {
+		d2Entries = append(d2Entries, sessionSeqEntry{LineNo: entry.LineNo, Seq: entry.D2Seq})
+	}
+	d2Duplicates := findSessionSubsequenceDuplicates(d2Entries, sessionD2MinSequenceLen)
+	for lineNo := range d2Duplicates {
+		if _, ok := keep[lineNo]; ok {
+			delete(keep, lineNo)
+			summary.RejectedSessionsByReason["message_subsequence_duplicate"]++
+		}
+	}
+
+	d3Entries := make([]sessionSeqEntry, 0, len(entries)-len(d2Duplicates))
+	for _, entry := range entries {
+		if _, ok := keep[entry.LineNo]; !ok {
+			continue
+		}
+		d3Entries = append(d3Entries, sessionSeqEntry{LineNo: entry.LineNo, Seq: entry.D3Seq})
+	}
+	d3Duplicates := findSessionSubsequenceDuplicates(d3Entries, sessionD3MinSequenceLen)
+	for lineNo := range d3Duplicates {
+		if _, ok := keep[lineNo]; ok {
+			delete(keep, lineNo)
+			summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"]++
+		}
+	}
+	return keep, duplicateRemoved, len(d2Duplicates) + len(d3Duplicates), nil
+}
+
+func streamSessionSpoolToShards(ctx context.Context, spool *sessionExportSpool, keep map[int64]struct{}, state *shardWriterState) error {
+	dataFile, err := os.Open(spool.dataPath)
+	if err != nil {
+		return err
+	}
+	defer dataFile.Close()
+	metaFile, err := os.Open(spool.metaPath)
+	if err != nil {
+		return err
+	}
+	defer metaFile.Close()
+
+	dataReader := bufio.NewReaderSize(dataFile, 1<<20)
+	metaReader := bufio.NewReaderSize(metaFile, 1<<20)
+	lineNo := int64(0)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dataLine, dataErr := readJSONLLine(dataReader)
+		if dataErr == io.EOF {
+			break
+		}
+		if dataErr != nil {
+			return dataErr
+		}
+		metaLine, metaErr := readJSONLLine(metaReader)
+		if metaErr != nil {
+			return metaErr
+		}
+		if _, ok := keep[lineNo]; ok {
+			var meta sessionSpoolMeta
+			if err := common.Unmarshal(metaLine, &meta); err != nil {
 				return err
 			}
-		}
-		// Cap enforcement: if still too many pending, force-flush oldest by lastSeenID.
-		if len(pending) > shardPendingSessionsCap {
-			type pair struct {
-				id   string
-				seen int
-			}
-			pairs := make([]pair, 0, len(pending))
-			for sid, entry := range pending {
-				pairs = append(pairs, pair{sid, entry.lastSeenID})
-			}
-			sort.Slice(pairs, func(i, j int) bool { return pairs[i].seen < pairs[j].seen })
-			overflow := len(pending) - shardPendingSessionsCap
-			common.SysLog(fmt.Sprintf("export job: pending sessions exceed cap (%d), force-flushing oldest %d", len(pending), overflow))
-			for i := 0; i < overflow; i++ {
-				if err := collectSession(pairs[i].id); err != nil {
+			lineLen := int64(len(dataLine) + 1)
+			if state.wouldOverflowMax(lineLen) {
+				if err := state.closeCurrentShard(); err != nil {
 					return err
 				}
 			}
+			if lineLen > state.shardMaxBytes {
+				common.SysLog(fmt.Sprintf("export job: session spool line %d exceeds shard_max_bytes (%d > %d), shard will be oversize", lineNo, lineLen, state.shardMaxBytes))
+			}
+			if err := state.appendLine(dataLine, meta.RecordIDs, 1, meta.RequestTimeMin, meta.ResponseTimeMax); err != nil {
+				return err
+			}
+			if state.shouldRotateAfter() {
+				if err := state.closeCurrentShard(); err != nil {
+					return err
+				}
+			}
+			state.maybePushProgress(false)
 		}
-		return nil
+		lineNo++
 	}
+	return nil
+}
 
-	err := model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
+func findSessionSubsequenceDuplicates(entries []sessionSeqEntry, minSeqLen int) map[int64]struct{} {
+	sortedEntries := append([]sessionSeqEntry(nil), entries...)
+	sort.SliceStable(sortedEntries, func(i, j int) bool {
+		if len(sortedEntries[i].Seq) == len(sortedEntries[j].Seq) {
+			return sortedEntries[i].LineNo < sortedEntries[j].LineNo
+		}
+		return len(sortedEntries[i].Seq) > len(sortedEntries[j].Seq)
+	})
+
+	index := make(map[uint64][]int)
+	keptSeqs := make([][]uint64, 0)
+	duplicates := make(map[int64]struct{})
+	for _, entry := range sortedEntries {
+		if len(entry.Seq) < minSeqLen {
+			continue
+		}
+		isDuplicate := false
+		if len(index) > 0 {
+			minToken := entry.Seq[0]
+			minCount := len(index[minToken])
+			for _, token := range entry.Seq[1:] {
+				count := len(index[token])
+				if count < minCount {
+					minToken = token
+					minCount = count
+				}
+			}
+			for _, parentIdx := range index[minToken] {
+				if containsUint64Subsequence(keptSeqs[parentIdx], entry.Seq) {
+					duplicates[entry.LineNo] = struct{}{}
+					isDuplicate = true
+					break
+				}
+			}
+		}
+		if isDuplicate {
+			continue
+		}
+		parentIdx := len(keptSeqs)
+		keptSeqs = append(keptSeqs, entry.Seq)
+		seenTokens := make(map[uint64]struct{}, len(entry.Seq))
+		for _, token := range entry.Seq {
+			if _, ok := seenTokens[token]; ok {
+				continue
+			}
+			index[token] = append(index[token], parentIdx)
+			seenTokens[token] = struct{}{}
+		}
+	}
+	return duplicates
+}
+
+func containsUint64Subsequence(parent, child []uint64) bool {
+	if len(child) == 0 || len(parent) == 0 || len(child) > len(parent) {
+		return false
+	}
+	first := child[0]
+	for start := 0; start <= len(parent)-len(child); start++ {
+		if parent[start] != first {
+			continue
+		}
+		matched := true
+		for i := range child {
+			if parent[start+i] != child[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
+func readJSONLLine(reader *bufio.Reader) ([]byte, error) {
+	line, err := reader.ReadBytes('\n')
+	if len(line) > 0 {
+		return bytes.TrimRight(line, "\r\n"), nil
+	}
+	return nil, err
+}
+
+func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) ([]string, int64, error) {
+	manager, err := newSessionBucketWriterManager(state.tmpDir)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer manager.closeAll()
+
+	var eligible int64
+	err = model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		for _, item := range logs {
-			currentScanID = item.Id
 			if item.ValidationStatus != ConversationValidationValid || !ValidateAPIRecord(item).Exportable {
 				continue
 			}
 			if item.SessionId == "" {
 				continue
 			}
-			entry := pending[item.SessionId]
-			if entry == nil {
-				entry = &sessionPending{earliestReqTS: item.RequestTime, latestReqTS: item.ResponseTime}
-				pending[item.SessionId] = entry
+			record := sessionBucketRecord{
+				ID:           item.Id,
+				SessionID:    item.SessionId,
+				Provider:     item.Provider,
+				RequestBody:  item.RequestBody,
+				ResponseBody: item.ResponseBody,
+				RequestTime:  item.RequestTime,
+				ResponseTime: item.ResponseTime,
 			}
-			entry.records = append(entry.records, item)
-			entry.lastSeenID = item.Id
-			if item.RequestTime > 0 && (entry.earliestReqTS == 0 || item.RequestTime < entry.earliestReqTS) {
-				entry.earliestReqTS = item.RequestTime
+			if err := manager.append(record); err != nil {
+				return err
 			}
-			if item.ResponseTime > entry.latestReqTS {
-				entry.latestReqTS = item.ResponseTime
-			}
-		}
-		if err := flushStable(); err != nil {
-			return err
+			eligible++
 		}
 		state.maybePushProgress(false)
 		return nil
 	})
 	if err != nil {
+		return nil, eligible, err
+	}
+	if err := manager.closeAll(); err != nil {
+		return nil, eligible, err
+	}
+	return manager.sortedPaths(), eligible, nil
+}
+
+func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spool *sessionExportSpool, summary *ConversationExportSummary, state *shardWriterState) (int64, error) {
+	var totalSessions int64
+	for bucketIndex, path := range bucketPaths {
+		if err := ctx.Err(); err != nil {
+			return totalSessions, err
+		}
+		groups, err := readSessionBucketGroups(path)
+		if err != nil {
+			return totalSessions, err
+		}
+		sessionIDs := sortedStringKeys(groups)
+		totalSessions += int64(len(sessionIDs))
+		for _, sessionID := range sessionIDs {
+			group := groups[sessionID]
+			if group.overflow {
+				summary.RejectedSessionsByReason["session_payload_too_large"]++
+				continue
+			}
+			candidate := buildSessionCandidate(sessionID, group.records)
+			if len(candidate.Reasons) > 0 {
+				for _, reason := range candidate.Reasons {
+					summary.RejectedSessionsByReason[reason]++
+				}
+				continue
+			}
+			if err := spool.appendCandidate(candidate); err != nil {
+				return totalSessions, err
+			}
+		}
+		if state != nil && strings.TrimSpace(state.jobID) != "" {
+			updateJobProgress(state.jobID, map[string]interface{}{
+				"total_sessions": totalSessions,
+				"progress":       fmt.Sprintf("rebuilt session bucket %d/%d", bucketIndex+1, len(bucketPaths)),
+			})
+		}
+	}
+	return totalSessions, nil
+}
+
+func readSessionBucketGroups(path string) (map[string]*sessionBucketGroup, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := bufio.NewReaderSize(file, 1<<20)
+	groups := make(map[string]*sessionBucketGroup)
+	var retainedBucketBytes int64
+	for {
+		line, err := readJSONLLine(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var record sessionBucketRecord
+		if err := common.Unmarshal(line, &record); err != nil {
+			return nil, err
+		}
+		group := groups[record.SessionID]
+		if group == nil {
+			group = &sessionBucketGroup{}
+			groups[record.SessionID] = group
+		}
+		recordBytes := sessionBucketRecordBytes(record)
+		previousGroupBytes := group.approxBytes
+		group.approxBytes += recordBytes
+		if group.overflow {
+			continue
+		}
+		if group.approxBytes > sessionMaxBufferedBytes {
+			group.overflow = true
+			group.records = nil
+			retainedBucketBytes -= previousGroupBytes
+			if retainedBucketBytes < 0 {
+				retainedBucketBytes = 0
+			}
+			continue
+		}
+		retainedBucketBytes += recordBytes
+		if retainedBucketBytes > sessionBucketMaxBufferedBytes {
+			return nil, fmt.Errorf("session bucket %s exceeds safety limit (%d bytes); lower auto-export threshold or increase bucket partitioning", filepath.Base(path), sessionBucketMaxBufferedBytes)
+		}
+		group.records = append(group.records, conversationLogFromSessionBucketRecord(record))
+	}
+	return groups, nil
+}
+
+func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) error {
+	summary := &ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
+	spool, err := newSessionExportSpool(state.tmpDir)
+	if err != nil {
 		return err
 	}
+	defer spool.close()
 
-	state.maybePushProgress(true)
-
-	// End-of-scan: flush everything that's left.
-	remaining := make([]string, 0, len(pending))
-	for sid := range pending {
-		remaining = append(remaining, sid)
-	}
-	sort.Strings(remaining)
-	for _, sid := range remaining {
-		if err := collectSession(sid); err != nil {
-			return err
-		}
-	}
-
-	summary := &ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
-	exportable, duplicateRemoved, subsequenceRemoved := filterSessionCandidates(candidates, summary)
-	if duplicateRemoved > 0 || subsequenceRemoved > 0 {
-		common.SysLog(fmt.Sprintf("export job: removed %d exact duplicate session(s), %d continuous-subsequence session(s)", duplicateRemoved, subsequenceRemoved))
+	updateJobProgress(state.jobID, map[string]interface{}{
+		"progress": "bucketing session records by session_id",
+	})
+	bucketPaths, eligibleRecords, err := writeSessionBuckets(ctx, query, state)
+	if err != nil {
+		return err
 	}
 	updateJobProgress(state.jobID, map[string]interface{}{
-		"total_sessions": int64(len(candidates)),
-		"progress":       fmt.Sprintf("deduplicated sessions: %d exportable of %d", len(exportable), len(candidates)),
+		"total_records": eligibleRecords,
+		"progress":      fmt.Sprintf("bucketed %d record(s) into %d session bucket(s)", eligibleRecords, len(bucketPaths)),
+	})
+	if len(bucketPaths) == 0 {
+		return nil
+	}
+
+	totalSessions, err := buildSessionSpoolFromBuckets(ctx, bucketPaths, spool, summary, state)
+	if err != nil {
+		return err
+	}
+	if err := spool.close(); err != nil {
+		return err
+	}
+	keep, duplicateRemoved, subsequenceRemoved, err := dedupeSessionSpool(ctx, spool.metaPath, summary)
+	if err != nil {
+		return err
+	}
+	if duplicateRemoved > 0 || subsequenceRemoved > 0 {
+		common.SysLog(fmt.Sprintf("export job: removed %d exact duplicate session(s), %d D2/D3 subsequence session(s)", duplicateRemoved, subsequenceRemoved))
+	}
+	updateJobProgress(state.jobID, map[string]interface{}{
+		"total_sessions": totalSessions,
+		"progress":       fmt.Sprintf("deduplicated sessions: %d exportable of %d", len(keep), spool.count),
 	})
 
-	for _, candidate := range exportable {
-		line, err := common.Marshal(candidate.Trajectory)
-		if err != nil {
-			return err
-		}
-		lineLen := int64(len(line) + 1)
-		// One session must fit in one shard. If even an empty shard cannot hold
-		// it (e.g. a 30 GiB session) we still write it but log a warning — the
-		// alternative would be data loss.
-		if state.wouldOverflowMax(lineLen) {
-			if err := state.closeCurrentShard(); err != nil {
-				return err
-			}
-		}
-		if lineLen > state.shardMaxBytes {
-			common.SysLog(fmt.Sprintf("export job: session %s exceeds shard_max_bytes (%d > %d), shard will be oversize", candidate.Trajectory.TrajectoryID, lineLen, state.shardMaxBytes))
-		}
-		if err := state.appendLine(line, candidate.RecordIDs, 1, candidate.RequestTimeMin, candidate.ResponseTimeMax); err != nil {
-			return err
-		}
-		if state.shouldRotateAfter() {
-			if err := state.closeCurrentShard(); err != nil {
-				return err
-			}
-		}
-		state.maybePushProgress(false)
-	}
-	return nil
+	return streamSessionSpoolToShards(ctx, spool, keep, state)
 }
 
 // CleanupOrphanedExportJobs is called on service startup to mark jobs that were
@@ -1107,6 +1725,56 @@ func DeleteExportJobArtifacts(job *model.ConversationExportJob) error {
 		return nil
 	}
 	return os.RemoveAll(job.OutputDirectory)
+}
+
+func markConversationLogIDsFromFile(path, batchID string, exportedAt int64, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	reader := bufio.NewReaderSize(file, 1<<20)
+	batch := make([]int, 0, batchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := model.MarkConversationLogsExported(batch, batchID, exportedAt); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			idText := strings.TrimSpace(line)
+			if idText != "" {
+				id, convErr := strconv.Atoi(idText)
+				if convErr != nil {
+					return convErr
+				}
+				batch = append(batch, id)
+				if len(batch) >= batchSize {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return flush()
 }
 
 // chunkIntsForExport is a package-local copy of the controller's chunk helper

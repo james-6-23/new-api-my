@@ -1215,7 +1215,10 @@ const ConversationLog = () => {
           </div>
         </Tabs.TabPane>
         <Tabs.TabPane tab={t('分片导出任务')} itemKey='export_jobs'>
-          <ExportJobs defaultMode={settings.default_export_mode} />
+          <ExportJobs
+            defaultMode={settings.default_export_mode}
+            getFilterParams={getFilterParams}
+          />
         </Tabs.TabPane>
         <Tabs.TabPane
           tab={
@@ -1345,9 +1348,7 @@ const ConversationLog = () => {
                         label={t('启用自动导出')}
                         checkedText={t('开')}
                         uncheckedText={t('关')}
-                        extraText={t(
-                          '存储占用达到阈值时自动打包导出 tar.gz',
-                        )}
+                        extraText={t('存储占用达到阈值时自动打包导出 tar.gz')}
                         onChange={(value) =>
                           setSettings({
                             ...settings,

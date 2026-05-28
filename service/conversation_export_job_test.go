@@ -2,7 +2,9 @@ package service
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,4 +64,138 @@ func TestBuildExportJobOutputDirNameUsesModeTimestampAndShortID(t *testing.T) {
 	name := buildExportJobOutputDirName("session_jsonl", 1710000000, "7810a11e-e779-4f09-ad73-a4e090874a65")
 
 	require.Equal(t, "session_jsonl-20240309T160000-7810a11e", name)
+}
+
+func TestExportJobCreateRequestAcceptsSnakeCaseFilter(t *testing.T) {
+	var req ExportJobCreateRequest
+	err := common.Unmarshal([]byte(`{
+		"mode":"session_jsonl",
+		"filter":{
+			"start_timestamp":1710000000,
+			"end_timestamp":1710003600,
+			"channel_id":7,
+			"token_name":"prod-token",
+			"validation_status":"valid",
+			"exported":false
+		}
+	}`), &req)
+
+	require.NoError(t, err)
+	require.EqualValues(t, 1710000000, req.Filter.StartTime)
+	require.EqualValues(t, 1710003600, req.Filter.EndTime)
+	require.Equal(t, 7, req.Filter.ChannelId)
+	require.Equal(t, "prod-token", req.Filter.TokenName)
+	require.Equal(t, "valid", req.Filter.ValidationStatus)
+	require.NotNil(t, req.Filter.Exported)
+	require.False(t, *req.Filter.Exported)
+}
+
+func TestSessionSpoolDedupRemovesD1D2AndD3WithoutLoadingBodies(t *testing.T) {
+	dir := t.TempDir()
+	spool, err := newSessionExportSpool(dir)
+	require.NoError(t, err)
+
+	longMessages := []SessionMessage{
+		{Role: "user", Content: nullableString("a")},
+		{Role: "assistant", Content: nullableString("b")},
+		{Role: "user", Content: nullableString("c")},
+		{Role: "assistant", Content: nullableString("d")},
+	}
+	d2SubsequenceMessages := []SessionMessage{
+		{Role: "assistant", Content: nullableString("b")},
+		{Role: "user", Content: nullableString("c")},
+		{Role: "assistant", Content: nullableString("different tail")},
+	}
+	d3ParentMessages := []SessionMessage{
+		{Role: "user", Content: nullableString("parent")},
+		{Role: "assistant", ToolCalls: []SessionToolCall{
+			{Name: "Read", Arguments: `{"file_path":"a.go"}`, CallID: "call_1"},
+			{Name: "Read", Arguments: `{"file_path":"b.go"}`, CallID: "call_2"},
+			{Name: "Read", Arguments: `{"file_path":"c.go"}`, CallID: "call_3"},
+		}},
+	}
+	d3ChildMessages := []SessionMessage{
+		{Role: "user", Content: nullableString("child with unrelated text")},
+		{Role: "assistant", ToolCalls: []SessionToolCall{
+			{Name: "Write", Arguments: `{"file_path":"x.go"}`, CallID: "call_1"},
+			{Name: "Write", Arguments: `{"file_path":"y.go"}`, CallID: "call_2"},
+			{Name: "Write", Arguments: `{"file_path":"z.go"}`, CallID: "call_3"},
+		}},
+	}
+
+	for i, candidate := range []sessionCandidate{
+		sessionCandidateForMessages(longMessages),
+		sessionCandidateForMessages(longMessages),
+		sessionCandidateForMessages(d2SubsequenceMessages),
+		sessionCandidateForMessages(d3ParentMessages),
+		sessionCandidateForMessages(d3ChildMessages),
+	} {
+		candidate.RecordIDs = []int{i + 1}
+		require.NoError(t, spool.appendCandidate(candidate))
+	}
+	require.NoError(t, spool.close())
+
+	summary := ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
+	keep, duplicateRemoved, subsequenceRemoved, err := dedupeSessionSpool(context.Background(), spool.metaPath, &summary)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, duplicateRemoved)
+	require.Equal(t, 2, subsequenceRemoved)
+	require.Len(t, keep, 2)
+	require.EqualValues(t, 1, summary.RejectedSessionsByReason["exact_duplicate"])
+	require.EqualValues(t, 1, summary.RejectedSessionsByReason["message_subsequence_duplicate"])
+	require.EqualValues(t, 1, summary.RejectedSessionsByReason["tool_id_subsequence_duplicate"])
+}
+
+func TestSessionBucketRebuildKeepsInterleavedSessionComplete(t *testing.T) {
+	dir := t.TempDir()
+	manager, err := newSessionBucketWriterManager(dir)
+	require.NoError(t, err)
+
+	requestBody := `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"read main.go"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_read","type":"function","function":{"name":"Read","arguments":"{\"file_path\":\"/repo/main.go\"}"}}]},
+			{"role":"tool","tool_call_id":"call_read","content":"package main"},
+			{"role":"user","content":"summarize it"}
+		],
+		"tools":[{"type":"function","function":{"name":"Read","description":"Reads a file.","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]
+	}`
+	responseBody := `{"choices":[{"message":{"role":"assistant","content":"It is a Go entrypoint."},"finish_reason":"stop"}],"usage":{"total_tokens":10}}`
+	for _, record := range []sessionBucketRecord{
+		{ID: 1, SessionID: "sess_interleaved", Provider: "openai", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 100, ResponseTime: 110},
+		{ID: 2, SessionID: "sess_other", Provider: "openai", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 120, ResponseTime: 130},
+		{ID: 3, SessionID: "sess_interleaved", Provider: "openai", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 1000000, ResponseTime: 1000010},
+	} {
+		require.NoError(t, manager.append(record))
+	}
+	require.NoError(t, manager.closeAll())
+
+	spool, err := newSessionExportSpool(dir)
+	require.NoError(t, err)
+	summary := ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
+	totalSessions, err := buildSessionSpoolFromBuckets(context.Background(), manager.sortedPaths(), spool, &summary, nil)
+	require.NoError(t, err)
+	require.NoError(t, spool.close())
+	require.EqualValues(t, 2, totalSessions)
+
+	metaFile, err := os.Open(spool.metaPath)
+	require.NoError(t, err)
+	defer metaFile.Close()
+	reader := bufio.NewReader(metaFile)
+	foundCompleteSession := false
+	for {
+		line, err := readJSONLLine(reader)
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		var meta sessionSpoolMeta
+		require.NoError(t, common.Unmarshal(line, &meta))
+		if len(meta.RecordIDs) == 2 && meta.RecordIDs[0] == 1 && meta.RecordIDs[1] == 3 {
+			foundCompleteSession = true
+		}
+	}
+	require.True(t, foundCompleteSession)
 }
