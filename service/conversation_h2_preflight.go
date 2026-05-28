@@ -132,12 +132,16 @@ func BuildConversationLogH2Preflight(ctx context.Context, query model.Conversati
 	}
 	acc := newH2PreflightAccumulator(mode)
 	if mode == conversation_log_setting.ExportModeAPIHijackJSONL {
-		err := model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
+		validQuery, ok := conversationExportValidQuery(query)
+		if !ok {
+			return acc.finalize(), nil
+		}
+		err := model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
 			if err := conversationContextErr(ctx); err != nil {
 				return err
 			}
 			for _, item := range logs {
-				if item.ValidationStatus != ConversationValidationValid || !ValidateAPIRecord(item).Exportable {
+				if !ValidateAPIRecord(item).Exportable {
 					continue
 				}
 				acc.report.CheckedRecords++
@@ -371,12 +375,16 @@ func forEachPreflightSessionCandidate(ctx context.Context, query model.Conversat
 	if err != nil {
 		return stats, err
 	}
-	err = model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
+	validQuery, ok := conversationExportValidQuery(query)
+	if !ok {
+		return stats, nil
+	}
+	err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
 		if err := conversationContextErr(ctx); err != nil {
 			return err
 		}
 		for _, item := range logs {
-			if item.ValidationStatus != ConversationValidationValid || !ValidateAPIRecord(item).Exportable || item.SessionId == "" {
+			if !ValidateAPIRecord(item).Exportable || item.SessionId == "" {
 				continue
 			}
 			record := sessionBucketRecord{

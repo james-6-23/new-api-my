@@ -423,7 +423,7 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	validRecords := make([]*model.ConversationLog, 0)
 	overflowed := false
 
-	err := model.ForEachConversationLog(ctx, query, 200, func(logs []*model.ConversationLog) error {
+	err := model.ForEachConversationLog(ctx, query, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
 			summary.TotalCapturedRecords++
 			validation := ValidateAPIRecord(item)
@@ -490,9 +490,13 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 
 	exportedIDs := make([]int, 0)
 	if mode == conversation_log_setting.ExportModeAPIHijackJSONL {
-		err = model.ForEachConversationLog(ctx, query, 200, func(logs []*model.ConversationLog) error {
+		validQuery, ok := conversationExportValidQuery(query)
+		if !ok {
+			return exportedIDs, summary, nil
+		}
+		err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
 			for _, item := range logs {
-				if item.ValidationStatus != ConversationValidationValid || !ValidateAPIRecord(item).Exportable {
+				if !ValidateAPIRecord(item).Exportable {
 					continue
 				}
 				record := StrictAPIRecord{
@@ -525,9 +529,13 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 	}
 
 	validRecords := make([]*model.ConversationLog, 0)
-	err = model.ForEachConversationLog(ctx, query, 200, func(logs []*model.ConversationLog) error {
+	validQuery, ok := conversationExportValidQuery(query)
+	if !ok {
+		return exportedIDs, summary, nil
+	}
+	err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
-			if item.ValidationStatus == ConversationValidationValid && ValidateAPIRecord(item).Exportable {
+			if ValidateAPIRecord(item).Exportable {
 				validRecords = append(validRecords, item)
 			}
 		}

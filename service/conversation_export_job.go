@@ -28,6 +28,10 @@ import (
 )
 
 const (
+	conversationExportScanBatchSize   = 500
+	conversationExportMarkBatchSize   = 500
+	conversationExportDeleteBatchSize = 500
+
 	sessionBucketCount   = 4096
 	sessionBucketMaxOpen = 128
 
@@ -572,6 +576,14 @@ func updateJobProgress(jobID string, fields map[string]interface{}) {
 	}
 }
 
+func conversationExportValidQuery(query model.ConversationLogQuery) (model.ConversationLogQuery, bool) {
+	if query.ValidationStatus != "" && query.ValidationStatus != ConversationValidationValid {
+		return query, false
+	}
+	query.ValidationStatus = ConversationValidationValid
+	return query, true
+}
+
 // executeExportJob is the actual work: scan, shard, write tar.gz, manifest.
 func executeExportJob(ctx context.Context, job *model.ConversationExportJob) error {
 	var query model.ConversationLogQuery
@@ -729,7 +741,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		updateJobProgress(job.JobId, map[string]interface{}{
 			"progress": "deleting processed source records",
 		})
-		deleted, err := model.DeleteConversationLogsByExportBatchID(ctx, job.JobId, 200)
+		deleted, err := model.DeleteConversationLogsByExportBatchID(ctx, job.JobId, conversationExportDeleteBatchSize)
 		if err != nil {
 			return fmt.Errorf("delete exported conversation logs after manifest: %w", err)
 		}
@@ -1287,7 +1299,7 @@ func (s *shardWriterState) markClosedShardRecordsExported(ctx context.Context) e
 				return err
 			}
 		}
-		if err := markConversationLogIDsFromFile(path, s.jobID, exportedAt, 200); err != nil {
+		if err := markConversationLogIDsFromFile(path, s.jobID, exportedAt, conversationExportMarkBatchSize); err != nil {
 			return fmt.Errorf("mark exported records for shard %d: %w", i+1, err)
 		}
 		_ = os.Remove(path)
@@ -1348,7 +1360,7 @@ func (s *shardWriterState) markProcessedSourceRecordsExported(ctx context.Contex
 			return err
 		}
 	}
-	if err := markConversationLogIDsFromFile(s.processedIDsPath, s.jobID, common.GetTimestamp(), 200); err != nil {
+	if err := markConversationLogIDsFromFile(s.processedIDsPath, s.jobID, common.GetTimestamp(), conversationExportMarkBatchSize); err != nil {
 		return err
 	}
 	_ = os.Remove(s.processedIDsPath)
@@ -1464,12 +1476,16 @@ func streamShardTarGz(tarPath, shardName string, dataFiles []shardDataFilePayloa
 }
 
 func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuery, state *shardWriterState) error {
-	return model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
+	validQuery, ok := conversationExportValidQuery(query)
+	if !ok {
+		return nil
+	}
+	return model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		for _, item := range logs {
-			if item.ValidationStatus != ConversationValidationValid || !ValidateAPIRecord(item).Exportable {
+			if !ValidateAPIRecord(item).Exportable {
 				continue
 			}
 			rec := StrictAPIRecord{
@@ -2075,13 +2091,17 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 	}
 	defer manager.closeAll()
 
+	validQuery, ok := conversationExportValidQuery(query)
+	if !ok {
+		return nil, 0, nil
+	}
 	var eligible int64
-	err = model.ForEachConversationLog(ctx, query, 50, func(logs []*model.ConversationLog) error {
+	err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		for _, item := range logs {
-			if item.ValidationStatus != ConversationValidationValid || !ValidateAPIRecord(item).Exportable {
+			if !ValidateAPIRecord(item).Exportable {
 				continue
 			}
 			if item.SessionId == "" {
@@ -2468,7 +2488,7 @@ func DeleteExportJobArtifacts(job *model.ConversationExportJob) error {
 
 func markConversationLogIDsFromFile(path, batchID string, exportedAt int64, batchSize int) error {
 	if batchSize <= 0 {
-		batchSize = 100
+		batchSize = conversationExportMarkBatchSize
 	}
 	file, err := os.Open(path)
 	if err != nil {

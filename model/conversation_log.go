@@ -20,7 +20,7 @@ import (
 )
 
 type ConversationLog struct {
-	Id                      int    `json:"id" gorm:"index:idx_conversation_logs_created_id,priority:2;index:idx_conversation_logs_validation_created_id,priority:3;index:idx_conversation_logs_exported_created_id,priority:3;index:idx_conversation_logs_session_created_id,priority:3"`
+	Id                      int    `json:"id" gorm:"index:idx_conversation_logs_created_id,priority:2;index:idx_conversation_logs_validation_created_id,priority:3;index:idx_conversation_logs_exported_created_id,priority:3;index:idx_conversation_logs_session_created_id,priority:3;index:idx_conversation_logs_validation_id,priority:2;index:idx_conversation_logs_export_batch_id_id,priority:2"`
 	CreatedAt               int64  `json:"created_at" gorm:"bigint;index:idx_conversation_logs_created_id,priority:1;index:idx_conversation_logs_validation_created_id,priority:2;index:idx_conversation_logs_exported_created_id,priority:2;index:idx_conversation_logs_session_created_id,priority:2"`
 	RequestId               string `json:"request_id" gorm:"type:varchar(64);index;default:''"`
 	UserId                  int    `json:"user_id" gorm:"index"`
@@ -50,11 +50,11 @@ type ConversationLog struct {
 	IsStream                bool   `json:"is_stream" gorm:"index"`
 	StatusCode              int    `json:"status_code" gorm:"default:200"`
 	UsageJSON               string `json:"usage_json,omitempty" gorm:"type:text"`
-	ValidationStatus        string `json:"validation_status" gorm:"type:varchar(32);index;index:idx_conversation_logs_validation_created_id,priority:1;index:idx_conversation_logs_validation_session,priority:1;default:''"`
+	ValidationStatus        string `json:"validation_status" gorm:"type:varchar(32);index;index:idx_conversation_logs_validation_created_id,priority:1;index:idx_conversation_logs_validation_session,priority:1;index:idx_conversation_logs_validation_id,priority:1;default:''"`
 	InvalidReason           string `json:"invalid_reason,omitempty" gorm:"type:text"`
 	StorageBytes            int64  `json:"storage_bytes" gorm:"bigint;index"`
 	ExportedAt              int64  `json:"exported_at" gorm:"bigint;index;index:idx_conversation_logs_exported_created_id,priority:1;default:0"`
-	ExportBatchId           string `json:"export_batch_id" gorm:"type:varchar(64);index;default:''"`
+	ExportBatchId           string `json:"export_batch_id" gorm:"type:varchar(64);index;index:idx_conversation_logs_export_batch_id_id,priority:1;default:''"`
 	DeletedAfterExport      bool   `json:"deleted_after_export" gorm:"default:false"`
 }
 
@@ -597,7 +597,7 @@ func DeleteConversationLogsByExportBatchID(ctx context.Context, batchID string, 
 		return 0, nil
 	}
 	if batchSize <= 0 {
-		batchSize = 100
+		batchSize = 500
 	}
 	var total int64
 	for {
