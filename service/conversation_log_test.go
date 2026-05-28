@@ -153,6 +153,36 @@ func TestBuildSessionCandidatePassesQualityGate(t *testing.T) {
 	require.NotEmpty(t, candidate.Trajectory.Meta)
 }
 
+func TestBuildSessionCandidateNormalizesExportJSONShape(t *testing.T) {
+	requestBody := `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"read main.go"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_read","type":"function","function":{"name":"Read","arguments":"{  \"file_path\" : \"/repo/main.go\", \"limit\" : 10 }"}}]},
+			{"role":"tool","tool_call_id":"call_read","content":"package main"},
+			{"role":"user","content":"summarize it"}
+		],
+		"tools":[{"type":"function","function":{"name":"Read","description":"Reads a file.","parameters":"{  \"type\" : \"object\", \"properties\" : { \"file_path\" : { \"type\" : \"string\" } }, \"required\" : [ \"file_path\" ] }"}}]
+	}`
+	responseBody := `{"choices":[{"message":{"role":"assistant","content":"It is a Go entrypoint."},"finish_reason":"stop"}],"usage":{"total_tokens":10}}`
+
+	candidate := buildSessionCandidate("sess_format", []*model.ConversationLog{
+		validConversationLog(1, "sess_format", "openai", requestBody, responseBody),
+	})
+
+	require.Empty(t, candidate.Reasons)
+	require.Equal(t, `{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}`, candidate.Trajectory.Tools[0].Parameters)
+	require.Nil(t, candidate.Trajectory.Messages[0].ToolCalls)
+	require.Equal(t, `{"file_path":"/repo/main.go","limit":10}`, candidate.Trajectory.Messages[1].ToolCalls[0].Arguments)
+	require.Nil(t, candidate.Trajectory.Messages[len(candidate.Trajectory.Messages)-1].ToolCalls)
+
+	data, err := common.Marshal(candidate.Trajectory)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), `"tool_calls":[]`)
+	require.Contains(t, string(data), `"tool_calls":null`)
+	require.Contains(t, string(data), `\"file_path\":\"/repo/main.go\",\"limit\":10`)
+}
+
 func TestBuildSessionCandidatePrefersCallIDForOpenAIToolCalls(t *testing.T) {
 	requestBody := `{
 		"model":"gpt-5",

@@ -22,6 +22,14 @@ func Marshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
+func CompactJSON(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, data); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func GetJsonType(data json.RawMessage) string {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {

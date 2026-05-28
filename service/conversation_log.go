@@ -1026,11 +1026,13 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 		messages = append(messages, extractRequestMessages(request, record.Provider, &systemPrompt)...)
 		messages = append(messages, extractResponseMessages(response, record.Provider)...)
 	}
+	messages = normalizeSessionMessagesForExport(messages)
 	messages = dedupeAdjacentMessages(messages)
 	tools := make([]SessionTool, 0, len(toolsByName))
 	for _, name := range sortedStringKeys(toolsByName) {
 		tools = append(tools, toolsByName[name])
 	}
+	tools = normalizeSessionToolsForExport(tools)
 	meta := mustJSONString(map[string]interface{}{
 		"original_session_id": sessionID,
 		"provider":            provider,
@@ -1241,7 +1243,7 @@ func extractOpenAITools(request map[string]interface{}) []SessionTool {
 		tools = append(tools, SessionTool{
 			Name:        name,
 			Description: asString(fn["description"]),
-			Parameters:  mustJSONString(fn["parameters"]),
+			Parameters:  jsonStringValue(fn["parameters"]),
 		})
 	}
 	return tools
@@ -1261,7 +1263,7 @@ func extractClaudeTools(request map[string]interface{}) []SessionTool {
 		tools = append(tools, SessionTool{
 			Name:        name,
 			Description: asString(tool["description"]),
-			Parameters:  mustJSONString(tool["input_schema"]),
+			Parameters:  jsonStringValue(tool["input_schema"]),
 		})
 	}
 	return tools
@@ -1277,7 +1279,7 @@ func extractGeminiTools(request map[string]interface{}) []SessionTool {
 		tools = append(tools, SessionTool{
 			Name:        name,
 			Description: asString(decl["description"]),
-			Parameters:  mustJSONString(decl["parameters"]),
+			Parameters:  jsonStringValue(decl["parameters"]),
 		})
 	}
 	return tools
@@ -1384,7 +1386,7 @@ func extractClaudeRequestMessages(request map[string]interface{}) []SessionMessa
 			case "tool_use":
 				toolCalls = append(toolCalls, SessionToolCall{
 					Name:      asString(part["name"]),
-					Arguments: mustJSONString(part["input"]),
+					Arguments: jsonStringValue(part["input"]),
 					CallID:    conversationToolCallID(part),
 				})
 			case "tool_result":
@@ -1430,7 +1432,7 @@ func extractGeminiRequestMessages(request map[string]interface{}) []SessionMessa
 			}
 			if call, ok := asMap(part["functionCall"]); ok {
 				name := asString(call["name"])
-				toolCalls = append(toolCalls, SessionToolCall{Name: name, Arguments: mustJSONString(call["args"]), CallID: firstNonEmpty(asString(call["id"]), name)})
+				toolCalls = append(toolCalls, SessionToolCall{Name: name, Arguments: jsonStringValue(call["args"]), CallID: firstNonEmpty(asString(call["id"]), name)})
 			}
 			if response, ok := asMap(part["functionResponse"]); ok {
 				toolID := asString(response["id"])
@@ -1507,7 +1509,7 @@ func extractResponsesOutputMessages(response map[string]interface{}) []SessionMe
 				Role: "assistant",
 				ToolCalls: []SessionToolCall{{
 					Name:      asString(item["name"]),
-					Arguments: asString(item["arguments"]),
+					Arguments: jsonStringValue(item["arguments"]),
 					CallID:    conversationToolCallID(item),
 				}},
 			})
@@ -1535,7 +1537,7 @@ func extractClaudeResponseMessages(response map[string]interface{}) []SessionMes
 		case "thinking":
 			thinkingParts = append(thinkingParts, asString(part["thinking"]))
 		case "tool_use":
-			toolCalls = append(toolCalls, SessionToolCall{Name: asString(part["name"]), Arguments: mustJSONString(part["input"]), CallID: conversationToolCallID(part)})
+			toolCalls = append(toolCalls, SessionToolCall{Name: asString(part["name"]), Arguments: jsonStringValue(part["input"]), CallID: conversationToolCallID(part)})
 		}
 	}
 	if len(textParts) == 0 && len(thinkingParts) == 0 && len(toolCalls) == 0 {
@@ -1569,7 +1571,7 @@ func extractGeminiResponseMessages(response map[string]interface{}) []SessionMes
 			}
 			if call, ok := asMap(part["functionCall"]); ok {
 				name := asString(call["name"])
-				toolCalls = append(toolCalls, SessionToolCall{Name: name, Arguments: mustJSONString(call["args"]), CallID: firstNonEmpty(asString(call["id"]), name)})
+				toolCalls = append(toolCalls, SessionToolCall{Name: name, Arguments: jsonStringValue(call["args"]), CallID: firstNonEmpty(asString(call["id"]), name)})
 			}
 		}
 		if len(textParts) > 0 || len(toolCalls) > 0 {
@@ -1587,7 +1589,7 @@ func openAIToolCall(value interface{}) SessionToolCall {
 	fn, _ := asMap(call["function"])
 	return SessionToolCall{
 		Name:      asString(fn["name"]),
-		Arguments: asString(fn["arguments"]),
+		Arguments: jsonStringValue(fn["arguments"]),
 		CallID:    conversationToolCallID(call),
 	}
 }
@@ -1798,6 +1800,60 @@ func mustJSONString(value interface{}) string {
 		return ""
 	}
 	return string(data)
+}
+
+func jsonStringValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return compactJSONString(text)
+	}
+	return mustJSONString(value)
+}
+
+func compactJSONString(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
+	}
+	data, err := common.CompactJSON([]byte(trimmed))
+	if err != nil {
+		return value
+	}
+	return string(data)
+}
+
+func normalizeSessionToolsForExport(tools []SessionTool) []SessionTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]SessionTool, len(tools))
+	for i, tool := range tools {
+		out[i] = tool
+		out[i].Parameters = compactJSONString(tool.Parameters)
+	}
+	return out
+}
+
+func normalizeSessionMessagesForExport(messages []SessionMessage) []SessionMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	out := make([]SessionMessage, len(messages))
+	for i, msg := range messages {
+		out[i] = msg
+		if len(msg.ToolCalls) == 0 {
+			out[i].ToolCalls = nil
+			continue
+		}
+		out[i].ToolCalls = make([]SessionToolCall, len(msg.ToolCalls))
+		for j, call := range msg.ToolCalls {
+			out[i].ToolCalls[j] = call
+			out[i].ToolCalls[j].Arguments = compactJSONString(call.Arguments)
+		}
+	}
+	return out
 }
 
 func shortHash(value string) string {
