@@ -217,6 +217,7 @@ func SetApiRouter(router *gin.Engine) {
 			conversationLogRoute.GET("/export.jsonl", controller.ExportConversationLogs)
 			conversationLogRoute.POST("/export_and_delete", controller.ExportAndDeleteConversationLogs)
 			conversationLogRoute.PUT("/settings", controller.UpdateConversationLogSettings)
+			conversationLogRoute.POST("/s3/test", controller.TestConversationLogS3Connection)
 			conversationLogRoute.GET("/export_jobs/bounds", controller.ExportJobShardBounds)
 			conversationLogRoute.GET("/export_jobs", controller.ListExportJobs)
 			conversationLogRoute.POST("/export_jobs", controller.CreateExportJob)

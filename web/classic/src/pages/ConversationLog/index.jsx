@@ -37,6 +37,7 @@ import {
   IconCopy,
   IconDelete,
   IconDownload,
+  IconLink,
   IconRefresh,
   IconSave,
   IconSearch,
@@ -207,6 +208,7 @@ const ConversationLog = () => {
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [tableLoading, setTableLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [s3Testing, setS3Testing] = useState(false);
   const [exportLoading, setExportLoading] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [mode, setMode] = useState('session_jsonl');
@@ -350,6 +352,37 @@ const ConversationLog = () => {
       showError(error.message || t('保存失败，请重试'));
     } finally {
       setSettingsSaving(false);
+    }
+  };
+
+  const testS3Connection = async () => {
+    const formValues = settingsFormRef.current?.getValues?.() || {};
+    const s3 = {
+      ...settings.s3,
+      ...(formValues.s3 || {}),
+    };
+    if (!s3.enabled) {
+      showWarning(t('请先启用 S3 上传'));
+      return;
+    }
+    setS3Testing(true);
+    try {
+      const res = await API.post('/api/conversation_logs/s3/test', s3);
+      const { success, message, data } = res.data;
+      if (!success) {
+        showError(message);
+        return;
+      }
+      showSuccess(t('S3 连接测试成功'));
+      if (data?.cleanup_error) {
+        showWarning(
+          `${t('测试对象清理失败')}: ${data.cleanup_error}`,
+        );
+      }
+    } catch (error) {
+      showError(error.message || t('S3 连接测试失败'));
+    } finally {
+      setS3Testing(false);
     }
   };
 
@@ -1463,13 +1496,24 @@ const ConversationLog = () => {
                   </Row>
 
                   <div
-                    className='text-sm font-semibold mt-6 mb-3 border-t pt-4'
+                    className='flex flex-col md:flex-row md:items-center md:justify-between gap-2 mt-6 mb-3 border-t pt-4'
                     style={{
                       borderColor: 'var(--semi-color-border)',
                       color: 'var(--semi-color-text-0)',
                     }}
                   >
-                    {t('S3 备份存储设置')}
+                    <span className='text-sm font-semibold'>
+                      {t('S3 备份存储设置')}
+                    </span>
+                    <Button
+                      size='small'
+                      icon={<IconLink />}
+                      loading={s3Testing}
+                      disabled={!settings.s3?.enabled}
+                      onClick={testS3Connection}
+                    >
+                      {t('测试连接')}
+                    </Button>
                   </div>
                   <Row gutter={16}>
                     <Col xs={24} sm={12} lg={8}>

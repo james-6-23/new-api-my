@@ -50,6 +50,16 @@ type s3UploadResult struct {
 	FileSize      int64
 }
 
+type ConversationS3ConnectionTestResult struct {
+	Endpoint        string `json:"endpoint"`
+	Region          string `json:"region"`
+	Bucket          string `json:"bucket"`
+	ObjectKey       string `json:"object_key"`
+	AddressingStyle string `json:"addressing_style"`
+	ETag            string `json:"etag,omitempty"`
+	CleanupError    string `json:"cleanup_error,omitempty"`
+}
+
 type s3UploadProgress func(uploadedBytes, totalBytes int64, partNumber, totalParts int)
 
 type s3InitiateMultipartUploadResult struct {
@@ -127,6 +137,67 @@ func validateConversationS3Setting(setting conversation_log_setting.S3Setting) e
 		return fmt.Errorf("s3 secret_key is empty")
 	}
 	return nil
+}
+
+func TestConversationS3Connection(ctx context.Context, setting conversation_log_setting.S3Setting) (ConversationS3ConnectionTestResult, error) {
+	setting = normalizeConversationS3Setting(setting)
+	result := ConversationS3ConnectionTestResult{
+		Endpoint: setting.Endpoint,
+		Region:   setting.Region,
+		Bucket:   setting.Bucket,
+	}
+	if err := validateConversationS3Setting(setting); err != nil {
+		return result, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	endpointURL, err := normalizeS3Endpoint(setting.Endpoint)
+	if err != nil {
+		return result, err
+	}
+	objectKey := buildS3ObjectKey(setting.Prefix, "connection-test", fmt.Sprintf("new-api-s3-test-%d.txt", time.Now().UnixNano()))
+	result.ObjectKey = objectKey
+	payload := []byte("new-api conversation log s3 connection test\n")
+	payloadHash := sha256HexString(string(payload))
+	client := newConversationS3HTTPClient()
+
+	var lastErr error
+	for _, pathStyle := range s3UploadAddressingStyles(setting) {
+		etag, cleanupErr, err := testS3ConnectionWithStyle(ctx, client, setting, endpointURL, objectKey, payload, payloadHash, pathStyle)
+		if err == nil {
+			result.AddressingStyle = s3AddressingStyleName(pathStyle)
+			result.ETag = strings.Trim(etag, `"`)
+			if cleanupErr != nil {
+				result.CleanupError = redactS3UploadError(cleanupErr.Error(), setting)
+			}
+			return result, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return result, fmt.Errorf("test S3 connection: %s", redactS3UploadError(lastErr.Error(), setting))
+	}
+	return result, fmt.Errorf("test S3 connection failed")
+}
+
+func testS3ConnectionWithStyle(ctx context.Context, client *http.Client, setting conversation_log_setting.S3Setting, endpointURL *url.URL, objectKey string, payload []byte, payloadHash string, pathStyle bool) (string, error, error) {
+	etag, err := putS3ObjectBytes(ctx, client, setting, endpointURL, objectKey, payload, payloadHash, pathStyle)
+	if err != nil {
+		return "", nil, err
+	}
+	cleanupErr := deleteS3Object(ctx, client, setting, endpointURL, objectKey, pathStyle)
+	return etag, cleanupErr, nil
+}
+
+func s3AddressingStyleName(pathStyle bool) string {
+	if pathStyle {
+		return "path"
+	}
+	return "virtual_hosted"
 }
 
 func normalizeConversationS3Setting(setting conversation_log_setting.S3Setting) conversation_log_setting.S3Setting {
@@ -482,6 +553,26 @@ func putS3Object(ctx context.Context, client *http.Client, setting conversation_
 	}
 	defer resp.Body.Close()
 	return strings.Trim(resp.Header.Get("ETag"), `"`), nil
+}
+
+func putS3ObjectBytes(ctx context.Context, client *http.Client, setting conversation_log_setting.S3Setting, endpointURL *url.URL, objectKey string, payload []byte, payloadHash string, pathStyle bool) (string, error) {
+	reqURL := buildS3ObjectURL(endpointURL, setting.Bucket, objectKey, pathStyle)
+	resp, err := sendS3Request(ctx, client, http.MethodPut, reqURL, bytes.NewReader(payload), int64(len(payload)), payloadHash, setting)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	return strings.Trim(resp.Header.Get("ETag"), `"`), nil
+}
+
+func deleteS3Object(ctx context.Context, client *http.Client, setting conversation_log_setting.S3Setting, endpointURL *url.URL, objectKey string, pathStyle bool) error {
+	reqURL := buildS3ObjectURL(endpointURL, setting.Bucket, objectKey, pathStyle)
+	resp, err := sendS3Request(ctx, client, http.MethodDelete, reqURL, http.NoBody, 0, s3EmptyPayloadHash, setting)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
 }
 
 func sendS3Request(ctx context.Context, client *http.Client, method string, reqURL *url.URL, body io.Reader, contentLength int64, payloadHash string, setting conversation_log_setting.S3Setting) (*http.Response, error) {

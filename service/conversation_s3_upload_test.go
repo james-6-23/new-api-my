@@ -125,3 +125,46 @@ func TestUploadS3ObjectFromFileUsesMultipartAboveThreshold(t *testing.T) {
 	require.Len(t, result.ContentSHA256, 64)
 	require.Equal(t, 1, progressCalls)
 }
+
+func TestConversationS3ConnectionWritesAndDeletesProbeObject(t *testing.T) {
+	var putPath string
+	var deletePath string
+	var putBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NotEmpty(t, r.Header.Get("Authorization"))
+		switch r.Method {
+		case http.MethodPut:
+			putPath = r.URL.Path
+			body, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			putBody = string(body)
+			w.Header().Set("ETag", `"probe-etag"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			deletePath = r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected S3 request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	result, err := TestConversationS3Connection(context.Background(), conversation_log_setting.S3Setting{
+		Enabled:   true,
+		Endpoint:  server.URL,
+		Region:    "ap-southeast-1",
+		Bucket:    "temporary-3",
+		AccessKey: "ak",
+		SecretKey: "sk",
+		Prefix:    "prefix",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "path", result.AddressingStyle)
+	require.Equal(t, "probe-etag", result.ETag)
+	require.Contains(t, result.ObjectKey, "prefix/connection-test/new-api-s3-test-")
+	require.Equal(t, "/temporary-3/"+result.ObjectKey, putPath)
+	require.Equal(t, putPath, deletePath)
+	require.Contains(t, putBody, "connection test")
+	require.Empty(t, result.CleanupError)
+}
