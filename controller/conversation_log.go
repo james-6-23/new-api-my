@@ -55,6 +55,26 @@ func GetConversationLogExportSummary(c *gin.Context) {
 	common.ApiSuccess(c, exportSummary)
 }
 
+func GetConversationLogH2Preflight(c *gin.Context) {
+	mode := conversationLogMode(c.Query("mode"))
+	report, err := service.BuildConversationLogH2Preflight(c.Request.Context(), parseConversationLogQuery(c), mode)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, report)
+}
+
+func GetConversationLogQualityPreflight(c *gin.Context) {
+	mode := conversationLogMode(c.Query("mode"))
+	report, err := service.BuildConversationLogQualityPreflight(c.Request.Context(), parseConversationLogQuery(c), mode)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, report)
+}
+
 func GetConversationLogs(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	query := parseConversationLogQuery(c)

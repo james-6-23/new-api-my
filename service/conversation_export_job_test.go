@@ -11,22 +11,104 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 
 	"github.com/stretchr/testify/require"
 )
 
 func TestStreamShardTarGzIncludesPathManifest(t *testing.T) {
 	dir := t.TempDir()
-	jsonlPath := filepath.Join(dir, "data.jsonl")
+	jsonlPath := filepath.Join(dir, "responses-data-1.jsonl")
 	data := []byte("{\"session_id\":\"sess_1\"}\n")
 	require.NoError(t, os.WriteFile(jsonlPath, data, 0o644))
 
+	dataFile := ShardDataFile{
+		Path:              "shard-0001/responses-data-1.jsonl",
+		Kind:              conversationDataKindResponses,
+		RecordCount:       1,
+		SourceRecordCount: 1,
+		SessionCount:      0,
+		UncompressedBytes: int64(len(data)),
+		SHA256:            "test-sha",
+	}
 	shardManifest := []byte(`{"record_count":1}`)
-	pathManifest, err := common.Marshal(buildShardPathManifest("shard-0001"))
+	pathManifest, err := common.Marshal(buildShardPathManifest("shard-0001", []ShardDataFile{dataFile}))
 	require.NoError(t, err)
 
 	tarPath := filepath.Join(dir, "shard.tar.gz")
-	require.NoError(t, streamShardTarGz(tarPath, "shard-0001", jsonlPath, int64(len(data)), shardManifest, pathManifest))
+	require.NoError(t, streamShardTarGz(tarPath, "shard-0001", []shardDataFilePayload{{
+		ShardDataFile: dataFile,
+		SourcePath:    jsonlPath,
+	}}, shardManifest, pathManifest))
+
+	entries := readTarGzEntries(t, tarPath)
+
+	require.Equal(t, data, entries["shard-0001/responses-data-1.jsonl"])
+	require.JSONEq(t, string(shardManifest), string(entries["shard-0001/shard-manifest.json"]))
+	require.Contains(t, string(entries["shard-0001/path-manifest.json"]), `"path":"shard-0001/responses-data-1.jsonl"`)
+
+	var parsed ShardPathManifest
+	require.NoError(t, common.Unmarshal(entries["shard-0001/path-manifest.json"], &parsed))
+	require.Equal(t, "tar.gz", parsed.PackageFormat)
+	require.Equal(t, "jsonl", parsed.DataFormat)
+	require.Equal(t, "UTF-8", parsed.Encoding)
+}
+
+func TestShardWriterStateSplitsDataFilesByKind(t *testing.T) {
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "out")
+	tmpDir := filepath.Join(dir, "tmp")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+	state := &shardWriterState{
+		mode:             "session_jsonl",
+		outputDir:        outputDir,
+		tmpDir:           tmpDir,
+		createdAt:        1710000000,
+		shardTargetBytes: 1 << 20,
+		shardMaxBytes:    1 << 20,
+	}
+	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"resp"}`), []int{1, 2}, 1, 100, 110, conversationDataKindResponses))
+	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"msg"}`), []int{3}, 1, 120, 130, conversationDataKindMessages))
+	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"chat"}`), []int{4}, 1, 140, 150, conversationDataKindCompletions))
+	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"mixed"}`), []int{5}, 1, 160, 170, "unknown"))
+	require.NoError(t, state.closeCurrentShard())
+
+	require.Len(t, state.shards, 1)
+	entries := readTarGzEntries(t, filepath.Join(outputDir, state.shards[0].File))
+	require.Equal(t, []byte("{\"trajectory_id\":\"resp\"}\n"), entries["shard-0001/responses-data-1.jsonl"])
+	require.Equal(t, []byte("{\"trajectory_id\":\"msg\"}\n"), entries["shard-0001/messages-data-1.jsonl"])
+	require.Equal(t, []byte("{\"trajectory_id\":\"chat\"}\n"), entries["shard-0001/completions-data-1.jsonl"])
+	require.Equal(t, []byte("{\"trajectory_id\":\"mixed\"}\n"), entries["shard-0001/mixed-data-1.jsonl"])
+
+	var manifest ShardManifest
+	require.NoError(t, common.Unmarshal(entries["shard-0001/shard-manifest.json"], &manifest))
+	require.EqualValues(t, 5, manifest.RecordCount)
+	require.EqualValues(t, 4, manifest.SessionCount)
+	require.Len(t, manifest.DataFiles, 4)
+	require.Equal(t, "shard-0001/responses-data-1.jsonl", manifest.DataFiles[0].Path)
+	require.Equal(t, "shard-0001/messages-data-1.jsonl", manifest.DataFiles[1].Path)
+	require.Equal(t, "shard-0001/completions-data-1.jsonl", manifest.DataFiles[2].Path)
+	require.Equal(t, "shard-0001/mixed-data-1.jsonl", manifest.DataFiles[3].Path)
+}
+
+func TestConversationDataKindForRecordsPreservesSessionIntegrity(t *testing.T) {
+	require.Equal(t, conversationDataKindResponses, conversationDataKindForRecords([]*model.ConversationLog{
+		{RequestPath: "/v1/responses"},
+		{RequestPath: "/v1/responses?stream=true"},
+	}))
+	require.Equal(t, conversationDataKindMixed, conversationDataKindForRecords([]*model.ConversationLog{
+		{RequestPath: "/v1/responses"},
+		{RequestPath: "/v1/messages"},
+	}))
+	require.Equal(t, conversationDataKindMixed, conversationDataKindForRecords([]*model.ConversationLog{
+		{RequestPath: "/v1/unknown"},
+	}))
+}
+
+func readTarGzEntries(t *testing.T, tarPath string) map[string][]byte {
+	t.Helper()
 
 	file, err := os.Open(tarPath)
 	require.NoError(t, err)
@@ -48,16 +130,7 @@ func TestStreamShardTarGzIncludesPathManifest(t *testing.T) {
 		require.NoError(t, err)
 		entries[header.Name] = body
 	}
-
-	require.Equal(t, data, entries["shard-0001/data.jsonl"])
-	require.JSONEq(t, string(shardManifest), string(entries["shard-0001/shard-manifest.json"]))
-	require.Contains(t, string(entries["shard-0001/path-manifest.json"]), `"path":"shard-0001/data.jsonl"`)
-
-	var parsed ShardPathManifest
-	require.NoError(t, common.Unmarshal(entries["shard-0001/path-manifest.json"], &parsed))
-	require.Equal(t, "tar.gz", parsed.PackageFormat)
-	require.Equal(t, "jsonl", parsed.DataFormat)
-	require.Equal(t, "UTF-8", parsed.Encoding)
+	return entries
 }
 
 func TestBuildExportJobOutputDirNameUsesModeTimestampAndShortID(t *testing.T) {

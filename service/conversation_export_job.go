@@ -44,20 +44,39 @@ const (
 	sessionD3MinSequenceLen = 3
 )
 
-// ShardManifest is the per-shard manifest packed inside each tar.gz next to data.jsonl.
+const (
+	conversationDataKindResponses   = "responses"
+	conversationDataKindMessages    = "messages"
+	conversationDataKindCompletions = "completions"
+	conversationDataKindMixed       = "mixed"
+)
+
+// ShardManifest is the per-shard manifest packed inside each tar.gz next to the data JSONL files.
 type ShardManifest struct {
-	JobID             string `json:"job_id"`
-	ShardIndex        int    `json:"shard_index"`
-	Mode              string `json:"mode"`
-	SchemaVersion     string `json:"schema_version"`
+	JobID             string          `json:"job_id"`
+	ShardIndex        int             `json:"shard_index"`
+	Mode              string          `json:"mode"`
+	SchemaVersion     string          `json:"schema_version"`
+	RecordCount       int64           `json:"record_count"`
+	SessionCount      int64           `json:"session_count"`
+	UncompressedBytes int64           `json:"uncompressed_bytes"`
+	SHA256DataJSONL   string          `json:"sha256_of_data_jsonl,omitempty"`
+	SHA256DataFiles   string          `json:"sha256_of_data_files"`
+	DataFiles         []ShardDataFile `json:"data_files"`
+	RequestTimeMin    int64           `json:"request_time_min"`
+	RequestTimeMax    int64           `json:"request_time_max"`
+	FirstRecordID     int             `json:"first_record_id"`
+	LastRecordID      int             `json:"last_record_id"`
+}
+
+type ShardDataFile struct {
+	Path              string `json:"path"`
+	Kind              string `json:"kind"`
 	RecordCount       int64  `json:"record_count"`
+	SourceRecordCount int64  `json:"source_record_count"`
 	SessionCount      int64  `json:"session_count"`
 	UncompressedBytes int64  `json:"uncompressed_bytes"`
-	SHA256DataJSONL   string `json:"sha256_of_data_jsonl"`
-	RequestTimeMin    int64  `json:"request_time_min"`
-	RequestTimeMax    int64  `json:"request_time_max"`
-	FirstRecordID     int    `json:"first_record_id"`
-	LastRecordID      int    `json:"last_record_id"`
+	SHA256            string `json:"sha256"`
 }
 
 // ShardPathManifest documents the internal paths of each delivery tar.gz.
@@ -80,17 +99,18 @@ type ShardPathManifestEntry struct {
 }
 
 type TopManifestShard struct {
-	Index             int    `json:"index"`
-	File              string `json:"file"`
-	SHA256            string `json:"sha256"`
-	UncompressedBytes int64  `json:"uncompressed_bytes"`
-	CompressedBytes   int64  `json:"compressed_bytes"`
-	RecordCount       int64  `json:"record_count"`
-	SessionCount      int64  `json:"session_count"`
-	FirstRecordID     int    `json:"first_record_id"`
-	LastRecordID      int    `json:"last_record_id"`
-	RequestTimeMin    int64  `json:"request_time_min"`
-	RequestTimeMax    int64  `json:"request_time_max"`
+	Index             int             `json:"index"`
+	File              string          `json:"file"`
+	SHA256            string          `json:"sha256"`
+	UncompressedBytes int64           `json:"uncompressed_bytes"`
+	CompressedBytes   int64           `json:"compressed_bytes"`
+	RecordCount       int64           `json:"record_count"`
+	SessionCount      int64           `json:"session_count"`
+	DataFiles         []ShardDataFile `json:"data_files"`
+	FirstRecordID     int             `json:"first_record_id"`
+	LastRecordID      int             `json:"last_record_id"`
+	RequestTimeMin    int64           `json:"request_time_min"`
+	RequestTimeMax    int64           `json:"request_time_max"`
 }
 
 type TopManifestTotals struct {
@@ -292,6 +312,9 @@ func finishJob(jobID, status, errMessage string) {
 }
 
 func updateJobProgress(jobID string, fields map[string]interface{}) {
+	if strings.TrimSpace(jobID) == "" {
+		return
+	}
 	fields["updated_at"] = common.GetTimestamp()
 	if err := model.UpdateConversationExportJobFields(jobID, fields); err != nil {
 		common.SysError("update job progress: " + err.Error())
@@ -361,8 +384,8 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		SchemaVersion:    "1",
 		Mode:             job.Mode,
 		PackageFormat:    "tar.gz",
-		DataFilePath:     "shard-000N/data.jsonl",
-		PathDescription:  "Each shard tar.gz contains data.jsonl, shard-manifest.json, and path-manifest.json under a shard-000N directory.",
+		DataFilePath:     "shard-000N/{responses|messages|completions|mixed}-data-{record_count}.jsonl",
+		PathDescription:  "Each shard tar.gz contains one or more category data JSONL files plus shard-manifest.json and path-manifest.json under a shard-000N directory.",
 		CreatedAt:        job.CreatedAt,
 		FinishedAt:       common.GetTimestamp(),
 		ShardTargetBytes: job.ShardTargetBytes,
@@ -464,22 +487,19 @@ type shardWriterState struct {
 	totalEligible int64
 
 	// Current shard accumulator (streaming).
-	currentIndex      int
-	currentJSONLPath  string
-	currentJSONLFile  *os.File
-	currentJSONLBuf   *bufio.Writer
-	currentIDsPath    string
-	currentIDsFile    *os.File
-	currentIDsBuf     *bufio.Writer
-	currentHasher     hash.Hash
-	currentSize       int64
-	currentIDCount    int64
-	currentRecordCnt  int64
-	currentSessionCnt int64
-	currentTimeMin    int64
-	currentTimeMax    int64
-	currentFirstID    int
-	currentLastID     int
+	currentIndex       int
+	currentDataWriters map[string]*shardDataWriter
+	currentIDsPath     string
+	currentIDsFile     *os.File
+	currentIDsBuf      *bufio.Writer
+	currentSize        int64
+	currentIDCount     int64
+	currentRecordCnt   int64
+	currentSessionCnt  int64
+	currentTimeMin     int64
+	currentTimeMax     int64
+	currentFirstID     int
+	currentLastID      int
 
 	// Job totals
 	shards            []TopManifestShard
@@ -493,37 +513,68 @@ type shardWriterState struct {
 	lastProgressAt time.Time
 }
 
+type shardDataWriter struct {
+	kind              string
+	path              string
+	file              *os.File
+	buf               *bufio.Writer
+	hasher            hash.Hash
+	size              int64
+	recordCount       int64
+	sourceRecordCount int64
+	sessionCount      int64
+}
+
+type shardDataFilePayload struct {
+	ShardDataFile
+	SourcePath string
+}
+
 // ensureCurrentShard opens the streaming temp file lazily on the first
 // appendLine of a new shard.
 func (s *shardWriterState) ensureCurrentShard() error {
-	if s.currentJSONLFile != nil {
+	if s.currentIDsFile != nil {
 		return nil
 	}
 	// Use a stable temp name keyed on the current shard *number that this file
 	// will become*. The shard index is incremented inside closeCurrentShard so
 	// the file produced by appends 1..N becomes shard {nextIndex}.
-	tmpName := fmt.Sprintf("shard-pending-%04d.jsonl", s.currentIndex+1)
-	path := filepath.Join(s.tmpDir, tmpName)
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
 	idsPath := filepath.Join(s.tmpDir, fmt.Sprintf("shard-pending-%04d.ids", s.currentIndex+1))
 	idsFile, err := os.Create(idsPath)
 	if err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
 		return err
 	}
-	s.currentJSONLPath = path
-	s.currentJSONLFile = f
-	s.currentJSONLBuf = bufio.NewWriterSize(f, 1<<20) // 1 MiB
+	s.currentDataWriters = make(map[string]*shardDataWriter)
 	s.currentIDsPath = idsPath
 	s.currentIDsFile = idsFile
 	s.currentIDsBuf = bufio.NewWriterSize(idsFile, 1<<20)
-	s.currentHasher = sha256.New()
 	s.currentSize = 0
 	return nil
+}
+
+func (s *shardWriterState) ensureDataWriter(kind string) (*shardDataWriter, error) {
+	kind = normalizeConversationDataKind(kind)
+	if err := s.ensureCurrentShard(); err != nil {
+		return nil, err
+	}
+	if existing := s.currentDataWriters[kind]; existing != nil {
+		return existing, nil
+	}
+	tmpName := fmt.Sprintf("shard-pending-%04d-%s.jsonl", s.currentIndex+1, kind)
+	path := filepath.Join(s.tmpDir, tmpName)
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	writer := &shardDataWriter{
+		kind:   kind,
+		path:   path,
+		file:   file,
+		buf:    bufio.NewWriterSize(file, 1<<20),
+		hasher: sha256.New(),
+	}
+	s.currentDataWriters[kind] = writer
+	return writer, nil
 }
 
 // wouldOverflowMax reports whether appending lineBytes to the current shard
@@ -538,10 +589,11 @@ func (s *shardWriterState) shouldRotateAfter() bool {
 	return s.currentSize >= s.shardTargetBytes
 }
 
-// appendLine streams one JSONL line into the current shard's temp file.
+// appendLine streams one JSONL line into the current shard's category temp file.
 // Caller must ensure overflow checks have been done.
-func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount int64, timeMin, timeMax int64) error {
-	if err := s.ensureCurrentShard(); err != nil {
+func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount int64, timeMin, timeMax int64, dataKind string) error {
+	writer, err := s.ensureDataWriter(dataKind)
+	if err != nil {
 		return err
 	}
 	if s.currentRecordCnt == 0 {
@@ -561,14 +613,19 @@ func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount
 	if len(recordIDs) > 0 {
 		s.currentLastID = recordIDs[len(recordIDs)-1]
 	}
-	mw := io.MultiWriter(s.currentJSONLBuf, s.currentHasher)
+	mw := io.MultiWriter(writer.buf, writer.hasher)
 	if _, err := mw.Write(line); err != nil {
 		return err
 	}
 	if _, err := mw.Write([]byte{'\n'}); err != nil {
 		return err
 	}
-	s.currentSize += int64(len(line)) + 1
+	lineBytes := int64(len(line)) + 1
+	writer.size += lineBytes
+	writer.recordCount++
+	writer.sourceRecordCount += int64(len(recordIDs))
+	writer.sessionCount += sessionCount
+	s.currentSize += lineBytes
 	s.currentRecordCnt += int64(len(recordIDs))
 	s.currentSessionCnt += sessionCount
 	for _, id := range recordIDs {
@@ -623,19 +680,10 @@ func (s *shardWriterState) maybePushProgress(force bool) {
 	})
 }
 
-// closeCurrentShard finalises the temp .jsonl file, packs it (streaming) into
-// a tar.gz next to its manifest, and resets shard state.
+// closeCurrentShard finalises the temp category .jsonl files, packs them
+// (streaming) into a tar.gz next to its manifest, and resets shard state.
 func (s *shardWriterState) closeCurrentShard() error {
-	if s.currentJSONLFile == nil || s.currentSize == 0 {
-		// Either there's nothing to flush, or appendLine was never called for
-		// this shard. Defensive: clean up an empty temp file if one exists.
-		if s.currentJSONLFile != nil {
-			_ = s.currentJSONLBuf.Flush()
-			_ = s.currentJSONLFile.Close()
-			_ = os.Remove(s.currentJSONLPath)
-			s.currentJSONLFile = nil
-			s.currentJSONLBuf = nil
-		}
+	if len(s.currentDataWriters) == 0 || s.currentSize == 0 {
 		if s.currentIDsFile != nil {
 			_ = s.currentIDsBuf.Flush()
 			_ = s.currentIDsFile.Close()
@@ -643,21 +691,48 @@ func (s *shardWriterState) closeCurrentShard() error {
 			s.currentIDsFile = nil
 			s.currentIDsBuf = nil
 		}
+		for _, writer := range s.currentDataWriters {
+			_ = writer.buf.Flush()
+			_ = writer.file.Close()
+			_ = os.Remove(writer.path)
+		}
+		s.currentDataWriters = nil
 		return nil
 	}
 
-	// 1. Flush and close the temp jsonl.
-	if err := s.currentJSONLBuf.Flush(); err != nil {
-		return err
-	}
+	// 1. Flush and close temp jsonl files.
 	if err := s.currentIDsBuf.Flush(); err != nil {
-		return err
-	}
-	if err := s.currentJSONLFile.Close(); err != nil {
 		return err
 	}
 	if err := s.currentIDsFile.Close(); err != nil {
 		return err
+	}
+	dataPayloads := make([]shardDataFilePayload, 0, len(s.currentDataWriters))
+	for _, kind := range orderedConversationDataKinds() {
+		writer := s.currentDataWriters[kind]
+		if writer == nil || writer.size == 0 {
+			continue
+		}
+		if err := writer.buf.Flush(); err != nil {
+			return err
+		}
+		if err := writer.file.Close(); err != nil {
+			return err
+		}
+		fileName := fmt.Sprintf("%s-data-%d.jsonl", writer.kind, writer.recordCount)
+		dataPayloads = append(dataPayloads, shardDataFilePayload{
+			ShardDataFile: ShardDataFile{
+				Path:              "", // filled after innerName is known
+				Kind:              writer.kind,
+				RecordCount:       writer.recordCount,
+				SourceRecordCount: writer.sourceRecordCount,
+				SessionCount:      writer.sessionCount,
+				UncompressedBytes: writer.size,
+				SHA256:            hex.EncodeToString(writer.hasher.Sum(nil)),
+			},
+			SourcePath: writer.path,
+		})
+		dataPayloads[len(dataPayloads)-1].Path = fileName
 	}
 
 	s.currentIndex++
@@ -665,8 +740,16 @@ func (s *shardWriterState) closeCurrentShard() error {
 	fileBase := buildShardFilename(s.jobID, s.mode, s.trigger, s.createdAt, s.currentIndex)
 	tarPath := filepath.Join(s.outputDir, fileBase+".tar.gz")
 
-	dataSHA := hex.EncodeToString(s.currentHasher.Sum(nil))
 	uncompressed := s.currentSize
+	for i := range dataPayloads {
+		dataPayloads[i].Path = innerName + "/" + dataPayloads[i].Path
+	}
+	dataFiles := shardDataFilesFromPayloads(dataPayloads)
+	dataFilesSHA := digestShardDataFiles(dataFiles)
+	legacySHA := ""
+	if len(dataFiles) == 1 {
+		legacySHA = dataFiles[0].SHA256
+	}
 
 	// 2. Build shard manifest.
 	shardManifest := ShardManifest{
@@ -677,7 +760,9 @@ func (s *shardWriterState) closeCurrentShard() error {
 		RecordCount:       s.currentRecordCnt,
 		SessionCount:      s.currentSessionCnt,
 		UncompressedBytes: uncompressed,
-		SHA256DataJSONL:   dataSHA,
+		SHA256DataJSONL:   legacySHA,
+		SHA256DataFiles:   dataFilesSHA,
+		DataFiles:         dataFiles,
 		RequestTimeMin:    s.currentTimeMin,
 		RequestTimeMax:    s.currentTimeMax,
 		FirstRecordID:     s.currentFirstID,
@@ -687,14 +772,14 @@ func (s *shardWriterState) closeCurrentShard() error {
 	if err != nil {
 		return err
 	}
-	pathManifestBytes, err := common.Marshal(buildShardPathManifest(innerName))
+	pathManifestBytes, err := common.Marshal(buildShardPathManifest(innerName, dataFiles))
 	if err != nil {
 		return err
 	}
 
 	// 3. Stream the temp .jsonl into tar.gz, then atomically rename.
 	tmpTarPath := filepath.Join(s.tmpDir, fileBase+".tar.gz")
-	if err := streamShardTarGz(tmpTarPath, innerName, s.currentJSONLPath, uncompressed, manifestBytes, pathManifestBytes); err != nil {
+	if err := streamShardTarGz(tmpTarPath, innerName, dataPayloads, manifestBytes, pathManifestBytes); err != nil {
 		return err
 	}
 	compressedInfo, err := os.Stat(tmpTarPath)
@@ -704,8 +789,10 @@ func (s *shardWriterState) closeCurrentShard() error {
 	if err := os.Rename(tmpTarPath, tarPath); err != nil {
 		return err
 	}
-	// 4. Drop the temp jsonl now that it's fully captured in the tar.gz.
-	_ = os.Remove(s.currentJSONLPath)
+	// 4. Drop temp jsonl files now that they are fully captured in the tar.gz.
+	for _, payload := range dataPayloads {
+		_ = os.Remove(payload.SourcePath)
+	}
 
 	// 5. Keep the sidecar id file until the top-level manifest is finalized.
 	// Records are marked exported only after the full delivery package is
@@ -720,11 +807,12 @@ func (s *shardWriterState) closeCurrentShard() error {
 	s.shards = append(s.shards, TopManifestShard{
 		Index:             s.currentIndex,
 		File:              filepath.Base(tarPath),
-		SHA256:            dataSHA,
+		SHA256:            dataFilesSHA,
 		UncompressedBytes: uncompressed,
 		CompressedBytes:   compressedInfo.Size(),
 		RecordCount:       s.currentRecordCnt,
 		SessionCount:      s.currentSessionCnt,
+		DataFiles:         dataFiles,
 		FirstRecordID:     s.currentFirstID,
 		LastRecordID:      s.currentLastID,
 		RequestTimeMin:    s.currentTimeMin,
@@ -747,13 +835,10 @@ func (s *shardWriterState) closeCurrentShard() error {
 	s.lastProgressAt = time.Now()
 
 	// 8. Reset for next shard.
-	s.currentJSONLFile = nil
-	s.currentJSONLBuf = nil
-	s.currentJSONLPath = ""
+	s.currentDataWriters = nil
 	s.currentIDsFile = nil
 	s.currentIDsBuf = nil
 	s.currentIDsPath = ""
-	s.currentHasher = nil
 	s.currentSize = 0
 	s.currentIDCount = 0
 	s.currentRecordCnt = 0
@@ -763,6 +848,108 @@ func (s *shardWriterState) closeCurrentShard() error {
 	s.currentFirstID = 0
 	s.currentLastID = 0
 	return nil
+}
+
+func shardDataFilesFromPayloads(payloads []shardDataFilePayload) []ShardDataFile {
+	files := make([]ShardDataFile, 0, len(payloads))
+	for _, payload := range payloads {
+		files = append(files, payload.ShardDataFile)
+	}
+	return files
+}
+
+func digestShardDataFiles(files []ShardDataFile) string {
+	h := sha256.New()
+	for _, file := range files {
+		_, _ = h.Write([]byte(file.Path))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(file.SHA256))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func orderedConversationDataKinds() []string {
+	return []string{
+		conversationDataKindResponses,
+		conversationDataKindMessages,
+		conversationDataKindCompletions,
+		conversationDataKindMixed,
+	}
+}
+
+func normalizeConversationDataKind(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case conversationDataKindResponses:
+		return conversationDataKindResponses
+	case conversationDataKindMessages:
+		return conversationDataKindMessages
+	case conversationDataKindCompletions:
+		return conversationDataKindCompletions
+	default:
+		return conversationDataKindMixed
+	}
+}
+
+func conversationDataKindForPath(path string) string {
+	path = strings.ToLower(strings.TrimSpace(path))
+	switch {
+	case strings.Contains(path, "/v1/responses"):
+		return conversationDataKindResponses
+	case strings.Contains(path, "/v1/messages"):
+		return conversationDataKindMessages
+	case strings.Contains(path, "/v1/chat/completions") || strings.Contains(path, "/chat/completions"):
+		return conversationDataKindCompletions
+	default:
+		return conversationDataKindMixed
+	}
+}
+
+func conversationDataKindForRelayFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "openai_responses", "openai_responses_compaction":
+		return conversationDataKindResponses
+	case "claude":
+		return conversationDataKindMessages
+	case "openai":
+		return conversationDataKindCompletions
+	default:
+		return conversationDataKindMixed
+	}
+}
+
+func conversationDataKindForLog(log *model.ConversationLog) string {
+	if log == nil {
+		return conversationDataKindMixed
+	}
+	if kind := conversationDataKindForPath(log.RequestPath); kind != conversationDataKindMixed {
+		return kind
+	}
+	if kind := conversationDataKindForRelayFormat(log.RelayFormat); kind != conversationDataKindMixed {
+		return kind
+	}
+	if kind := conversationDataKindForRelayFormat(log.FinalRequestFormat); kind != conversationDataKindMixed {
+		return kind
+	}
+	return conversationDataKindMixed
+}
+
+func conversationDataKindForRecords(records []*model.ConversationLog) string {
+	seen := make(map[string]struct{})
+	for _, record := range records {
+		kind := conversationDataKindForLog(record)
+		if kind == conversationDataKindMixed {
+			return conversationDataKindMixed
+		}
+		seen[kind] = struct{}{}
+		if len(seen) > 1 {
+			return conversationDataKindMixed
+		}
+	}
+	for kind := range seen {
+		return kind
+	}
+	return conversationDataKindMixed
 }
 
 func (s *shardWriterState) markClosedShardRecordsExported(ctx context.Context) error {
@@ -785,49 +972,47 @@ func (s *shardWriterState) markClosedShardRecordsExported(ctx context.Context) e
 	return nil
 }
 
-func buildShardPathManifest(shardName string) ShardPathManifest {
+func buildShardPathManifest(shardName string, dataFiles []ShardDataFile) ShardPathManifest {
+	entries := make([]ShardPathManifestEntry, 0, len(dataFiles)+2)
+	for _, file := range dataFiles {
+		entries = append(entries, ShardPathManifestEntry{
+			Path:        file.Path,
+			Required:    true,
+			Description: fmt.Sprintf("%s API category delivery data. Each line is one valid JSON record in the selected export mode.", file.Kind),
+		})
+	}
+	entries = append(entries,
+		ShardPathManifestEntry{
+			Path:        shardName + "/shard-manifest.json",
+			Required:    true,
+			Description: "Shard-level counts, time range, record id range, per-data-file counts, and SHA-256 checksums.",
+		},
+		ShardPathManifestEntry{
+			Path:        shardName + "/path-manifest.json",
+			Required:    true,
+			Description: "This path description file for the tar.gz package.",
+		},
+	)
 	return ShardPathManifest{
 		FormatVersion: "1",
 		PackageFormat: "tar.gz",
 		DataFormat:    "jsonl",
 		Encoding:      "UTF-8",
 		ShardRoot:     shardName + "/",
-		Entries: []ShardPathManifestEntry{
-			{
-				Path:        shardName + "/data.jsonl",
-				Required:    true,
-				Description: "Official traj delivery data. Each line is one valid JSON record in the selected export mode.",
-			},
-			{
-				Path:        shardName + "/shard-manifest.json",
-				Required:    true,
-				Description: "Shard-level counts, time range, record id range, and SHA-256 checksum for data.jsonl.",
-			},
-			{
-				Path:        shardName + "/path-manifest.json",
-				Required:    true,
-				Description: "This path description file for the tar.gz package.",
-			},
-		},
+		Entries:       entries,
 		Notes: []string{
-			"Use data.jsonl as the canonical dataset file.",
-			"The SHA-256 checksum in shard-manifest.json is computed over raw data.jsonl bytes before compression.",
+			"Use every *-data-*.jsonl file in this shard as the canonical dataset payload.",
+			"responses-data-N.jsonl, messages-data-N.jsonl, completions-data-N.jsonl, and mixed-data-N.jsonl are split by the request API entrypoint while preserving whole sessions.",
+			"The SHA-256 checksums in shard-manifest.json are computed over raw JSONL bytes before compression.",
 			"In session_jsonl mode, a reconstructed session is kept within one shard.",
 		},
 	}
 }
 
-// streamShardTarGz writes a tar.gz containing data.jsonl (streamed from
-// jsonlPath), shard-manifest.json, and path-manifest.json. The tar header
-// carries the precomputed uncompressed size, so we never have to load the whole
-// jsonl into memory.
-func streamShardTarGz(tarPath, shardName, jsonlPath string, jsonlSize int64, shardManifestJSON []byte, pathManifestJSON []byte) error {
-	in, err := os.Open(jsonlPath)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
+// streamShardTarGz writes a tar.gz containing category JSONL files (streamed),
+// shard-manifest.json, and path-manifest.json. Tar headers carry precomputed
+// uncompressed sizes, so the JSONL payloads are never loaded into memory.
+func streamShardTarGz(tarPath, shardName string, dataFiles []shardDataFilePayload, shardManifestJSON []byte, pathManifestJSON []byte) error {
 	out, err := os.Create(tarPath)
 	if err != nil {
 		return err
@@ -841,19 +1026,29 @@ func streamShardTarGz(tarPath, shardName, jsonlPath string, jsonlSize int64, sha
 	defer tw.Close()
 
 	now := time.Now()
-
-	// data.jsonl (streamed)
-	if err := tw.WriteHeader(&tar.Header{
-		Name:    shardName + "/data.jsonl",
-		Mode:    0o644,
-		Size:    jsonlSize,
-		ModTime: now,
-	}); err != nil {
-		return err
-	}
 	buf := make([]byte, 1<<20) // 1 MiB copy buffer
-	if _, err := io.CopyBuffer(tw, in, buf); err != nil {
-		return err
+
+	for _, file := range dataFiles {
+		in, err := os.Open(file.SourcePath)
+		if err != nil {
+			return err
+		}
+		if err := tw.WriteHeader(&tar.Header{
+			Name:    file.Path,
+			Mode:    0o644,
+			Size:    file.UncompressedBytes,
+			ModTime: now,
+		}); err != nil {
+			_ = in.Close()
+			return err
+		}
+		if _, err := io.CopyBuffer(tw, in, buf); err != nil {
+			_ = in.Close()
+			return err
+		}
+		if err := in.Close(); err != nil {
+			return err
+		}
 	}
 
 	// shard-manifest.json (small, bytes)
@@ -896,7 +1091,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 			rec := StrictAPIRecord{
 				SessionID:    item.SessionId,
 				Provider:     item.Provider,
-				RequestBody:  item.RequestBody,
+				RequestBody:  effectiveConversationRequestBody(item),
 				ResponseBody: item.ResponseBody,
 				RequestTime:  item.RequestTime,
 				ResponseTime: item.ResponseTime,
@@ -911,7 +1106,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 					return err
 				}
 			}
-			if err := state.appendLine(line, []int{item.Id}, 0, item.RequestTime, item.ResponseTime); err != nil {
+			if err := state.appendLine(line, []int{item.Id}, 0, item.RequestTime, item.ResponseTime, conversationDataKindForLog(item)); err != nil {
 				return err
 			}
 			if state.shouldRotateAfter() {
@@ -938,6 +1133,7 @@ type sessionExportSpool struct {
 type sessionSpoolMeta struct {
 	LineNo          int64    `json:"line_no"`
 	RecordIDs       []int    `json:"record_ids"`
+	DataKind        string   `json:"data_kind"`
 	D1Hash          string   `json:"d1_hash"`
 	D2Seq           []uint64 `json:"d2_seq"`
 	D3Seq           []uint64 `json:"d3_seq"`
@@ -960,6 +1156,9 @@ type sessionBucketRecord struct {
 	ID           int    `json:"id"`
 	SessionID    string `json:"session_id"`
 	Provider     string `json:"provider"`
+	RelayFormat  string `json:"relay_format,omitempty"`
+	FinalFormat  string `json:"final_request_format,omitempty"`
+	RequestPath  string `json:"request_path,omitempty"`
 	RequestBody  string `json:"request_body"`
 	ResponseBody string `json:"response_body"`
 	RequestTime  int64  `json:"request_time"`
@@ -1109,18 +1308,21 @@ func sessionBucketIndex(sessionID string) int {
 }
 
 func sessionBucketRecordBytes(record sessionBucketRecord) int64 {
-	return int64(len(record.SessionID) + len(record.Provider) + len(record.RequestBody) + len(record.ResponseBody) + 128)
+	return int64(len(record.SessionID) + len(record.Provider) + len(record.RelayFormat) + len(record.FinalFormat) + len(record.RequestPath) + len(record.RequestBody) + len(record.ResponseBody) + 128)
 }
 
 func conversationLogFromSessionBucketRecord(record sessionBucketRecord) *model.ConversationLog {
 	return &model.ConversationLog{
-		Id:           record.ID,
-		SessionId:    record.SessionID,
-		Provider:     record.Provider,
-		RequestBody:  record.RequestBody,
-		ResponseBody: record.ResponseBody,
-		RequestTime:  record.RequestTime,
-		ResponseTime: record.ResponseTime,
+		Id:                 record.ID,
+		SessionId:          record.SessionID,
+		Provider:           record.Provider,
+		RelayFormat:        record.RelayFormat,
+		FinalRequestFormat: record.FinalFormat,
+		RequestPath:        record.RequestPath,
+		RequestBody:        record.RequestBody,
+		ResponseBody:       record.ResponseBody,
+		RequestTime:        record.RequestTime,
+		ResponseTime:       record.ResponseTime,
 	}
 }
 
@@ -1155,6 +1357,7 @@ func (s *sessionExportSpool) appendCandidate(candidate sessionCandidate) error {
 	meta := sessionSpoolMeta{
 		LineNo:          s.count,
 		RecordIDs:       candidate.RecordIDs,
+		DataKind:        normalizeConversationDataKind(candidate.DataKind),
 		D1Hash:          sessionD1Hash(candidate.Trajectory),
 		D2Seq:           buildSessionD2Sequence(candidate.Trajectory.Messages),
 		D3Seq:           buildSessionD3Sequence(candidate.Trajectory.Messages),
@@ -1340,7 +1543,7 @@ func streamSessionSpoolToShards(ctx context.Context, spool *sessionExportSpool, 
 			if lineLen > state.shardMaxBytes {
 				common.SysLog(fmt.Sprintf("export job: session spool line %d exceeds shard_max_bytes (%d > %d), shard will be oversize", lineNo, lineLen, state.shardMaxBytes))
 			}
-			if err := state.appendLine(dataLine, meta.RecordIDs, 1, meta.RequestTimeMin, meta.ResponseTimeMax); err != nil {
+			if err := state.appendLine(dataLine, meta.RecordIDs, 1, meta.RequestTimeMin, meta.ResponseTimeMax, meta.DataKind); err != nil {
 				return err
 			}
 			if state.shouldRotateAfter() {
@@ -1461,7 +1664,10 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 				ID:           item.Id,
 				SessionID:    item.SessionId,
 				Provider:     item.Provider,
-				RequestBody:  item.RequestBody,
+				RelayFormat:  item.RelayFormat,
+				FinalFormat:  item.FinalRequestFormat,
+				RequestPath:  item.RequestPath,
+				RequestBody:  effectiveConversationRequestBody(item),
 				ResponseBody: item.ResponseBody,
 				RequestTime:  item.RequestTime,
 				ResponseTime: item.ResponseTime,

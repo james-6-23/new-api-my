@@ -97,6 +97,7 @@ type ConversationExportSummary struct {
 type sessionCandidate struct {
 	Trajectory      SessionTrajectory
 	RecordIDs       []int
+	DataKind        string
 	Reasons         []string
 	Signature       string
 	Messages        []string
@@ -180,6 +181,14 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 	if responseBody == "" && len(snapshot.ClientResponseBody) > 0 {
 		reconstructionReasons = append(reconstructionReasons, "provider_response_body_missing")
 	}
+	requestBodyText := completeConversationRequestBody(
+		provider,
+		strings.TrimSpace(string(requestBody)),
+		responseBody,
+		string(snapshot.ClientRequestBody),
+		string(snapshot.UpstreamRequestBody),
+	)
+	requestBody = []byte(requestBodyText)
 
 	requestTime := snapshot.RequestTime
 	if requestTime == 0 {
@@ -222,7 +231,7 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		SessionIdSource:         sessionIDSource,
 		SessionIdConfidence:     sessionIDConfidence,
 		Provider:                provider,
-		RequestBody:             strings.TrimSpace(string(requestBody)),
+		RequestBody:             requestBodyText,
 		ResponseBody:            responseBody,
 		RequestTime:             requestTime,
 		ResponseTime:            responseTime,
@@ -476,7 +485,7 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 				record := StrictAPIRecord{
 					SessionID:    item.SessionId,
 					Provider:     item.Provider,
-					RequestBody:  item.RequestBody,
+					RequestBody:  effectiveConversationRequestBody(item),
 					ResponseBody: item.ResponseBody,
 					RequestTime:  item.RequestTime,
 					ResponseTime: item.ResponseTime,
@@ -1013,14 +1022,15 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 		}
 		var request map[string]interface{}
 		var response map[string]interface{}
-		_ = common.Unmarshal([]byte(record.RequestBody), &request)
+		requestBody := effectiveConversationRequestBody(record)
+		_ = common.Unmarshal([]byte(requestBody), &request)
 		_ = common.Unmarshal([]byte(record.ResponseBody), &response)
 		if systemPrompt == "" {
 			systemPrompt = extractSystemPrompt(request)
 		}
 		for _, tool := range extractSessionTools(request, record.Provider) {
 			if tool.Name != "" {
-				toolsByName[tool.Name] = tool
+				mergeSessionToolDefinition(toolsByName, tool)
 			}
 		}
 		messages = append(messages, extractRequestMessages(request, record.Provider, &systemPrompt)...)
@@ -1028,10 +1038,14 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 	}
 	messages = normalizeSessionMessagesForExport(messages)
 	messages = dedupeAdjacentMessages(messages)
+	fillMissingSessionToolDefinitions(toolsByName, messages)
 	tools := make([]SessionTool, 0, len(toolsByName))
-	for _, name := range sortedStringKeys(toolsByName) {
-		tools = append(tools, toolsByName[name])
+	for _, tool := range toolsByName {
+		tools = append(tools, tool)
 	}
+	sort.SliceStable(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
 	tools = normalizeSessionToolsForExport(tools)
 	meta := mustJSONString(map[string]interface{}{
 		"original_session_id": sessionID,
@@ -1051,6 +1065,7 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 	candidate := sessionCandidate{
 		Trajectory:      trajectory,
 		RecordIDs:       recordIDs,
+		DataKind:        conversationDataKindForRecords(records),
 		Signature:       sessionSignature(trajectory),
 		Messages:        messageSignatureList(messages),
 		RequestTimeMin:  requestTimeMin,
@@ -1131,22 +1146,18 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 	}
 	toolNames := make(map[string]struct{}, len(trajectory.Tools))
 	for _, tool := range trajectory.Tools {
-		if strings.TrimSpace(tool.Name) == "" || strings.TrimSpace(tool.Description) == "" || strings.TrimSpace(tool.Parameters) == "" {
+		normalizedName := normalizeH2ToolName(tool.Name)
+		if normalizedName == "" || !isCompleteSessionTool(tool) {
 			reasons = append(reasons, "tool_schema_incomplete")
 			continue
 		}
-		var parameters map[string]interface{}
-		if err := common.Unmarshal([]byte(tool.Parameters), &parameters); err != nil || len(parameters) == 0 {
-			reasons = append(reasons, "tool_schema_incomplete")
-			continue
-		}
-		toolNames[tool.Name] = struct{}{}
+		toolNames[normalizedName] = struct{}{}
 	}
 	toolCallCount := 0
 	for _, msg := range trajectory.Messages {
 		for _, call := range msg.ToolCalls {
 			toolCallCount++
-			if _, ok := toolNames[call.Name]; !ok {
+			if _, ok := toolNames[normalizeH2ToolName(call.Name)]; !ok {
 				reasons = append(reasons, "tool_definition_missing")
 			}
 		}
@@ -1242,8 +1253,8 @@ func extractOpenAITools(request map[string]interface{}) []SessionTool {
 		}
 		tools = append(tools, SessionTool{
 			Name:        name,
-			Description: asString(fn["description"]),
-			Parameters:  jsonStringValue(fn["parameters"]),
+			Description: firstNonEmpty(asString(fn["description"]), asString(tool["description"])),
+			Parameters:  jsonStringValue(firstNonNil(fn["parameters"], tool["parameters"])),
 		})
 	}
 	return tools

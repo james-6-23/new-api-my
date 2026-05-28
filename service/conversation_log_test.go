@@ -292,6 +292,136 @@ func TestValidateSessionTrajectoryRejectsIncompleteToolSchema(t *testing.T) {
 	require.Contains(t, reasons, "tool_definition_missing")
 }
 
+func TestValidateSessionTrajectoryMatchesNormalizedToolNames(t *testing.T) {
+	trajectory := SessionTrajectory{
+		Tools: []SessionTool{{
+			Name:        "web_search",
+			Description: "Searches the web.",
+			Parameters:  `{"type":"object","properties":{"query":{"type":"string","description":"Search query"}}}`,
+		}},
+		Messages: []SessionMessage{
+			{Role: "user", Content: nullableString("search")},
+			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "WebSearch", Arguments: `{"query":"go"}`, CallID: "call_1"}}},
+			{Role: "tool", Content: nullableString("result"), ToolCallID: nullableString("call_1")},
+			{Role: "user", Content: nullableString("summarize")},
+			{Role: "assistant", Content: nullableString("done")},
+		},
+	}
+
+	reasons := validateSessionTrajectory(trajectory)
+	require.Empty(t, reasons)
+}
+
+func TestBuildSessionCandidateCompletesKnownMissingToolDefinition(t *testing.T) {
+	requestBody := `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"search context"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_search","type":"function","function":{"name":"mcp__ace-tool__search_context","arguments":"{\"query\":\"billing\"}"}}]},
+			{"role":"tool","tool_call_id":"call_search","content":"context"},
+			{"role":"user","content":"summarize"}
+		]
+	}`
+	responseBody := `{"choices":[{"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}],"usage":{"total_tokens":10}}`
+
+	candidate := buildSessionCandidate("sess_known_tool", []*model.ConversationLog{
+		validConversationLog(1, "sess_known_tool", "openai", requestBody, responseBody),
+	})
+
+	require.Empty(t, candidate.Reasons)
+	require.Len(t, candidate.Trajectory.Tools, 1)
+	require.Equal(t, "mcp__ace-tool__search_context", candidate.Trajectory.Tools[0].Name)
+	require.NotEmpty(t, candidate.Trajectory.Tools[0].Description)
+	require.NotEmpty(t, candidate.Trajectory.Tools[0].Parameters)
+}
+
+func TestCompleteConversationRequestBodyAddsKnownToolToAPIHijackTools(t *testing.T) {
+	requestBody := `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"find code"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_retrieve","type":"function","function":{"name":"codebase_retrieval","arguments":"{\"query\":\"router\"}"}}]}
+		]
+	}`
+	completed := completeConversationRequestBody("openai", requestBody, `{"choices":[{"message":{"role":"assistant","content":"done"}}]}`)
+
+	var parsed map[string]interface{}
+	require.NoError(t, common.Unmarshal([]byte(completed), &parsed))
+	tools := asSlice(parsed["tools"])
+	require.Len(t, tools, 1)
+	tool, ok := asMap(tools[0])
+	require.True(t, ok)
+	fn, ok := asMap(tool["function"])
+	require.True(t, ok)
+	require.Equal(t, "codebase_retrieval", fn["name"])
+	require.NotEmpty(t, fn["description"])
+	require.NotNil(t, fn["parameters"])
+}
+
+func TestH2CheckReportsIncompleteUnknownToolDefinition(t *testing.T) {
+	log := validConversationLog(1, "sess_custom", "openai", `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"lookup"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup_target_profile","arguments":"{\"target\":\"abc\"}"}}]}
+		],
+		"tools":[{"type":"function","function":{"name":"lookup_target_profile","parameters":{"type":"object","properties":{"target":{"type":"string","description":"Target"}}}}}]
+	}`, `{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"total_tokens":10}}`)
+
+	result := checkAPIHijackRecordH2(log)
+	require.Empty(t, result.UndefinedTools)
+	require.Contains(t, result.IncompleteTools, "lookup_target_profile")
+}
+
+func TestCheckSessionQualityPassesH1H4(t *testing.T) {
+	trajectory := SessionTrajectory{
+		Tools: []SessionTool{{
+			Name:        "Read",
+			Description: "Reads a file.",
+			Parameters:  `{"type":"object","properties":{"file_path":{"type":"string","description":"Path"}}}`,
+		}},
+		Messages: []SessionMessage{
+			{Role: "user", Content: nullableString("read main.go")},
+			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", Arguments: `{"file_path":"main.go"}`, CallID: "call_1"}}},
+			{Role: "tool", Content: nullableString("package main"), ToolCallID: nullableString("call_1")},
+			{Role: "user", Content: nullableString("summarize")},
+			{Role: "assistant", Content: nullableString("done")},
+		},
+	}
+
+	check := checkSessionQuality(trajectory)
+
+	require.True(t, check.H1Pass)
+	require.True(t, check.H2Pass)
+	require.True(t, check.H3Pass)
+	require.True(t, check.H4Pass)
+	require.Empty(t, check.Reasons)
+	require.GreaterOrEqual(t, check.EffectiveTurns, 2)
+	require.Equal(t, 1, check.ToolCallCount)
+	require.Equal(t, 1, check.PairedToolCallCount)
+}
+
+func TestCheckSessionQualityReportsH1H4Failures(t *testing.T) {
+	trajectory := SessionTrajectory{
+		Tools: []SessionTool{{Name: "lookup_target_profile", Parameters: `{"type":"object"}`}},
+		Messages: []SessionMessage{
+			{Role: "user", Content: nullableString("lookup")},
+			{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "lookup_target_profile", Arguments: `{"target":"abc"}`, CallID: "call_1"}}},
+		},
+	}
+
+	check := checkSessionQuality(trajectory)
+
+	require.False(t, check.H1Pass)
+	require.False(t, check.H2Pass)
+	require.True(t, check.H3Pass)
+	require.False(t, check.H4Pass)
+	require.Contains(t, check.Reasons, "h1_effective_turns_lt_2")
+	require.Contains(t, check.Reasons, "h2_tool_schema_incomplete")
+	require.Contains(t, check.Reasons, "h4_tool_result_pairing_not_strict")
+	require.Contains(t, check.IncompleteTools, "lookup_target_profile")
+}
+
 func TestSessionSignatureMatchesPDFDuplicateScope(t *testing.T) {
 	messages := []SessionMessage{
 		{Role: "user", Content: nullableString("read main.go")},
