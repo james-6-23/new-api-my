@@ -361,6 +361,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		shardMaxBytes:    job.ShardMaxBytes,
 		totalEligible:    recordsEligible,
 	}
+	defer func() {
+		_ = state.closeProcessedSourceIDs()
+	}()
 
 	var processErr error
 	if job.Mode == conversation_log_setting.ExportModeAPIHijackJSONL {
@@ -438,16 +441,27 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		}
 	}
 
-	if job.DeleteAfterExport && state.totalRecordCount > 0 {
+	deleteExpected := state.totalRecordCount
+	if job.DeleteAfterExport && job.Mode == conversation_log_setting.ExportModeSessionJSONL && state.processedIDCount > 0 {
 		updateJobProgress(job.JobId, map[string]interface{}{
-			"progress": "deleting exported source records",
+			"progress": "marking processed session source records",
+		})
+		if err := state.markProcessedSourceRecordsExported(ctx); err != nil {
+			return fmt.Errorf("mark processed session source records: %w", err)
+		}
+		deleteExpected = state.processedIDCount
+	}
+
+	if job.DeleteAfterExport && deleteExpected > 0 {
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"progress": "deleting processed source records",
 		})
 		deleted, err := model.DeleteConversationLogsByExportBatchID(ctx, job.JobId, 200)
 		if err != nil {
 			return fmt.Errorf("delete exported conversation logs after manifest: %w", err)
 		}
-		if deleted != state.totalRecordCount {
-			common.SysLog(fmt.Sprintf("export job: deleted %d source record(s), expected %d for batch %s", deleted, state.totalRecordCount, job.JobId))
+		if deleted != deleteExpected {
+			common.SysLog(fmt.Sprintf("export job: deleted %d source record(s), expected %d for batch %s", deleted, deleteExpected, job.JobId))
 		}
 	}
 
@@ -508,6 +522,16 @@ type shardWriterState struct {
 	totalSessionCount int64
 	totalUncompressed int64
 	totalCompressed   int64
+
+	// Session-mode cleanup ids. session_jsonl exports intentionally filter out
+	// H1-H4 failures and duplicate/subsequence sessions. When delete-after is
+	// enabled, those processed-but-not-delivered source rows still need to be
+	// removed after the manifest/S3 upload succeeds, otherwise auto-export will
+	// keep reprocessing the same rejected data forever.
+	processedIDsPath string
+	processedIDsFile *os.File
+	processedIDsBuf  *bufio.Writer
+	processedIDCount int64
 
 	// Progress throttling
 	lastProgressAt time.Time
@@ -969,6 +993,66 @@ func (s *shardWriterState) markClosedShardRecordsExported(ctx context.Context) e
 		_ = os.Remove(path)
 	}
 	s.shardIDPaths = nil
+	return nil
+}
+
+func (s *shardWriterState) appendProcessedSourceID(id int) error {
+	if id <= 0 {
+		return nil
+	}
+	if s.processedIDsFile == nil {
+		path := filepath.Join(s.tmpDir, "session-processed-source.ids")
+		file, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		s.processedIDsPath = path
+		s.processedIDsFile = file
+		s.processedIDsBuf = bufio.NewWriterSize(file, 1<<20)
+	}
+	if _, err := s.processedIDsBuf.WriteString(strconv.Itoa(id)); err != nil {
+		return err
+	}
+	if err := s.processedIDsBuf.WriteByte('\n'); err != nil {
+		return err
+	}
+	s.processedIDCount++
+	return nil
+}
+
+func (s *shardWriterState) closeProcessedSourceIDs() error {
+	if s.processedIDsBuf != nil {
+		if err := s.processedIDsBuf.Flush(); err != nil {
+			return err
+		}
+		s.processedIDsBuf = nil
+	}
+	if s.processedIDsFile != nil {
+		if err := s.processedIDsFile.Close(); err != nil {
+			return err
+		}
+		s.processedIDsFile = nil
+	}
+	return nil
+}
+
+func (s *shardWriterState) markProcessedSourceRecordsExported(ctx context.Context) error {
+	if s.processedIDCount == 0 || s.processedIDsPath == "" {
+		return nil
+	}
+	if err := s.closeProcessedSourceIDs(); err != nil {
+		return err
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if err := markConversationLogIDsFromFile(s.processedIDsPath, s.jobID, common.GetTimestamp(), 200); err != nil {
+		return err
+	}
+	_ = os.Remove(s.processedIDsPath)
+	s.processedIDsPath = ""
 	return nil
 }
 
@@ -1673,6 +1757,9 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 				ResponseTime: item.ResponseTime,
 			}
 			if err := manager.append(record); err != nil {
+				return err
+			}
+			if err := state.appendProcessedSourceID(item.Id); err != nil {
 				return err
 			}
 			eligible++

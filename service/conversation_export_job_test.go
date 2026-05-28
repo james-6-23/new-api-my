@@ -13,7 +13,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestStreamShardTarGzIncludesPathManifest(t *testing.T) {
@@ -105,6 +107,56 @@ func TestConversationDataKindForRecordsPreservesSessionIntegrity(t *testing.T) {
 	require.Equal(t, conversationDataKindMixed, conversationDataKindForRecords([]*model.ConversationLog{
 		{RequestPath: "/v1/unknown"},
 	}))
+}
+
+func TestSessionProcessedSourceIDsAllowDeletingRejectedSessionRows(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	requestBody := `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`
+	responseBody := `{"choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"total_tokens":2}}`
+	now := int64(1710000000)
+	for i := 1; i <= 2; i++ {
+		require.NoError(t, model.CreateConversationLog(&model.ConversationLog{
+			CreatedAt:        now + int64(i),
+			SessionId:        "sess_rejected",
+			Provider:         "openai",
+			RequestPath:      "/v1/chat/completions",
+			RequestBody:      requestBody,
+			ResponseBody:     responseBody,
+			RequestTime:      now + int64(i),
+			ResponseTime:     now + int64(i) + 1,
+			ValidationStatus: ConversationValidationValid,
+		}))
+	}
+
+	state := &shardWriterState{
+		jobID:  "job-session-cleanup",
+		tmpDir: t.TempDir(),
+	}
+	_, eligible, err := writeSessionBuckets(context.Background(), model.ConversationLogQuery{}, state)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, eligible)
+	require.EqualValues(t, 2, state.processedIDCount)
+
+	require.NoError(t, state.markProcessedSourceRecordsExported(context.Background()))
+	deleted, err := model.DeleteConversationLogsByExportBatchID(context.Background(), "job-session-cleanup", 200)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, deleted)
+
+	var remaining int64
+	require.NoError(t, model.LOG_DB.Model(&model.ConversationLog{}).Count(&remaining).Error)
+	require.EqualValues(t, 0, remaining)
+}
+
+func setupConversationExportJobTestDB(t *testing.T) {
+	t.Helper()
+	previous := model.LOG_DB
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "conversation-export-job.db")), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.ConversationLog{}))
+	model.LOG_DB = db
+	t.Cleanup(func() {
+		model.LOG_DB = previous
+	})
 }
 
 func readTarGzEntries(t *testing.T, tarPath string) map[string][]byte {
