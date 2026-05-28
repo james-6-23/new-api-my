@@ -304,7 +304,7 @@ func buildConversationExportQualityReportForScope(mode string, kind string, kind
 		conversationExportRuleFromMetric(
 			"h4",
 			"H4 tool result 配对",
-			"每条 session 的 tool result/tool call 配对率 >= 0.5",
+			"每条 session 的 tool result/tool call 去尾后严格配对",
 			preflight.H4,
 			preflight.H4.FailedCount,
 		),

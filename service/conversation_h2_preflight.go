@@ -474,13 +474,13 @@ func checkSessionQuality(trajectory SessionTrajectory) ConversationQualityFailur
 	h2 := checkSessionTrajectoryH2(trajectory)
 	effectiveTurns := effectiveTurnCount(trajectory.Messages)
 	toolCallCount := countSessionToolCalls(trajectory.Messages)
-	h4Info := checkSessionToolPairingStrict(trajectory.Messages)
+	h4Info := checkSessionToolPairingStrict(normalizeSessionToolPairingIDs(trajectory.Messages))
 
 	check := ConversationQualityFailure{
 		H1Pass:              effectiveTurns >= 2,
 		H2Pass:              len(h2.UndefinedTools) == 0 && len(h2.IncompleteTools) == 0,
 		H3Pass:              toolCallCount >= 1,
-		H4Pass:              sessionToolPairingRatePass(h4Info),
+		H4Pass:              h4Info.PairStrict,
 		EffectiveTurns:      effectiveTurns,
 		ToolCallCount:       toolCallCount,
 		ToolResultCount:     h4Info.ToolResultCount,
@@ -505,7 +505,11 @@ func checkSessionQuality(trajectory SessionTrajectory) ConversationQualityFailur
 		check.Reasons = append(check.Reasons, "h3_structured_tool_call_missing")
 	}
 	if !check.H4Pass {
-		check.Reasons = append(check.Reasons, "h4_tool_result_pairing_lt_0_5")
+		if !sessionToolPairingRatePass(h4Info) {
+			check.Reasons = append(check.Reasons, "h4_tool_result_pairing_lt_0_5")
+		} else {
+			check.Reasons = append(check.Reasons, "h4_tool_result_pairing_not_strict")
+		}
 	}
 	return check
 }

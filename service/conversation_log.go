@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -1050,6 +1051,7 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 	}
 	messages = normalizeSessionMessagesForExport(messages)
 	messages = dedupeAdjacentMessages(messages)
+	messages = normalizeSessionToolPairingIDs(messages)
 	fillMissingSessionToolDefinitions(toolsByName, messages)
 	tools := make([]SessionTool, 0, len(toolsByName))
 	for _, tool := range toolsByName {
@@ -1183,9 +1185,13 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 	if toolCallCount > 0 && len(trajectory.Tools) == 0 {
 		reasons = append(reasons, "tools_missing")
 	}
-	h4 := checkSessionToolPairingStrict(trajectory.Messages)
-	if toolCallCount > 0 && !sessionToolPairingRatePass(h4) {
-		reasons = append(reasons, "tool_result_pairing_lt_0_5")
+	h4 := checkSessionToolPairingStrict(normalizeSessionToolPairingIDs(trajectory.Messages))
+	if toolCallCount > 0 && !h4.PairStrict {
+		if !sessionToolPairingRatePass(h4) {
+			reasons = append(reasons, "tool_result_pairing_lt_0_5")
+		} else {
+			reasons = append(reasons, "tool_result_pairing_not_strict")
+		}
 	}
 	return uniqueStrings(reasons)
 }
@@ -2081,6 +2087,137 @@ func deduplicateSessionMessagesForH4(messages []SessionMessage) []sessionH4Messa
 		}
 	}
 	return deduped
+}
+
+func normalizeSessionToolPairingIDs(messages []SessionMessage) []SessionMessage {
+	type idBucket struct {
+		callIDs   map[string]struct{}
+		resultIDs map[string]struct{}
+	}
+
+	buckets := make(map[string]*idBucket)
+	add := func(id string, isCall bool) {
+		key := normalizeSessionToolPairingID(id)
+		if key == "" {
+			return
+		}
+		bucket := buckets[key]
+		if bucket == nil {
+			bucket = &idBucket{callIDs: make(map[string]struct{}), resultIDs: make(map[string]struct{})}
+			buckets[key] = bucket
+		}
+		if isCall {
+			bucket.callIDs[id] = struct{}{}
+			return
+		}
+		bucket.resultIDs[id] = struct{}{}
+	}
+	for _, msg := range messages {
+		if msg.Role == "assistant" {
+			for _, call := range msg.ToolCalls {
+				add(call.CallID, true)
+			}
+			continue
+		}
+		if msg.Role == "tool" {
+			add(sessionToolResultID(msg), false)
+		}
+	}
+
+	canonicalByID := make(map[string]string)
+	for _, bucket := range buckets {
+		if len(bucket.callIDs) != 1 || len(bucket.resultIDs) != 1 {
+			continue
+		}
+		callID := onlySessionToolID(bucket.callIDs)
+		resultID := onlySessionToolID(bucket.resultIDs)
+		if callID == "" || resultID == "" || callID == resultID {
+			continue
+		}
+		canonical := preferredSessionToolPairingID(callID, resultID)
+		canonicalByID[callID] = canonical
+		canonicalByID[resultID] = canonical
+	}
+	if len(canonicalByID) == 0 {
+		return messages
+	}
+
+	out := append([]SessionMessage(nil), messages...)
+	for i := range out {
+		switch out[i].Role {
+		case "assistant":
+			if len(out[i].ToolCalls) == 0 {
+				continue
+			}
+			calls := append([]SessionToolCall(nil), out[i].ToolCalls...)
+			changed := false
+			for j := range calls {
+				if canonical, ok := canonicalByID[calls[j].CallID]; ok {
+					calls[j].CallID = canonical
+					changed = true
+				}
+			}
+			if changed {
+				out[i].ToolCalls = calls
+			}
+		case "tool":
+			id := sessionToolResultID(out[i])
+			if canonical, ok := canonicalByID[id]; ok {
+				out[i].ToolCallID = nullableString(canonical)
+			}
+		}
+	}
+	return out
+}
+
+func normalizeSessionToolPairingID(id string) string {
+	if id == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range id {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+func onlySessionToolID(ids map[string]struct{}) string {
+	for id := range ids {
+		return id
+	}
+	return ""
+}
+
+func preferredSessionToolPairingID(a, b string) string {
+	aScore := sessionToolPairingIDScore(a)
+	bScore := sessionToolPairingIDScore(b)
+	if aScore > bScore {
+		return a
+	}
+	if bScore > aScore {
+		return b
+	}
+	if a <= b {
+		return a
+	}
+	return b
+}
+
+func sessionToolPairingIDScore(id string) int {
+	lower := strings.ToLower(id)
+	score := len(id)
+	if strings.ContainsAny(id, "_-") {
+		score += 1000
+	}
+	for _, prefix := range []string{"tooluse_", "tool_use_", "toolu_", "call_"} {
+		if strings.HasPrefix(lower, prefix) {
+			score += 2000
+			break
+		}
+	}
+	return score
 }
 
 func checkSessionToolPairingStrict(messages []SessionMessage) sessionH4Info {
