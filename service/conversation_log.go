@@ -1172,11 +1172,8 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 		reasons = append(reasons, "tools_missing")
 	}
 	h4 := checkSessionToolPairingStrict(trajectory.Messages)
-	if toolCallCount > 0 && h4.ToolCallCount > 0 && float64(h4.PairedCount)/float64(h4.ToolCallCount) < 0.5 {
+	if toolCallCount > 0 && !sessionToolPairingRatePass(h4) {
 		reasons = append(reasons, "tool_result_pairing_lt_0_5")
-	}
-	if toolCallCount > 0 && !h4.PairStrict {
-		reasons = append(reasons, "tool_result_pairing_not_strict")
 	}
 	return uniqueStrings(reasons)
 }
@@ -2219,6 +2216,20 @@ func checkSessionToolPairingStrict(messages []SessionMessage) sessionH4Info {
 		info.DuplicateIDCount == 0 &&
 		info.PairedCount >= 1
 	return info
+}
+
+func sessionToolPairingRate(info sessionH4Info) float64 {
+	if info.ToolCallCount <= 0 {
+		return 0
+	}
+	return float64(info.PairedCount) / float64(info.ToolCallCount)
+}
+
+func sessionToolPairingRatePass(info sessionH4Info) bool {
+	if info.ToolCallCount == 0 {
+		return info.ToolResultCount == 0
+	}
+	return sessionToolPairingRate(info) >= 0.5
 }
 
 func sessionD1Hash(trajectory SessionTrajectory) string {

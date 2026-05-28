@@ -95,6 +95,8 @@ type ConversationQualityFailure struct {
 	ToolCallCount       int      `json:"tool_call_count"`
 	ToolResultCount     int      `json:"tool_result_count"`
 	PairedToolCallCount int      `json:"paired_tool_call_count"`
+	ToolPairingRate     float64  `json:"tool_pairing_rate"`
+	ToolPairingStrict   bool     `json:"tool_pairing_strict"`
 	UndefinedTools      []string `json:"undefined_tools,omitempty"`
 	IncompleteTools     []string `json:"incomplete_tools,omitempty"`
 }
@@ -478,11 +480,13 @@ func checkSessionQuality(trajectory SessionTrajectory) ConversationQualityFailur
 		H1Pass:              effectiveTurns >= 2,
 		H2Pass:              len(h2.UndefinedTools) == 0 && len(h2.IncompleteTools) == 0,
 		H3Pass:              toolCallCount >= 1,
-		H4Pass:              h4Info.PairStrict,
+		H4Pass:              sessionToolPairingRatePass(h4Info),
 		EffectiveTurns:      effectiveTurns,
 		ToolCallCount:       toolCallCount,
 		ToolResultCount:     h4Info.ToolResultCount,
 		PairedToolCallCount: h4Info.PairedCount,
+		ToolPairingRate:     sessionToolPairingRate(h4Info),
+		ToolPairingStrict:   h4Info.PairStrict,
 		UndefinedTools:      h2.UndefinedTools,
 		IncompleteTools:     h2.IncompleteTools,
 	}
@@ -501,7 +505,7 @@ func checkSessionQuality(trajectory SessionTrajectory) ConversationQualityFailur
 		check.Reasons = append(check.Reasons, "h3_structured_tool_call_missing")
 	}
 	if !check.H4Pass {
-		check.Reasons = append(check.Reasons, "h4_tool_result_pairing_not_strict")
+		check.Reasons = append(check.Reasons, "h4_tool_result_pairing_lt_0_5")
 	}
 	return check
 }

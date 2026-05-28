@@ -249,7 +249,7 @@ func TestBuildGeminiSessionCandidatePairsFunctionResponseByName(t *testing.T) {
 	require.Equal(t, "Read", candidate.Trajectory.Tools[0].Name)
 }
 
-func TestValidateSessionTrajectoryAllowsOnlyTrailingToolOrphans(t *testing.T) {
+func TestValidateSessionTrajectoryUsesOfficialH4PairingRate(t *testing.T) {
 	toolParameters := `{"type":"object","properties":{"file_path":{"type":"string","description":"Path to read"}}}`
 	trajectory := SessionTrajectory{
 		Tools: []SessionTool{{Name: "Read", Description: "Reads a file.", Parameters: toolParameters}},
@@ -272,7 +272,18 @@ func TestValidateSessionTrajectoryAllowsOnlyTrailingToolOrphans(t *testing.T) {
 		{Role: "assistant", Content: nullableString("done")},
 	}
 	reasons = validateSessionTrajectory(trajectory)
-	require.Contains(t, reasons, "tool_result_pairing_not_strict")
+	require.NotContains(t, reasons, "tool_result_pairing_not_strict")
+	require.NotContains(t, reasons, "tool_result_pairing_lt_0_5")
+
+	trajectory.Messages = []SessionMessage{
+		{Role: "user", Content: nullableString("read one")},
+		{Role: "assistant", ToolCalls: []SessionToolCall{{Name: "Read", CallID: "call_1"}, {Name: "Read", CallID: "call_2"}, {Name: "Read", CallID: "call_3"}}},
+		{Role: "tool", Content: nullableString("one"), ToolCallID: nullableString("call_1")},
+		{Role: "user", Content: nullableString("summarize")},
+		{Role: "assistant", Content: nullableString("done")},
+	}
+	reasons = validateSessionTrajectory(trajectory)
+	require.Contains(t, reasons, "tool_result_pairing_lt_0_5")
 }
 
 func TestValidateSessionTrajectoryRejectsIncompleteToolSchema(t *testing.T) {
@@ -418,8 +429,36 @@ func TestCheckSessionQualityReportsH1H4Failures(t *testing.T) {
 	require.False(t, check.H4Pass)
 	require.Contains(t, check.Reasons, "h1_effective_turns_lt_2")
 	require.Contains(t, check.Reasons, "h2_tool_schema_incomplete")
-	require.Contains(t, check.Reasons, "h4_tool_result_pairing_not_strict")
+	require.Contains(t, check.Reasons, "h4_tool_result_pairing_lt_0_5")
 	require.Contains(t, check.IncompleteTools, "lookup_target_profile")
+}
+
+func TestCheckSessionQualityAllowsOfficialH4PairingRate(t *testing.T) {
+	trajectory := SessionTrajectory{
+		Tools: []SessionTool{{
+			Name:        "Read",
+			Description: "Reads a file.",
+			Parameters:  `{"type":"object","properties":{"file_path":{"type":"string","description":"Path"}}}`,
+		}},
+		Messages: []SessionMessage{
+			{Role: "user", Content: nullableString("read two files")},
+			{Role: "assistant", ToolCalls: []SessionToolCall{
+				{Name: "Read", Arguments: `{"file_path":"a.go"}`, CallID: "call_1"},
+				{Name: "Read", Arguments: `{"file_path":"b.go"}`, CallID: "call_2"},
+			}},
+			{Role: "tool", Content: nullableString("package a"), ToolCallID: nullableString("call_1")},
+			{Role: "user", Content: nullableString("summarize")},
+			{Role: "assistant", Content: nullableString("done")},
+		},
+	}
+
+	check := checkSessionQuality(trajectory)
+
+	require.True(t, check.H4Pass)
+	require.False(t, check.ToolPairingStrict)
+	require.Equal(t, 0.5, check.ToolPairingRate)
+	require.NotContains(t, check.Reasons, "h4_tool_result_pairing_lt_0_5")
+	require.NotContains(t, check.Reasons, "h4_tool_result_pairing_not_strict")
 }
 
 func TestSessionSignatureMatchesPDFDuplicateScope(t *testing.T) {
