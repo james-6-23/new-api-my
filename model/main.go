@@ -300,6 +300,9 @@ func migrateDB() error {
 	if err := migrateConversationLogBodyColumns(DB); err != nil {
 		return err
 	}
+	if err := migrateConversationS3UploadLogColumns(DB); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -375,6 +378,9 @@ func migrateDBFast() error {
 	if err := migrateConversationLogBodyColumns(DB); err != nil {
 		return err
 	}
+	if err := migrateConversationS3UploadLogColumns(DB); err != nil {
+		return err
+	}
 	common.SysLog("database migrated")
 	return nil
 }
@@ -393,8 +399,33 @@ func migrateLOGDB() error {
 	if err = LOG_DB.AutoMigrate(&ConversationS3UploadLog{}); err != nil {
 		return err
 	}
+	if err = migrateConversationS3UploadLogColumns(LOG_DB); err != nil {
+		return err
+	}
 	if err = migrateConversationLogBodyColumns(LOG_DB); err != nil {
 		return err
+	}
+	return nil
+}
+
+func migrateConversationS3UploadLogColumns(db *gorm.DB) error {
+	if db == nil || !db.Migrator().HasTable(&ConversationS3UploadLog{}) {
+		return nil
+	}
+	if !db.Migrator().HasColumn(&ConversationS3UploadLog{}, "content_sha256") {
+		if err := db.Migrator().AddColumn(&ConversationS3UploadLog{}, "ContentSHA256"); err != nil {
+			return err
+		}
+	}
+	if !db.Migrator().HasColumn(&ConversationS3UploadLog{}, "etag") {
+		if err := db.Migrator().AddColumn(&ConversationS3UploadLog{}, "ETag"); err != nil {
+			return err
+		}
+	}
+	if db.Migrator().HasColumn(&ConversationS3UploadLog{}, "e_tag") && db.Migrator().HasColumn(&ConversationS3UploadLog{}, "etag") {
+		if err := db.Exec("UPDATE conversation_s3_upload_logs SET etag = e_tag WHERE (etag = '' OR etag IS NULL) AND e_tag IS NOT NULL AND e_tag <> ''").Error; err != nil {
+			return err
+		}
 	}
 	return nil
 }

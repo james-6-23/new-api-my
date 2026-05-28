@@ -24,8 +24,8 @@ type ConversationS3UploadLog struct {
 	FilePath      string `json:"file_path" gorm:"type:text"`
 	FileName      string `json:"file_name" gorm:"type:varchar(512);default:''"`
 	FileSize      int64  `json:"file_size" gorm:"bigint;default:0"`
-	ContentSHA256 string `json:"content_sha256" gorm:"type:varchar(64);default:''"`
-	ETag          string `json:"etag" gorm:"type:varchar(255);default:''"`
+	ContentSHA256 string `json:"content_sha256" gorm:"column:content_sha256;type:varchar(64);default:''"`
+	ETag          string `json:"etag" gorm:"column:etag;type:varchar(255);default:''"`
 
 	ErrorMessage string `json:"error_message,omitempty" gorm:"type:text"`
 }
