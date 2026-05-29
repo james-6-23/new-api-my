@@ -308,7 +308,7 @@ func buildConversationExportQualityReportForScope(mode string, kind string, kind
 		conversationExportRuleFromMetric(
 			"h4",
 			"H4 tool result 配对",
-			"每条 session 的 tool result/tool call 去尾后严格配对",
+			"每条 session 的 tool result/tool call 配对率 ≥ 0.5",
 			preflight.H4,
 			preflight.H4.FailedCount,
 		),
@@ -1371,10 +1371,14 @@ func (s *shardWriterState) markProcessedSourceRecordsExported(ctx context.Contex
 func buildShardPathManifest(shardName string, dataFiles []ShardDataFile) ShardPathManifest {
 	entries := make([]ShardPathManifestEntry, 0, len(dataFiles)+2)
 	for _, file := range dataFiles {
+		description := fmt.Sprintf("%s API category delivery data. Each line is one valid JSON record in the selected export mode.", file.Kind)
+		if file.Kind == conversationDataKindResponses {
+			description = "responses API category delivery data (OpenAI Responses API). Each line is one valid JSON record; request_body uses the Responses schema where the conversation is carried in `input`/`instructions` (typed items: message/reasoning/function_call/function_call_output) instead of a top-level `messages` array."
+		}
 		entries = append(entries, ShardPathManifestEntry{
 			Path:        file.Path,
 			Required:    true,
-			Description: fmt.Sprintf("%s API category delivery data. Each line is one valid JSON record in the selected export mode.", file.Kind),
+			Description: description,
 		})
 	}
 	entries = append(entries,
@@ -1399,7 +1403,7 @@ func buildShardPathManifest(shardName string, dataFiles []ShardDataFile) ShardPa
 		Notes: []string{
 			"Use every *-data-*.jsonl file in this shard as the canonical dataset payload.",
 			"responses-data-N.jsonl, messages-data-N.jsonl, completions-data-N.jsonl, and mixed-data-N.jsonl are split by the request API entrypoint while preserving whole sessions.",
-			"The SHA-256 checksums in shard-manifest.json are computed over raw JSONL bytes before compression.",
+			"The SHA-256 checksums in shard-manifest.json are computed over raw JSONL bytes before compression. The per-data-file `sha256` values hash the raw JSONL bytes; `sha256_of_data_files` is a digest over the ordered (path, per-file sha256) pairs.",
 			"In session_jsonl mode, a reconstructed session is kept within one shard.",
 		},
 	}

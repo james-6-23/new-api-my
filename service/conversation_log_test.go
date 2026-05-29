@@ -207,6 +207,102 @@ func TestBuildSessionCandidatePrefersCallIDForOpenAIToolCalls(t *testing.T) {
 	require.Equal(t, "call_read", stringPtrValue(candidate.Trajectory.Messages[2].ToolCallID))
 }
 
+func TestExtractResponsesInputMessagesParsesToolItems(t *testing.T) {
+	var request map[string]interface{}
+	require.NoError(t, common.UnmarshalJsonStr(`{
+		"model":"gpt-5.5",
+		"instructions":"",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are a coding agent."}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"I will run ls."}],"encrypted_content":"opaque"},
+			{"type":"function_call","name":"shell","arguments":"{\"command\":\"ls\"}","call_id":"call_1"},
+			{"type":"function_call_output","call_id":"call_1","output":"a.go\nb.go"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"There are two files."}]}
+		]
+	}`, &request))
+
+	systemPrompt := ""
+	msgs := extractRequestMessages(request, "openai", &systemPrompt)
+
+	// developer message becomes the system prompt; it is not emitted as a message.
+	require.Equal(t, "You are a coding agent.", systemPrompt)
+	require.Equal(t, "user", msgs[0].Role)
+	require.Equal(t, "list files", stringPtrValue(msgs[0].Content))
+
+	var toolCall *SessionToolCall
+	var toolResult *SessionMessage
+	thinking := ""
+	for i := range msgs {
+		if len(msgs[i].ToolCalls) > 0 {
+			toolCall = &msgs[i].ToolCalls[0]
+		}
+		if msgs[i].Role == "tool" {
+			toolResult = &msgs[i]
+		}
+		if msgs[i].Thinking != nil && *msgs[i].Thinking != "" {
+			thinking = *msgs[i].Thinking
+		}
+	}
+	require.NotNil(t, toolCall, "function_call must become an assistant tool_call")
+	require.Equal(t, "shell", toolCall.Name)
+	require.Equal(t, `{"command":"ls"}`, toolCall.Arguments)
+	require.Equal(t, "call_1", toolCall.CallID)
+	require.NotNil(t, toolResult, "function_call_output must become a tool result message")
+	require.Equal(t, "call_1", stringPtrValue(toolResult.ToolCallID))
+	require.Equal(t, "a.go\nb.go", stringPtrValue(toolResult.Content))
+	require.Equal(t, "I will run ls.", thinking)
+}
+
+func TestBuildResponsesSessionCandidatePassesQualityGateAndMeta(t *testing.T) {
+	requestBody := `{
+		"model":"gpt-5.5",
+		"instructions":"You are a coding agent.",
+		"tools":[{"type":"function","name":"shell","description":"Run a shell command.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]},
+			{"type":"function_call","name":"shell","arguments":"{\"command\":\"ls\"}","call_id":"call_1"},
+			{"type":"function_call_output","call_id":"call_1","output":"a.go\nb.go"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"count them"}]}
+		]
+	}`
+	responseBody := `{"output":[{"type":"message","content":[{"type":"output_text","text":"Two files."}]}],"usage":{"total_tokens":12}}`
+	rec := &model.ConversationLog{
+		Id:           1,
+		SessionId:    "sess_resp",
+		Provider:     "openai",
+		ModelName:    "gpt-5.5",
+		RequestBody:  requestBody,
+		ResponseBody: responseBody,
+		RequestTime:  1710000000000,
+		ResponseTime: 1710000001234,
+	}
+
+	candidate := buildSessionCandidate("sess_resp", []*model.ConversationLog{rec})
+
+	// Responses-API tool calls/results are reconstructed, so the session clears H1-H4.
+	require.Empty(t, candidate.Reasons)
+	require.Equal(t, "You are a coding agent.", stringPtrValue(candidate.Trajectory.SystemPrompt))
+	calls, results := 0, 0
+	for _, m := range candidate.Trajectory.Messages {
+		calls += len(m.ToolCalls)
+		if m.Role == "tool" {
+			results++
+		}
+	}
+	require.GreaterOrEqual(t, calls, 1)
+	require.GreaterOrEqual(t, results, 1)
+
+	// meta carries the required model_name plus a stats summary.
+	var meta map[string]interface{}
+	require.NoError(t, common.UnmarshalJsonStr(candidate.Trajectory.Meta, &meta))
+	require.Equal(t, "gpt-5.5", meta["model_name"])
+	stats, ok := meta["stats"].(map[string]interface{})
+	require.True(t, ok, "meta.stats must be present")
+	require.Contains(t, stats, "messages")
+	require.Contains(t, stats, "tool_calls")
+}
+
 func TestBuildClaudeSessionCandidatePassesQualityGate(t *testing.T) {
 	requestBody := `{
 		"model":"claude-sonnet",
@@ -249,7 +345,7 @@ func TestBuildGeminiSessionCandidatePairsFunctionResponseByName(t *testing.T) {
 	require.Equal(t, "Read", candidate.Trajectory.Tools[0].Name)
 }
 
-func TestValidateSessionTrajectoryUsesStrictH4Pairing(t *testing.T) {
+func TestValidateSessionTrajectoryH4AcceptsPairingRateAtLeastHalf(t *testing.T) {
 	toolParameters := `{"type":"object","properties":{"file_path":{"type":"string","description":"Path to read"}}}`
 	trajectory := SessionTrajectory{
 		Tools: []SessionTool{{Name: "Read", Description: "Reads a file.", Parameters: toolParameters}},
@@ -272,8 +368,10 @@ func TestValidateSessionTrajectoryUsesStrictH4Pairing(t *testing.T) {
 		{Role: "assistant", Content: nullableString("done")},
 	}
 	reasons = validateSessionTrajectory(trajectory)
-	require.Contains(t, reasons, "tool_result_pairing_not_strict")
+	// rate == 0.5 satisfies the v3.0 >=0.5 standard; not-strict is no longer a rejection reason.
+	require.NotContains(t, reasons, "tool_result_pairing_not_strict")
 	require.NotContains(t, reasons, "tool_result_pairing_lt_0_5")
+	require.Empty(t, reasons)
 
 	trajectory.Messages = []SessionMessage{
 		{Role: "user", Content: nullableString("read one")},
@@ -455,7 +553,7 @@ func TestCheckSessionQualityReportsH1H4Failures(t *testing.T) {
 	require.Contains(t, check.IncompleteTools, "lookup_target_profile")
 }
 
-func TestCheckSessionQualityReportsStrictH4Failure(t *testing.T) {
+func TestCheckSessionQualityNonStrictH4Passes(t *testing.T) {
 	trajectory := SessionTrajectory{
 		Tools: []SessionTool{{
 			Name:        "Read",
@@ -476,11 +574,12 @@ func TestCheckSessionQualityReportsStrictH4Failure(t *testing.T) {
 
 	check := checkSessionQuality(trajectory)
 
-	require.False(t, check.H4Pass)
+	// rate == 0.5 passes the v3.0 >=0.5 standard; strictness is reported as info only.
+	require.True(t, check.H4Pass)
 	require.False(t, check.ToolPairingStrict)
 	require.Equal(t, 0.5, check.ToolPairingRate)
 	require.NotContains(t, check.Reasons, "h4_tool_result_pairing_lt_0_5")
-	require.Contains(t, check.Reasons, "h4_tool_result_pairing_not_strict")
+	require.NotContains(t, check.Reasons, "h4_tool_result_pairing_not_strict")
 }
 
 func TestSessionSignatureMatchesPDFDuplicateScope(t *testing.T) {

@@ -1028,6 +1028,7 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 	recordIDs := make([]int, 0, len(records))
 	systemPrompt := ""
 	provider := ""
+	modelName := ""
 	requestTimeMin := int64(0)
 	responseTimeMax := int64(0)
 	for _, record := range records {
@@ -1040,6 +1041,10 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 		}
 		if provider == "" {
 			provider = record.Provider
+		}
+		// Most recent non-empty model wins (records are sorted ascending by time).
+		if record.ModelName != "" {
+			modelName = record.ModelName
 		}
 		var request map[string]interface{}
 		var response map[string]interface{}
@@ -1069,11 +1074,22 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 		return tools[i].Name < tools[j].Name
 	})
 	tools = normalizeSessionToolsForExport(tools)
-	meta := mustJSONString(map[string]interface{}{
+	// meta carries the format-reference standard fields: model_name (required model
+	// identifier), original_id (session id) and a stats summary. provider and the
+	// raw record count are kept for provenance.
+	metaFields := map[string]interface{}{
 		"original_session_id": sessionID,
 		"provider":            provider,
 		"records":             len(records),
-	})
+		"stats": map[string]interface{}{
+			"messages":   len(messages),
+			"tool_calls": countSessionToolCalls(messages),
+		},
+	}
+	if modelName != "" {
+		metaFields["model_name"] = modelName
+	}
+	meta := mustJSONString(metaFields)
 	trajectory := SessionTrajectory{
 		TrajectoryID:     "new-api_" + shortHash(sessionID+"|"+messageListSignature(messages)),
 		Dataset:          "new-api",
@@ -1193,13 +1209,14 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 	if toolCallCount > 0 && len(trajectory.Tools) == 0 {
 		reasons = append(reasons, "tools_missing")
 	}
+	// H4 per traj v2.0/v3.0: tool result/tool call pairing rate must be >= 0.5.
+	// A session that is paired but not strictly 100% (rate in [0.5,1.0)) still
+	// conforms to the standard and must NOT be dropped; its non-strict status is
+	// surfaced as an informational signal in the quality report (ToolPairingStrict),
+	// not as an export-gate rejection.
 	h4 := checkSessionToolPairingStrict(normalizeSessionToolPairingIDs(trajectory.Messages))
-	if toolCallCount > 0 && !h4.PairStrict {
-		if !sessionToolPairingRatePass(h4) {
-			reasons = append(reasons, "tool_result_pairing_lt_0_5")
-		} else {
-			reasons = append(reasons, "tool_result_pairing_not_strict")
-		}
+	if toolCallCount > 0 && !sessionToolPairingRatePass(h4) {
+		reasons = append(reasons, "tool_result_pairing_lt_0_5")
 	}
 	return uniqueStrings(reasons)
 }
@@ -1327,7 +1344,7 @@ func extractRequestMessages(request map[string]interface{}, provider string, sys
 		return extractGeminiRequestMessages(request)
 	default:
 		if _, ok := request["input"]; ok && request["messages"] == nil {
-			return extractResponsesInputMessages(request)
+			return extractResponsesInputMessages(request, systemPrompt)
 		}
 		return extractOpenAIRequestMessages(request, systemPrompt)
 	}
@@ -1365,9 +1382,19 @@ func extractOpenAIRequestMessages(request map[string]interface{}, systemPrompt *
 	return messages
 }
 
-func extractResponsesInputMessages(request map[string]interface{}) []SessionMessage {
-	input := request["input"]
-	switch value := input.(type) {
+// extractResponsesInputMessages reconstructs session messages from an OpenAI
+// Responses API request body. The Responses API carries the conversation in
+// `input[]` using typed items rather than a `messages` array, and crucially the
+// tool RESULTS (function_call_output) only ever appear here in the request input
+// (never in the response). Each item type is mapped to the standard session
+// message shape:
+//   - message (role user/assistant)  -> user/assistant text
+//   - message (role system/developer)-> system prompt (when not already set)
+//   - reasoning                       -> assistant thinking (summary text)
+//   - function_call                   -> assistant tool_call
+//   - function_call_output            -> tool result message
+func extractResponsesInputMessages(request map[string]interface{}, systemPrompt *string) []SessionMessage {
+	switch value := request["input"].(type) {
 	case string:
 		return []SessionMessage{{Role: "user", Content: nullableString(value)}}
 	case []interface{}:
@@ -1377,19 +1404,70 @@ func extractResponsesInputMessages(request map[string]interface{}) []SessionMess
 			if !ok {
 				continue
 			}
-			role := normalizeRole(asString(msg["role"]))
-			content := contentToString(msg["content"])
-			if content == "" {
-				content = contentToString(msg["text"])
-			}
-			if role != "" {
-				messages = append(messages, SessionMessage{Role: role, Content: nullableString(content)})
+			switch asString(msg["type"]) {
+			case "function_call", "custom_tool_call":
+				messages = append(messages, SessionMessage{
+					Role: "assistant",
+					ToolCalls: []SessionToolCall{{
+						Name:      asString(msg["name"]),
+						Arguments: jsonStringValue(msg["arguments"]),
+						CallID:    conversationToolCallID(msg),
+					}},
+				})
+			case "function_call_output", "custom_tool_call_output":
+				messages = append(messages, SessionMessage{
+					Role:       "tool",
+					Content:    nullableString(contentToString(msg["output"])),
+					ToolCallID: nullableString(conversationToolResultID(msg)),
+				})
+			case "reasoning":
+				if thinking := responsesReasoningText(msg); thinking != "" {
+					messages = append(messages, SessionMessage{Role: "assistant", Thinking: nullableString(thinking)})
+				}
+			default:
+				// "message" items (and any role-bearing item).
+				rawRole := asString(msg["role"])
+				content := contentToString(msg["content"])
+				if content == "" {
+					content = contentToString(msg["text"])
+				}
+				if rawRole == "system" || rawRole == "developer" {
+					if systemPrompt != nil && *systemPrompt == "" {
+						*systemPrompt = content
+					}
+					continue
+				}
+				if role := normalizeRole(rawRole); role != "" {
+					messages = append(messages, SessionMessage{Role: role, Content: nullableString(content)})
+				}
 			}
 		}
 		return messages
 	default:
 		return nil
 	}
+}
+
+// responsesReasoningText pulls the human-readable reasoning text out of a
+// Responses API `reasoning` item (summary blocks and any plain content blocks).
+// The opaque `encrypted_content` is intentionally ignored.
+func responsesReasoningText(item map[string]interface{}) string {
+	parts := make([]string, 0)
+	for _, summaryValue := range asSlice(item["summary"]) {
+		if summary, ok := asMap(summaryValue); ok {
+			if text := asString(summary["text"]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	for _, contentValue := range asSlice(item["content"]) {
+		if content, ok := asMap(contentValue); ok {
+			if text := asString(content["text"]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func extractClaudeRequestMessages(request map[string]interface{}) []SessionMessage {
