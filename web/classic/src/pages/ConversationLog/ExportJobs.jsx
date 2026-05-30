@@ -382,12 +382,15 @@ const ExportJobs = ({
   const [detail, setDetail] = useState(null);
   const [detailVisible, setDetailVisible] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  const [total, setTotal] = useState(0);
 
-  const loadJobs = async () => {
+  const loadJobs = async (nextPage = page, nextPageSize = pageSize) => {
     setLoading(true);
     try {
       const res = await API.get('/api/conversation_logs/export_jobs', {
-        params: { p: 1, page_size: 50 },
+        params: { p: nextPage, page_size: nextPageSize },
         disableDuplicate: true,
       });
       const { success, message, data } = res.data;
@@ -396,6 +399,9 @@ const ExportJobs = ({
         return;
       }
       setJobs((data?.items || []).map((j) => ({ ...j, key: j.job_id })));
+      setPage(nextPage);
+      setPageSize(nextPageSize);
+      setTotal(data?.total || 0);
     } catch (e) {
       showError(e.message || t('加载任务失败'));
     } finally {
@@ -404,7 +410,7 @@ const ExportJobs = ({
   };
 
   useEffect(() => {
-    loadJobs();
+    loadJobs(1, pageSize);
   }, []);
 
   // Auto-refresh while any job is running/pending.
@@ -414,9 +420,9 @@ const ExportJobs = ({
       (j) => j.status === 'running' || j.status === 'pending',
     );
     if (!hasActive) return undefined;
-    const timer = setInterval(loadJobs, 3000);
+    const timer = setInterval(() => loadJobs(page, pageSize), 3000);
     return () => clearInterval(timer);
-  }, [jobs, autoRefresh]);
+  }, [jobs, autoRefresh, page, pageSize]);
 
   const onCreate = async (values) => {
     setCreating(true);
@@ -440,7 +446,7 @@ const ExportJobs = ({
       showSuccess(t('任务已创建'));
       setCreateVisible(false);
       createFormRef.current?.reset?.();
-      await loadJobs();
+      await loadJobs(1, pageSize);
     } catch (e) {
       const msg = e?.response?.data?.message || e?.message || t('创建任务失败');
       showError(msg);
@@ -459,7 +465,7 @@ const ExportJobs = ({
         return;
       }
       showSuccess(t('已请求取消'));
-      await loadJobs();
+      await loadJobs(page, pageSize);
     } catch (e) {
       showError(e.message || t('取消失败'));
     }
@@ -475,7 +481,7 @@ const ExportJobs = ({
         return;
       }
       showSuccess(t('已删除'));
-      await loadJobs();
+      await loadJobs(jobs.length <= 1 && page > 1 ? page - 1 : page, pageSize);
     } catch (e) {
       showError(e.message || t('删除失败'));
     }
@@ -698,7 +704,11 @@ const ExportJobs = ({
             </Text>
           </div>
           <Space>
-            <Button icon={<IconRefresh />} onClick={loadJobs} loading={loading}>
+            <Button
+              icon={<IconRefresh />}
+              onClick={() => loadJobs(page, pageSize)}
+              loading={loading}
+            >
               {t('刷新')}
             </Button>
             <Button
@@ -718,7 +728,16 @@ const ExportJobs = ({
           <Table
             columns={columns}
             dataSource={jobs}
-            pagination={false}
+            pagination={{
+              currentPage: page,
+              pageSize,
+              total,
+              pageSizeOpts: [20, 50, 100],
+              showSizeChanger: true,
+              onPageChange: (nextPage) => loadJobs(nextPage, pageSize),
+              onPageSizeChange: (nextPageSize) =>
+                loadJobs(1, nextPageSize),
+            }}
             scroll={{ x: 1300 }}
             empty={t('暂无任务')}
             expandRowByClick
