@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
@@ -66,6 +67,21 @@ type rotationDirState struct {
 type rotationDirInspection struct {
 	tarGzCount      int
 	hasSubdirectory bool
+}
+
+type ConversationS3RotationStatus struct {
+	Enabled             bool   `json:"enabled"`
+	RotationEnabled     bool   `json:"rotation_enabled"`
+	BaseDir             string `json:"base_dir"`
+	NextDir             string `json:"next_dir"`
+	NextObjectPrefix    string `json:"next_object_prefix"`
+	DirectoryMarker     string `json:"directory_marker"`
+	CompletionMarker    string `json:"completion_marker"`
+	NextIndex           int    `json:"next_index"`
+	ObjectCount         int    `json:"object_count"`
+	MaxObjects          int    `json:"max_objects"`
+	RemainingObjects    int    `json:"remaining_objects"`
+	AddressingStyleHint string `json:"addressing_style_hint,omitempty"`
 }
 
 // completedDirMarkerPattern matches a completion marker like
@@ -191,8 +207,71 @@ func uploadConversationExportShardsRotating(ctx context.Context, job *model.Conv
 		if err := finalizeRotationDir(ctx, client, setting, endpointURL, state, maxObjects); err != nil {
 			return fmt.Errorf("finalize rotation dir %s: %s", state.dirName, redactS3UploadError(err.Error(), setting))
 		}
+		next := nextRotationDir(state)
+		if err := ensureRotationDirMarker(ctx, client, setting, endpointURL, next.dirName); err != nil {
+			return fmt.Errorf("ensure next rotation dir %s: %s", next.dirName, redactS3UploadError(err.Error(), setting))
+		}
 	}
 	return nil
+}
+
+func GetConversationS3RotationStatus(ctx context.Context, setting conversation_log_setting.S3Setting) (ConversationS3RotationStatus, error) {
+	setting = normalizeConversationS3Setting(setting)
+	maxObjects := setting.RotationMaxObjects
+	if maxObjects <= 0 {
+		min, _ := conversation_log_setting.RotationMaxObjectsBounds()
+		maxObjects = min
+	}
+	base := conversation_log_setting.RotationBaseFromPrefix(setting.Prefix)
+	status := ConversationS3RotationStatus{
+		Enabled:         setting.Enabled,
+		RotationEnabled: setting.RotationEnabled,
+		BaseDir:         base,
+		NextDir:         rotationDirName(base, 1),
+		MaxObjects:      maxObjects,
+	}
+	status.NextObjectPrefix = status.NextDir + "/"
+	status.DirectoryMarker = status.NextObjectPrefix
+	status.CompletionMarker = fmt.Sprintf("%s-%d-completed/", status.NextDir, maxObjects)
+	status.RemainingObjects = maxObjects
+	if !setting.Enabled || !setting.RotationEnabled {
+		return status, nil
+	}
+	if err := validateConversationS3Setting(setting); err != nil {
+		return status, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	endpointURL, err := normalizeS3Endpoint(setting.Endpoint)
+	if err != nil {
+		return status, err
+	}
+	client := newConversationS3HTTPClient()
+	state, err := scanActiveRotationDir(ctx, client, setting, endpointURL, maxObjects)
+	if err != nil {
+		return status, fmt.Errorf("scan rotation directory: %s", redactS3UploadError(err.Error(), setting))
+	}
+	if err := ensureRotationDirMarker(ctx, client, setting, endpointURL, state.dirName); err != nil {
+		return status, fmt.Errorf("ensure next rotation dir %s: %s", state.dirName, redactS3UploadError(err.Error(), setting))
+	}
+	status.NextIndex = state.index
+	status.NextDir = state.dirName
+	status.NextObjectPrefix = state.dirName + "/"
+	status.DirectoryMarker = status.NextObjectPrefix
+	status.CompletionMarker = fmt.Sprintf("%s-%d-completed/", state.dirName, maxObjects)
+	status.ObjectCount = state.objectCount
+	status.RemainingObjects = maxObjects - state.objectCount
+	if status.RemainingObjects < 0 {
+		status.RemainingObjects = 0
+	}
+	if styles := s3UploadAddressingStyles(setting); len(styles) > 0 {
+		status.AddressingStyleHint = s3AddressingStyleName(styles[0])
+	}
+	return status, nil
 }
 
 func ensureRotationDirMarker(ctx context.Context, client *http.Client, setting conversation_log_setting.S3Setting, endpointURL *url.URL, dirName string) error {

@@ -750,6 +750,26 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		}
 	}
 
+	var deletedInvalid int64
+	if job.DeleteAfterExport && strings.TrimSpace(job.Trigger) == "auto" {
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"progress": "deleting invalid source records",
+		})
+		deleted, err := model.DeleteConversationLogsByInvalidValidationStatus(ctx, query, ConversationValidationValid, conversationExportDeleteBatchSize)
+		if err != nil {
+			return fmt.Errorf("delete invalid conversation logs after auto export: %w", err)
+		}
+		deletedInvalid = deleted
+		if deletedInvalid > 0 {
+			common.SysLog(fmt.Sprintf("auto export job: deleted %d invalid source record(s) for batch %s", deletedInvalid, job.JobId))
+		}
+	}
+
+	progress := fmt.Sprintf("done: %d shard(s), %d record(s)", len(state.shards), state.totalRecordCount)
+	if deletedInvalid > 0 {
+		progress += fmt.Sprintf(", %d invalid source record(s) deleted", deletedInvalid)
+	}
+
 	updateJobProgress(job.JobId, map[string]interface{}{
 		"manifest_path":       manifestPath,
 		"total_records":       recordsEligible,
@@ -760,7 +780,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		"compressed_bytes":    state.totalCompressed,
 		"shard_count":         len(state.shards),
 		"quality_report_json": qualityReportJSON,
-		"progress":            fmt.Sprintf("done: %d shard(s), %d record(s)", len(state.shards), state.totalRecordCount),
+		"progress":            progress,
 	})
 
 	return nil

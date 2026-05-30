@@ -654,6 +654,60 @@ func DeleteConversationLogsByQuery(ctx context.Context, query ConversationLogQue
 	return total, err
 }
 
+func DeleteConversationLogsByInvalidValidationStatus(ctx context.Context, query ConversationLogQuery, validStatus string, batchSize int) (int64, error) {
+	validStatus = strings.TrimSpace(validStatus)
+	if validStatus == "" {
+		return 0, nil
+	}
+	explicitStatus := strings.TrimSpace(query.ValidationStatus)
+	if explicitStatus == validStatus {
+		return 0, nil
+	}
+	query.ValidationStatus = ""
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+
+	var total int64
+	lastID := 0
+	for {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return total, err
+			}
+		}
+		var logs []*ConversationLog
+		db := applyConversationLogQuery(conversationLogDBWithContext(ctx).Model(&ConversationLog{}), query).
+			Select("id").
+			Where("id > ?", lastID)
+		if explicitStatus != "" {
+			db = db.Where("validation_status = ?", explicitStatus)
+		} else {
+			db = db.Where("(validation_status <> ? OR validation_status = ? OR validation_status IS NULL)", validStatus, "")
+		}
+		if err := db.Order("id asc").Limit(batchSize).Find(&logs).Error; err != nil {
+			return total, err
+		}
+		if len(logs) == 0 {
+			if total > 0 {
+				InvalidateConversationLogStatsCache()
+			}
+			return total, nil
+		}
+
+		ids := make([]int, 0, len(logs))
+		for _, log := range logs {
+			ids = append(ids, log.Id)
+		}
+		lastID = logs[len(logs)-1].Id
+		rows, err := DeleteConversationLogsByIDs(ids)
+		if err != nil {
+			return total, err
+		}
+		total += rows
+	}
+}
+
 func DeleteConversationLogsOlderThan(ctx context.Context, cutoffTimestamp int64, batchSize int) (int64, error) {
 	if cutoffTimestamp <= 0 {
 		return 0, nil

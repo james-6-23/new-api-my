@@ -277,6 +277,20 @@ func TestConversationLogS3Connection(c *gin.Context) {
 	common.ApiSuccess(c, result)
 }
 
+func GetConversationLogS3RotationStatus(c *gin.Context) {
+	var setting conversation_log_setting.S3Setting
+	if err := common.DecodeJson(c.Request.Body, &setting); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	result, err := service.GetConversationS3RotationStatus(c.Request.Context(), setting)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
 func parseConversationLogQuery(c *gin.Context) model.ConversationLogQuery {
 	startTimestamp, _ := strconv.ParseInt(firstQuery(c, "start_timestamp", "start_time"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(firstQuery(c, "end_timestamp", "end_time"), 10, 64)

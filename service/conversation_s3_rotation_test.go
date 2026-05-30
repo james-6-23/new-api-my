@@ -255,6 +255,35 @@ func TestScanActiveRotationDirPartialHighest(t *testing.T) {
 	require.Equal(t, 50, state.objectCount)
 }
 
+func TestGetConversationS3RotationStatusReportsNextDirectory(t *testing.T) {
+	f := &fakeS3{
+		listCommon: []string{"backup", "backup-2"},
+		tarGzByDir: map[string]int{"backup-2": 50},
+	}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	setting := newRotationTestSetting(server.URL, 200)
+	status, err := GetConversationS3RotationStatus(context.Background(), setting)
+	require.NoError(t, err)
+
+	require.True(t, status.Enabled)
+	require.True(t, status.RotationEnabled)
+	require.Equal(t, "backup", status.BaseDir)
+	require.Equal(t, "backup-2", status.NextDir)
+	require.Equal(t, "backup-2/", status.NextObjectPrefix)
+	require.Equal(t, "backup-2/", status.DirectoryMarker)
+	require.Equal(t, "backup-2-200-completed/", status.CompletionMarker)
+	require.Equal(t, 2, status.NextIndex)
+	require.Equal(t, 50, status.ObjectCount)
+	require.Equal(t, 200, status.MaxObjects)
+	require.Equal(t, 150, status.RemainingObjects)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.Contains(t, f.dirMarkerKeys, "backup-2/")
+}
+
 func TestScanActiveRotationDirSkipsLegacySubdirectoryLayout(t *testing.T) {
 	f := &fakeS3{
 		listCommon:   []string{"backup"},
@@ -369,6 +398,37 @@ func TestUploadRotatingCreatesNextDirectoryMarkerAfterCompletedHighest(t *testin
 	defer f.mu.Unlock()
 	require.Contains(t, f.dirMarkerKeys, "backup-10/")
 	require.Equal(t, []string{"backup-10/" + name}, f.putKeys)
+}
+
+func TestUploadRotatingCreatesNextDirectoryMarkerAfterFinalizingFullDir(t *testing.T) {
+	setupRotationTestDB(t)
+	f := &fakeS3{tarGzByDir: map[string]int{}}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	dir := t.TempDir()
+	shards := make([]TopManifestShard, 0, 2)
+	for i := 1; i <= 2; i++ {
+		name := fmt.Sprintf("conversation-logs-session-auto-shard%04d.tar.gz", i)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644))
+		shards = append(shards, TopManifestShard{Index: i, File: name})
+	}
+
+	job := newRotationTestJob(dir)
+	setting := newRotationTestSetting(server.URL, 2)
+
+	err := uploadConversationExportShardsRotating(context.Background(), job, shards, setting)
+	require.NoError(t, err)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.Contains(t, f.dirMarkerKeys, "backup/")
+	require.Contains(t, f.dirMarkerKeys, "backup-2/")
+	require.Equal(t, []string{
+		"backup/conversation-logs-session-auto-shard0001.tar.gz",
+		"backup/conversation-logs-session-auto-shard0002.tar.gz",
+	}, f.putKeys)
+	require.Contains(t, f.completedMarker, "backup-2-completed/")
 }
 
 func TestUploadRotatingRollsOverAndMarks(t *testing.T) {

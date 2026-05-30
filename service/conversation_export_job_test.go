@@ -148,12 +148,85 @@ func TestSessionProcessedSourceIDsAllowDeletingRejectedSessionRows(t *testing.T)
 	require.EqualValues(t, 0, remaining)
 }
 
+func TestAutoExportDeleteAfterRemovesInvalidRowsInScope(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	requestBody := `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`
+	responseBody := `{"choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"total_tokens":2}}`
+	now := int64(1710000000)
+
+	inScopeValid := &model.ConversationLog{
+		CreatedAt:        now + 1,
+		SessionId:        "sess_auto_valid",
+		Provider:         "openai",
+		RequestPath:      "/v1/chat/completions",
+		RequestBody:      requestBody,
+		ResponseBody:     responseBody,
+		RequestTime:      now + 1,
+		ResponseTime:     now + 2,
+		ValidationStatus: ConversationValidationValid,
+	}
+	inScopeInvalid := &model.ConversationLog{
+		CreatedAt:        now + 2,
+		SessionId:        "sess_auto_invalid",
+		Provider:         "openai",
+		RequestPath:      "/v1/chat/completions",
+		RequestBody:      requestBody,
+		ResponseBody:     "",
+		RequestTime:      now + 2,
+		ResponseTime:     now + 3,
+		ValidationStatus: ConversationValidationInvalid,
+		InvalidReason:    "response_body_empty",
+	}
+	outOfScopeInvalid := &model.ConversationLog{
+		CreatedAt:        now - 100,
+		SessionId:        "sess_outside",
+		Provider:         "openai",
+		RequestPath:      "/v1/chat/completions",
+		RequestBody:      requestBody,
+		ResponseBody:     "",
+		RequestTime:      now - 100,
+		ResponseTime:     now - 99,
+		ValidationStatus: ConversationValidationInvalid,
+		InvalidReason:    "response_body_empty",
+	}
+	require.NoError(t, model.CreateConversationLog(inScopeValid))
+	require.NoError(t, model.CreateConversationLog(inScopeInvalid))
+	require.NoError(t, model.CreateConversationLog(outOfScopeInvalid))
+
+	filter := model.ConversationLogQuery{StartTime: now, EndTime: now + 10}
+	filterJSON, err := common.Marshal(filter)
+	require.NoError(t, err)
+	outputDir := filepath.Join(t.TempDir(), "export")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	job := &model.ConversationExportJob{
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		JobId:             "job-auto-invalid-cleanup",
+		Mode:              conversation_log_setting.ExportModeSessionJSONL,
+		FilterJSON:        string(filterJSON),
+		ShardTargetBytes:  1 << 30,
+		ShardMaxBytes:     1 << 30,
+		DeleteAfterExport: true,
+		Status:            model.ConversationExportJobStatusRunning,
+		OutputDirectory:   outputDir,
+		Trigger:           "auto",
+	}
+	require.NoError(t, model.CreateConversationExportJob(job))
+
+	require.NoError(t, executeExportJob(context.Background(), job))
+
+	var remaining []*model.ConversationLog
+	require.NoError(t, model.LOG_DB.Order("id asc").Find(&remaining).Error)
+	require.Len(t, remaining, 1)
+	require.Equal(t, outOfScopeInvalid.SessionId, remaining[0].SessionId)
+}
+
 func setupConversationExportJobTestDB(t *testing.T) {
 	t.Helper()
 	previous := model.LOG_DB
 	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "conversation-export-job.db")), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.ConversationLog{}))
+	require.NoError(t, db.AutoMigrate(&model.ConversationLog{}, &model.ConversationExportJob{}))
 	model.LOG_DB = db
 	t.Cleanup(func() {
 		model.LOG_DB = previous

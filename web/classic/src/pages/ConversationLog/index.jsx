@@ -211,6 +211,8 @@ const ConversationLog = () => {
   const [tableLoading, setTableLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [s3Testing, setS3Testing] = useState(false);
+  const [s3RotationStatusLoading, setS3RotationStatusLoading] = useState(false);
+  const [s3RotationStatus, setS3RotationStatus] = useState(null);
   const [exportLoading, setExportLoading] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [mode, setMode] = useState('session_jsonl');
@@ -235,6 +237,38 @@ const ConversationLog = () => {
 
   const getFilterParams = () =>
     normalizeFilterParams(filterFormRef.current?.getValues() || {});
+
+  const loadS3RotationStatus = async (notify = false, s3Override = null) => {
+    const formValues = settingsFormRef.current?.getValues?.() || {};
+    const s3 = {
+      ...settings.s3,
+      ...(formValues.s3 || {}),
+      ...(s3Override || {}),
+    };
+    if (!s3.enabled || !s3.rotation_enabled) {
+      setS3RotationStatus(null);
+      return;
+    }
+    setS3RotationStatusLoading(true);
+    try {
+      const res = await API.post('/api/conversation_logs/s3/rotation_status', s3, {
+        disableDuplicate: true,
+      });
+      const { success, message, data } = res.data;
+      if (!success) {
+        showError(message);
+        return;
+      }
+      setS3RotationStatus(data || null);
+      if (notify) {
+        showSuccess(t('刷新成功'));
+      }
+    } catch (error) {
+      showError(error.message || t('刷新失败'));
+    } finally {
+      setS3RotationStatusLoading(false);
+    }
+  };
 
   const loadSummary = async () => {
     setSummaryLoading(true);
@@ -268,6 +302,7 @@ const ConversationLog = () => {
           ),
         };
         settingsFormRef.current?.setValues(formValues);
+        void loadS3RotationStatus(false, nextSettings.s3);
       } else {
         showError(summaryRes.data.message);
       }
@@ -379,6 +414,9 @@ const ConversationLog = () => {
         return;
       }
       showSuccess(t('S3 连接测试成功'));
+      if (s3.rotation_enabled) {
+        void loadS3RotationStatus(false, s3);
+      }
       if (data?.cleanup_error) {
         showWarning(
           `${t('测试对象清理失败')}: ${data.cleanup_error}`,
@@ -495,6 +533,7 @@ const ConversationLog = () => {
   };
 
   const updateS3 = (key, value) => {
+    setS3RotationStatus(null);
     setSettings((prev) => ({
       ...prev,
       s3: {
@@ -1632,6 +1671,49 @@ const ConversationLog = () => {
                         }
                       />
                     </Col>
+                    {settings.s3?.enabled && settings.s3?.rotation_enabled && (
+                      <Col xs={24}>
+                        <div
+                          className='flex flex-col md:flex-row md:items-center md:justify-between gap-2 rounded-md border px-3 py-2'
+                          style={{
+                            borderColor: 'var(--semi-color-border)',
+                            background: 'var(--semi-color-fill-0)',
+                          }}
+                        >
+                          <Space wrap>
+                            <Text strong>{t('下一次上传目录')}</Text>
+                            {s3RotationStatus?.next_dir ? (
+                              <Tag color='blue' size='large'>
+                                {s3RotationStatus.next_object_prefix ||
+                                  `${s3RotationStatus.next_dir}/`}
+                              </Tag>
+                            ) : (
+                              <Text type='tertiary'>
+                                {t('点击刷新获取当前 S3 目录状态')}
+                              </Text>
+                            )}
+                            {s3RotationStatus && (
+                              <Text type='tertiary'>
+                                {`${t('已用')} ${s3RotationStatus.object_count || 0}/${s3RotationStatus.max_objects || 0}，${t('剩余')} ${s3RotationStatus.remaining_objects || 0}`}
+                              </Text>
+                            )}
+                            {s3RotationStatus?.completion_marker && (
+                              <Text type='tertiary'>
+                                {`${t('满后标记')}: ${s3RotationStatus.completion_marker}`}
+                              </Text>
+                            )}
+                          </Space>
+                          <Button
+                            size='small'
+                            icon={<IconRefresh />}
+                            loading={s3RotationStatusLoading}
+                            onClick={() => loadS3RotationStatus(true)}
+                          >
+                            {t('刷新')}
+                          </Button>
+                        </div>
+                      </Col>
+                    )}
                   </Row>
                 </Form>
               </Spin>
