@@ -2,6 +2,7 @@ package conversation_log_setting
 
 import (
 	"path/filepath"
+	"strings"
 
 	"github.com/QuantumNous/new-api/setting/config"
 )
@@ -20,6 +21,18 @@ const (
 	defaultAutoExportThresholdBytes = int64(10) << 30
 	defaultAutoExportShardMaxBytes  = int64(10) << 30
 	defaultAutoExportCheckInterval  = 300 // seconds (5 minutes)
+
+	// S3 rotation defaults. When rotation is enabled, export artifacts are
+	// uploaded flat (tar.gz only, no per-job subdirectory and no manifest.json)
+	// into a rotating set of directories derived from the S3 object prefix:
+	// {prefix}, {prefix}-2, {prefix}-3, ... Each directory accepts at most
+	// RotationMaxObjects tar.gz files before the uploader rolls over to the next
+	// one and drops a "{dir}-{count}-completed/" marker object so operators can
+	// see the directory is finished at a glance.
+	defaultS3RotationBaseDir    = "backup"
+	defaultS3RotationMaxObjects = 200
+	minS3RotationMaxObjects     = 1
+	maxS3RotationMaxObjects     = 100000
 )
 
 type S3Setting struct {
@@ -30,6 +43,17 @@ type S3Setting struct {
 	AccessKey string `json:"access_key"`
 	SecretKey string `json:"secret_key"`
 	Prefix    string `json:"prefix"`
+
+	// RotationEnabled switches the upload layout from the legacy
+	// "{prefix}/{job-dir}/{manifest.json + shards}" scheme to a flat rotating
+	// scheme: each shard tar.gz is uploaded directly into a rotating directory
+	// derived from the prefix ("{prefix}", "{prefix}-2", "{prefix}-3", ...), with
+	// no per-job subdirectory and no manifest.json. When false, upload behaviour
+	// is unchanged (fully backward compatible).
+	RotationEnabled bool `json:"rotation_enabled"`
+	// RotationMaxObjects is the max number of tar.gz objects a single rotation
+	// directory holds before rolling over to the next one.
+	RotationMaxObjects int `json:"rotation_max_objects"`
 }
 
 type ConversationLogSetting struct {
@@ -120,6 +144,8 @@ func GetSetting() ConversationLogSetting {
 	if setting.AutoExportCheckIntervalSeconds <= 0 {
 		setting.AutoExportCheckIntervalSeconds = defaultAutoExportCheckInterval
 	}
+
+	setting.S3.RotationMaxObjects = clampRotationMaxObjects(setting.S3.RotationMaxObjects)
 	return setting
 }
 
@@ -141,4 +167,30 @@ func clampShardBytes(value, fallback int64) int64 {
 
 func ShardBytesBounds() (min, max int64) {
 	return minShardBytes, maxShardBytes
+}
+
+// RotationBaseFromPrefix derives the rotation base directory from the S3 object
+// prefix: when rotation is enabled the prefix itself is used as the base name
+// (trailing slashes trimmed). When the prefix is empty it falls back to the
+// default ("backup"). Examples: "backup/" -> "backup", "" -> "backup",
+// "exports/conversation/" -> "exports/conversation".
+func RotationBaseFromPrefix(prefix string) string {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	if prefix == "" {
+		return defaultS3RotationBaseDir
+	}
+	return prefix
+}
+
+func clampRotationMaxObjects(value int) int {
+	if value < minS3RotationMaxObjects || value > maxS3RotationMaxObjects {
+		return defaultS3RotationMaxObjects
+	}
+	return value
+}
+
+// RotationMaxObjectsBounds exposes the valid [min, max] range so the controller
+// can validate operator input before persisting the setting.
+func RotationMaxObjectsBounds() (min, max int) {
+	return minS3RotationMaxObjects, maxS3RotationMaxObjects
 }

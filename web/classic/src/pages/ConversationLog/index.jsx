@@ -83,6 +83,8 @@ const defaultSettings = {
     access_key: '',
     secret_key: '',
     prefix: '',
+    rotation_enabled: false,
+    rotation_max_objects: 200,
   },
   auto_export_enabled: false,
   auto_export_threshold_bytes: 10 * 1024 * 1024 * 1024,
@@ -1593,6 +1595,41 @@ const ConversationLog = () => {
                         mode='password'
                         disabled={!settings.s3?.enabled}
                         onChange={(value) => updateS3('secret_key', value)}
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='s3.rotation_enabled'
+                        label={t('启用目录轮换')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          '开启后仅上传 tar.gz（不含子目录与 manifest.json），以「S3 对象前缀」为基名按 前缀、前缀-2、前缀-3 … 轮换',
+                        )}
+                        disabled={!settings.s3?.enabled}
+                        onChange={(value) => updateS3('rotation_enabled', value)}
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='s3.rotation_max_objects'
+                        label={t('每个目录最多 tar.gz 个数')}
+                        min={1}
+                        max={100000}
+                        step={1}
+                        precision={0}
+                        style={{ width: '100%' }}
+                        extraText={t(
+                          '达到该数量后轮换到下一目录，并将满目录标记为 *-个数-completed',
+                        )}
+                        disabled={
+                          !settings.s3?.enabled || !settings.s3?.rotation_enabled
+                        }
+                        onChange={(value) =>
+                          updateS3('rotation_max_objects', value)
+                        }
                       />
                     </Col>
                   </Row>

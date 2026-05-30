@@ -184,6 +184,16 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		}
 	}
 	if req.S3 != nil {
+		// Validate rotation knobs before persisting. RotationMaxObjects == 0 means
+		// "unset" and falls back to the default in GetSetting(); only reject values
+		// explicitly out of the supported range.
+		if req.S3.RotationMaxObjects != 0 {
+			minObj, maxObj := conversation_log_setting.RotationMaxObjectsBounds()
+			if req.S3.RotationMaxObjects < minObj || req.S3.RotationMaxObjects > maxObj {
+				common.ApiErrorMsg(c, fmt.Sprintf("s3.rotation_max_objects must be in [%d, %d]", minObj, maxObj))
+				return
+			}
+		}
 		data, err := common.Marshal(req.S3)
 		if err != nil {
 			common.ApiError(c, err)

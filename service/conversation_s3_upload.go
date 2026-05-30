@@ -88,6 +88,9 @@ func uploadConversationExportArtifactsToS3(ctx context.Context, job *model.Conve
 	if err := validateConversationS3Setting(setting); err != nil {
 		return err
 	}
+	if setting.RotationEnabled {
+		return uploadConversationExportShardsRotating(ctx, job, shards, setting)
+	}
 	targets := make([]s3UploadTarget, 0, len(shards)+1)
 	targets = append(targets, newS3UploadTarget(setting.Prefix, job.OutputDirectory, manifestPath))
 	for _, shard := range shards {
