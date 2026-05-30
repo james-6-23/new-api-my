@@ -304,6 +304,97 @@ func TestScanActiveRotationDirSkipsLegacySubdirectoryLayout(t *testing.T) {
 	require.Equal(t, 0, state.objectCount)
 }
 
+func TestScanActiveRotationDirIgnoresStaleEmptyMarkersAfterLegacyLayout(t *testing.T) {
+	f := &fakeS3{
+		listCommon: []string{"backup", "backup-2", "backup-3", "backup-4", "backup-5", "backup-6", "backup-7", "backup-8"},
+		tarGzByDir: map[string]int{
+			"backup":   0,
+			"backup-2": 0,
+			"backup-3": 0,
+			"backup-4": 0,
+			"backup-5": 0,
+			"backup-6": 0,
+			"backup-7": 0,
+			"backup-8": 0,
+		},
+		subdirsByDir: map[string][]string{"backup": {"backup/legacy-job-1", "backup/legacy-job-2"}},
+	}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	setting := normalizeConversationS3Setting(newRotationTestSetting(server.URL, 200))
+	endpointURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	state, err := scanActiveRotationDir(context.Background(), server.Client(), setting, endpointURL, 200)
+	require.NoError(t, err)
+	require.Equal(t, 2, state.index)
+	require.Equal(t, "backup-2", state.dirName)
+	require.Equal(t, 0, state.objectCount)
+}
+
+func TestScanActiveRotationDirIgnoresStaleEmptyMarkersAfterPartialDir(t *testing.T) {
+	f := &fakeS3{
+		listCommon: []string{"backup", "backup-2", "backup-3", "backup-4"},
+		tarGzByDir: map[string]int{
+			"backup":   200,
+			"backup-2": 50,
+			"backup-3": 0,
+			"backup-4": 0,
+		},
+	}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	setting := normalizeConversationS3Setting(newRotationTestSetting(server.URL, 200))
+	endpointURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	state, err := scanActiveRotationDir(context.Background(), server.Client(), setting, endpointURL, 200)
+	require.NoError(t, err)
+	require.Equal(t, 2, state.index)
+	require.Equal(t, "backup-2", state.dirName)
+	require.Equal(t, 50, state.objectCount)
+}
+
+func TestScanActiveRotationDirContinuesSparsePartialDirectory(t *testing.T) {
+	f := &fakeS3{
+		listCommon: []string{"backup-4"},
+		tarGzByDir: map[string]int{"backup-4": 50},
+	}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	setting := normalizeConversationS3Setting(newRotationTestSetting(server.URL, 200))
+	endpointURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	state, err := scanActiveRotationDir(context.Background(), server.Client(), setting, endpointURL, 200)
+	require.NoError(t, err)
+	require.Equal(t, 4, state.index)
+	require.Equal(t, "backup-4", state.dirName)
+	require.Equal(t, 50, state.objectCount)
+}
+
+func TestScanActiveRotationDirRollsOverSparseFullDirectory(t *testing.T) {
+	f := &fakeS3{
+		listCommon: []string{"backup-4"},
+		tarGzByDir: map[string]int{"backup-4": 200},
+	}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	setting := normalizeConversationS3Setting(newRotationTestSetting(server.URL, 200))
+	endpointURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	state, err := scanActiveRotationDir(context.Background(), server.Client(), setting, endpointURL, 200)
+	require.NoError(t, err)
+	require.Equal(t, 5, state.index)
+	require.Equal(t, "backup-5", state.dirName)
+	require.Equal(t, 0, state.objectCount)
+}
+
 func TestScanActiveRotationDirSkipsCompletedDirectoryEvenBelowCurrentCap(t *testing.T) {
 	f := &fakeS3{
 		listCommon: []string{"backup", "backup-2", "backup-2-200-completed"},

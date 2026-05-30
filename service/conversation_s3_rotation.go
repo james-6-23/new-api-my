@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -427,12 +428,13 @@ func scanActiveRotationDir(ctx context.Context, client *http.Client, setting con
 		return rotationDirState{}, err
 	}
 
-	// Find rotation directories and completion markers separately. A completion
-	// marker seals that ordinal forever, even if the object count later drops or
-	// the configured max object count is raised.
-	directories := make(map[int]struct{})
+	// Find rotation directories and completion markers separately. Empty
+	// directory markers alone do not prove that rotation has advanced; object
+	// store consoles can leave stale zero-byte "folders" behind. We only treat a
+	// directory as occupied when it contains direct tar.gz objects or legacy
+	// subdirectories.
+	directories := make([]int, 0)
 	highestCompleted := 0
-	completed := make(map[int]struct{})
 	for _, cp := range commonPrefixes {
 		dirName := strings.Trim(cp, "/")
 		if dirName == "" {
@@ -441,7 +443,6 @@ func scanActiveRotationDir(ctx context.Context, client *http.Client, setting con
 		if completedDirMarkerRegexp.MatchString(dirName) {
 			// e.g. "backup-2-200-completed" -> mark ordinal 2 as completed.
 			if ord, ok := completedMarkerOrdinal(base, dirName); ok {
-				completed[ord] = struct{}{}
 				if ord > highestCompleted {
 					highestCompleted = ord
 				}
@@ -449,55 +450,41 @@ func scanActiveRotationDir(ctx context.Context, client *http.Client, setting con
 			continue
 		}
 		if ord, ok := rotationDirOrdinal(base, dirName); ok {
-			directories[ord] = struct{}{}
+			directories = append(directories, ord)
 		}
 	}
 
-	// Pick the highest writable directory after the highest sealed ordinal.
-	highestWritable := 0
-	for ord := range directories {
+	sort.Sort(sort.Reverse(sort.IntSlice(directories)))
+	for _, ord := range directories {
 		if ord <= highestCompleted {
 			continue
 		}
-		if _, done := completed[ord]; done {
+		dir := rotationDirName(base, ord)
+		inspection, err := inspectS3RotationDir(ctx, client, setting, endpointURL, dir+"/")
+		if err != nil {
+			return rotationDirState{}, err
+		}
+		if inspection.tarGzCount == 0 && !inspection.hasSubdirectory {
 			continue
 		}
-		if ord > highestWritable {
-			highestWritable = ord
+		state := rotationDirState{index: ord, dirName: dir, objectCount: inspection.tarGzCount}
+		// A pre-rotation backup directory may contain legacy per-job
+		// subdirectories instead of root-level tar.gz files. Treat that layout as
+		// occupied and start the new flat tar.gz rotation in the next ordinal.
+		if inspection.tarGzCount == 0 && inspection.hasSubdirectory {
+			return nextRotationDir(state), nil
 		}
-	}
-
-	// No writable rotation directory yet: start after the latest completed marker
-	// (or at ordinal 1 for a new bucket).
-	if highestWritable == 0 {
-		start := highestCompleted + 1
-		if start < 1 {
-			start = 1
+		if inspection.tarGzCount >= maxObjects {
+			return nextRotationDir(state), nil
 		}
-		return rotationDirState{index: start, dirName: rotationDirName(base, start), objectCount: 0}, nil
-	}
-
-	// Count tar.gz objects in the highest directory.
-	highestDir := rotationDirName(base, highestWritable)
-	inspection, err := inspectS3RotationDir(ctx, client, setting, endpointURL, highestDir+"/")
-	if err != nil {
-		return rotationDirState{}, err
-	}
-
-	state := rotationDirState{index: highestWritable, dirName: highestDir, objectCount: inspection.tarGzCount}
-	// A pre-rotation backup directory may contain legacy per-job subdirectories
-	// instead of root-level tar.gz files. Treat that layout as occupied and start
-	// the new flat tar.gz rotation in the next ordinal, e.g. backup-2.
-	if inspection.tarGzCount == 0 && inspection.hasSubdirectory {
-		state = nextRotationDir(state)
 		return state, nil
 	}
-	// If the highest directory is already at/over the cap, advance to the next
-	// empty one so the caller doesn't immediately have to roll over.
-	if inspection.tarGzCount >= maxObjects {
-		state = nextRotationDir(state)
+
+	start := highestCompleted + 1
+	if start < 1 {
+		start = 1
 	}
-	return state, nil
+	return rotationDirState{index: start, dirName: rotationDirName(base, start), objectCount: 0}, nil
 }
 
 // completedMarkerOrdinal extracts the directory ordinal from a completion marker
