@@ -136,16 +136,17 @@ func BuildConversationLogH2Preflight(ctx context.Context, query model.Conversati
 		if !ok {
 			return acc.finalize(), nil
 		}
-		err := model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
+		err := forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 			if err := conversationContextErr(ctx); err != nil {
 				return err
 			}
 			for _, item := range logs {
-				if !ValidateAPIRecord(item).Exportable {
+				prepared := prepareConversationExportLog(item)
+				if !prepared.validation.Exportable {
 					continue
 				}
 				acc.report.CheckedRecords++
-				result := checkAPIHijackRecordH2(item)
+				result := checkAPIHijackPreparedRecordH2(item, &prepared)
 				acc.addCheck(ConversationH2Failure{
 					ID:        fmt.Sprintf("record:%d", item.Id),
 					RecordID:  item.Id,
@@ -379,19 +380,23 @@ func forEachPreflightSessionCandidate(ctx context.Context, query model.Conversat
 	if !ok {
 		return stats, nil
 	}
-	err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
+	err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := conversationContextErr(ctx); err != nil {
 			return err
 		}
 		for _, item := range logs {
-			if !ValidateAPIRecord(item).Exportable || item.SessionId == "" {
+			prepared := prepareConversationExportLog(item)
+			if !prepared.validation.Exportable || item.SessionId == "" {
 				continue
 			}
 			record := sessionBucketRecord{
 				ID:           item.Id,
 				SessionID:    item.SessionId,
 				Provider:     item.Provider,
-				RequestBody:  effectiveConversationRequestBody(item),
+				RelayFormat:  item.RelayFormat,
+				FinalFormat:  item.FinalRequestFormat,
+				RequestPath:  item.RequestPath,
+				RequestBody:  prepared.EffectiveRequestBody(),
 				ResponseBody: item.ResponseBody,
 				RequestTime:  item.RequestTime,
 				ResponseTime: item.ResponseTime,
@@ -455,13 +460,21 @@ func checkAPIHijackRecordH2(log *model.ConversationLog) h2CheckResult {
 	if log == nil {
 		return h2CheckResult{}
 	}
-	requestBody := effectiveConversationRequestBody(log)
+	prepared := prepareConversationExportLog(log)
+	return checkAPIHijackPreparedRecordH2(log, &prepared)
+}
+
+func checkAPIHijackPreparedRecordH2(log *model.ConversationLog, prepared *conversationExportPreparedLog) h2CheckResult {
+	if log == nil || prepared == nil {
+		return h2CheckResult{}
+	}
+	requestBody := prepared.EffectiveRequestBody()
 	var request map[string]interface{}
 	if err := common.Unmarshal([]byte(requestBody), &request); err != nil {
 		return h2CheckResult{}
 	}
 	var response map[string]interface{}
-	_ = common.Unmarshal([]byte(log.ResponseBody), &response)
+	response = prepared.parsed.Response
 
 	systemPrompt := extractSystemPrompt(request)
 	messages := make([]SessionMessage, 0)
@@ -651,10 +664,12 @@ func effectiveConversationRequestBody(log *model.ConversationLog) string {
 	if log == nil {
 		return ""
 	}
-	return completeConversationRequestBody(
+	parsed := parseConversationAPIRecordBodies(log)
+	return completeConversationRequestBodyParsed(
 		log.Provider,
 		strings.TrimSpace(log.RequestBody),
-		log.ResponseBody,
+		parsed.Request,
+		parsed.Response,
 		log.ClientRequestBody,
 		log.UpstreamRequestBody,
 	)
@@ -671,8 +686,15 @@ func completeConversationRequestBody(provider, requestBody, responseBody string,
 	}
 	var response map[string]interface{}
 	_ = common.Unmarshal([]byte(responseBody), &response)
+	return completeConversationRequestBodyParsed(provider, requestBody, request, response, extraRequestBodies...)
+}
 
+func completeConversationRequestBodyParsed(provider, requestBody string, request map[string]interface{}, response map[string]interface{}, extraRequestBodies ...string) string {
 	toolsByName := make(map[string]SessionTool)
+	requestBody = strings.TrimSpace(requestBody)
+	if requestBody == "" || request == nil {
+		return requestBody
+	}
 	for _, tool := range extractAllSessionTools(request, provider) {
 		mergeSessionToolDefinition(toolsByName, tool)
 	}

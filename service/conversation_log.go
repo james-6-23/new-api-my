@@ -307,6 +307,10 @@ func cleanupConversationLogs(ctx context.Context) {
 }
 
 func ValidateAPIRecord(log *model.ConversationLog) ConversationAPIValidation {
+	return validateAPIRecordParsed(log, parseConversationAPIRecordBodies(log))
+}
+
+func validateAPIRecordParsed(log *model.ConversationLog, parsed conversationAPIRecordParsedBodies) ConversationAPIValidation {
 	result := ConversationAPIValidation{Reasons: make([]string, 0)}
 	if log == nil {
 		result.Reasons = append(result.Reasons, "record_nil")
@@ -318,38 +322,32 @@ func ValidateAPIRecord(log *model.ConversationLog) ConversationAPIValidation {
 	if strings.TrimSpace(log.ResponseBody) == "" {
 		result.Reasons = append(result.Reasons, "response_body_empty")
 	}
-	if looksLikeRawSSE(log.ResponseBody) {
+	if parsed.ResponseLooksLikeSSE {
 		result.Reasons = append(result.Reasons, "raw_sse_response")
 	}
 
-	var request map[string]interface{}
-	if strings.TrimSpace(log.RequestBody) != "" {
-		if err := common.Unmarshal([]byte(log.RequestBody), &request); err != nil {
-			result.Reasons = append(result.Reasons, "request_body_invalid_json")
-		}
+	if strings.TrimSpace(log.RequestBody) != "" && parsed.RequestErr != nil {
+		result.Reasons = append(result.Reasons, "request_body_invalid_json")
 	}
-	var response map[string]interface{}
-	if strings.TrimSpace(log.ResponseBody) != "" && !looksLikeRawSSE(log.ResponseBody) {
-		if err := common.Unmarshal([]byte(log.ResponseBody), &response); err != nil {
-			result.Reasons = append(result.Reasons, "response_body_invalid_json")
-		}
+	if strings.TrimSpace(log.ResponseBody) != "" && !parsed.ResponseLooksLikeSSE && parsed.ResponseErr != nil {
+		result.Reasons = append(result.Reasons, "response_body_invalid_json")
 	}
 
-	if request != nil {
-		result.HasModel = strings.TrimSpace(asString(request["model"])) != ""
+	if parsed.Request != nil {
+		result.HasModel = strings.TrimSpace(asString(parsed.Request["model"])) != ""
 		if !result.HasModel {
 			result.Reasons = append(result.Reasons, "request_model_missing")
 		}
-		result.HasMessages = requestHasConversationField(request)
+		result.HasMessages = requestHasConversationField(parsed.Request)
 		if !result.HasMessages {
 			result.Reasons = append(result.Reasons, "request_conversation_missing")
 		}
-		result.HasTools = len(asSlice(request["tools"])) > 0 || len(extractGeminiToolDecls(request)) > 0
+		result.HasTools = len(asSlice(parsed.Request["tools"])) > 0 || len(extractGeminiToolDecls(parsed.Request)) > 0
 	}
-	if response != nil {
-		_, result.HasUsage = response["usage"]
+	if parsed.Response != nil {
+		_, result.HasUsage = parsed.Response["usage"]
 		if !result.HasUsage {
-			_, result.HasUsage = response["usageMetadata"]
+			_, result.HasUsage = parsed.Response["usageMetadata"]
 		}
 	}
 	if log.RequestTime <= 0 {
@@ -423,10 +421,11 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	validRecords := make([]*model.ConversationLog, 0)
 	overflowed := false
 
-	err := model.ForEachConversationLog(ctx, query, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
+	err := forEachConversationExportLog(ctx, query, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
 			summary.TotalCapturedRecords++
-			validation := ValidateAPIRecord(item)
+			prepared := prepareConversationExportLog(item)
+			validation := prepared.validation
 			if validation.Exportable && item.ValidationStatus == ConversationValidationValid {
 				summary.APIExportableRecords++
 				if !overflowed {
@@ -494,15 +493,16 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 		if !ok {
 			return exportedIDs, summary, nil
 		}
-		err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
+		err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 			for _, item := range logs {
-				if !ValidateAPIRecord(item).Exportable {
+				prepared := prepareConversationExportLog(item)
+				if !prepared.validation.Exportable {
 					continue
 				}
 				record := StrictAPIRecord{
 					SessionID:    item.SessionId,
 					Provider:     item.Provider,
-					RequestBody:  effectiveConversationRequestBody(item),
+					RequestBody:  prepared.EffectiveRequestBody(),
 					ResponseBody: item.ResponseBody,
 					RequestTime:  item.RequestTime,
 					ResponseTime: item.ResponseTime,
@@ -533,9 +533,11 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 	if !ok {
 		return exportedIDs, summary, nil
 	}
-	err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
+	err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
-			if ValidateAPIRecord(item).Exportable {
+			prepared := prepareConversationExportLog(item)
+			if prepared.validation.Exportable {
+				item.RequestBody = prepared.EffectiveRequestBody()
 				validRecords = append(validRecords, item)
 			}
 		}

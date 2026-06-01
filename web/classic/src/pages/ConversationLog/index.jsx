@@ -93,6 +93,9 @@ const defaultSettings = {
   auto_export_directory: 'data/conversation_exports/auto',
   auto_export_check_interval_seconds: 300,
   auto_export_delete_after: true,
+  export_scan_batch_size: 5000,
+  export_mark_batch_size: 2000,
+  export_delete_batch_size: 2000,
 };
 
 const formInitValues = {
@@ -108,6 +111,8 @@ const formInitValues = {
   exported: '',
 };
 
+const defaultBatchSizeBounds = { min: 100, max: 10000 };
+
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -118,6 +123,80 @@ function formatBytes(bytes) {
     unitIndex += 1;
   }
   return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatInteger(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function clampBatchSize(value, bounds = defaultBatchSizeBounds) {
+  const number = Number(value || 0);
+  const min = Number(bounds?.min || defaultBatchSizeBounds.min);
+  const max = Number(bounds?.max || defaultBatchSizeBounds.max);
+  if (!Number.isFinite(number)) return min;
+  return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function normalizeBatchRecommendation(recommendation) {
+  if (!recommendation) return null;
+  const bounds = {
+    min: Number(recommendation.min_batch_size || defaultBatchSizeBounds.min),
+    max: Number(recommendation.max_batch_size || defaultBatchSizeBounds.max),
+  };
+  return {
+    level: recommendation.level || 'small',
+    reason: recommendation.reason || '',
+    databaseType: recommendation.database_type || '',
+    sqliteLimited: recommendation.sqlite_limited === true,
+    recordCount: Number(recommendation.record_count || 0),
+    storageBytes: Number(recommendation.storage_bytes || 0),
+    averageRecordBytes: Number(recommendation.average_record_bytes || 0),
+    scan: clampBatchSize(recommendation.scan_batch_size, bounds),
+    mark: clampBatchSize(recommendation.mark_batch_size, bounds),
+    delete: clampBatchSize(recommendation.delete_batch_size, bounds),
+  };
+}
+
+function getExportBatchRecommendation(summary) {
+  const records = Number(summary?.record_count || 0);
+  const storageBytes = Number(summary?.storage_bytes || 0);
+  const avgBytes = records > 0 ? storageBytes / records : 0;
+  const gb = storageBytes / 1024 / 1024 / 1024;
+
+  if (records >= 5000000 || gb >= 100 || avgBytes >= 512 * 1024) {
+    return {
+      level: 'extra_large',
+      reason: avgBytes >= 512 * 1024 ? 'large_record_body' : 'large_log_table',
+      scan: avgBytes >= 512 * 1024 ? 1500 : 3000,
+      mark: 2000,
+      delete: 2000,
+    };
+  }
+  if (records >= 1000000 || gb >= 30 || avgBytes >= 256 * 1024) {
+    return {
+      level: 'large',
+      reason: avgBytes >= 256 * 1024 ? 'large_record_body' : 'large_log_table',
+      scan: avgBytes >= 256 * 1024 ? 2500 : 5000,
+      mark: 3000,
+      delete: 3000,
+    };
+  }
+  if (records >= 100000 || gb >= 5 || avgBytes >= 64 * 1024) {
+    return {
+      level: 'medium',
+      reason: avgBytes >= 64 * 1024 ? 'large_record_body' : 'medium_log_table',
+      scan: avgBytes >= 64 * 1024 ? 4000 : 7000,
+      mark: 4000,
+      delete: 4000,
+    };
+  }
+  return {
+    level: 'small',
+    reason: 'small_log_table',
+    scan: 8000,
+    mark: 5000,
+    delete: 5000,
+  };
 }
 
 function formatCreatedAt(timestamp) {
@@ -218,6 +297,10 @@ const ConversationLog = () => {
   const [mode, setMode] = useState('session_jsonl');
   const [settings, setSettings] = useState(defaultSettings);
   const [summary, setSummary] = useState(null);
+  const [batchRecommendationHint, setBatchRecommendationHint] = useState(null);
+  const [batchSizeBounds, setBatchSizeBounds] = useState(
+    defaultBatchSizeBounds,
+  );
   const [exportSummary, setExportSummary] = useState(null);
   const [exportSummaryLoading, setExportSummaryLoading] = useState(false);
   const [logs, setLogs] = useState([]);
@@ -234,9 +317,64 @@ const ConversationLog = () => {
       ? exportSummary?.session_exportable_sessions || 0
       : exportSummary?.api_exportable_records || 0
     : 0;
+  const batchRecommendation = useMemo(
+    () =>
+      normalizeBatchRecommendation(batchRecommendationHint) ||
+      getExportBatchRecommendation(summary),
+    [batchRecommendationHint, summary],
+  );
+  const avgRecordBytes =
+    batchRecommendation.averageRecordBytes ||
+    (summary?.record_count > 0
+      ? Math.round((summary?.storage_bytes || 0) / summary.record_count)
+      : 0);
+  const batchRecommendationLevelLabel =
+    {
+      small: t('轻量数据'),
+      medium: t('中等数据'),
+      large: t('大型数据'),
+      extra_large: t('超大数据'),
+    }[batchRecommendation.level] || t('轻量数据');
+  const batchRecommendationReason =
+    batchRecommendation.sqliteLimited ||
+    batchRecommendation.reason === 'sqlite_parameter_limit'
+      ? t('SQLite 对单条 SQL 参数数量更敏感，标记和删除批次已推荐为保守值。')
+      : batchRecommendation.level === 'small'
+        ? t('当前记录量和存储占用较低，可以使用更大的批处理减少数据库往返。')
+        : batchRecommendation.reason === 'large_record_body' ||
+            avgRecordBytes >= 256 * 1024
+          ? t('平均单条记录较大，建议降低扫描批次，避免单批加载过多正文。')
+          : t(
+              '当前记录量或存储占用较高，建议提高标记和删除批次，减少批量操作往返。',
+            );
+  const currentBatchSettings = {
+    scan: Number(settings.export_scan_batch_size || 0),
+    mark: Number(settings.export_mark_batch_size || 0),
+    delete: Number(settings.export_delete_batch_size || 0),
+  };
+  const isUsingRecommendedBatch =
+    currentBatchSettings.scan === batchRecommendation.scan &&
+    currentBatchSettings.mark === batchRecommendation.mark &&
+    currentBatchSettings.delete === batchRecommendation.delete;
 
   const getFilterParams = () =>
     normalizeFilterParams(filterFormRef.current?.getValues() || {});
+
+  const applyBatchRecommendation = () => {
+    const nextSettings = {
+      ...settings,
+      export_scan_batch_size: batchRecommendation.scan,
+      export_mark_batch_size: batchRecommendation.mark,
+      export_delete_batch_size: batchRecommendation.delete,
+    };
+    setSettings(nextSettings);
+    settingsFormRef.current?.setValues({
+      ...(settingsFormRef.current?.getValues?.() || {}),
+      export_scan_batch_size: batchRecommendation.scan,
+      export_mark_batch_size: batchRecommendation.mark,
+      export_delete_batch_size: batchRecommendation.delete,
+    });
+  };
 
   const loadS3RotationStatus = async (notify = false, s3Override = null) => {
     const formValues = settingsFormRef.current?.getValues?.() || {};
@@ -251,9 +389,13 @@ const ConversationLog = () => {
     }
     setS3RotationStatusLoading(true);
     try {
-      const res = await API.post('/api/conversation_logs/s3/rotation_status', s3, {
-        disableDuplicate: true,
-      });
+      const res = await API.post(
+        '/api/conversation_logs/s3/rotation_status',
+        s3,
+        {
+          disableDuplicate: true,
+        },
+      );
       const { success, message, data } = res.data;
       if (!success) {
         showError(message);
@@ -278,15 +420,22 @@ const ConversationLog = () => {
       });
 
       if (summaryRes.data.success) {
+        const payload = summaryRes.data.data || {};
         const nextSettings = {
           ...defaultSettings,
-          ...(summaryRes.data.data.settings || {}),
+          ...(payload.settings || {}),
           s3: {
             ...defaultSettings.s3,
-            ...(summaryRes.data.data.settings?.s3 || {}),
+            ...(payload.settings?.s3 || {}),
           },
         };
-        setSummary(summaryRes.data.data.summary);
+        const bounds = payload.export_batch_size_bounds || {};
+        setSummary(payload.summary);
+        setBatchRecommendationHint(payload.export_batch_recommendation || null);
+        setBatchSizeBounds({
+          min: Number(bounds.min || defaultBatchSizeBounds.min),
+          max: Number(bounds.max || defaultBatchSizeBounds.max),
+        });
         setSettings(nextSettings);
         // The two MB-typed fields aren't first-class properties of the
         // settings object (the API stores bytes), so Form's values={settings}
@@ -418,9 +567,7 @@ const ConversationLog = () => {
         void loadS3RotationStatus(false, s3);
       }
       if (data?.cleanup_error) {
-        showWarning(
-          `${t('测试对象清理失败')}: ${data.cleanup_error}`,
-        );
+        showWarning(`${t('测试对象清理失败')}: ${data.cleanup_error}`);
       }
     } catch (error) {
       showError(error.message || t('S3 连接测试失败'));
@@ -1434,6 +1581,124 @@ const ConversationLog = () => {
                       color: 'var(--semi-color-text-0)',
                     }}
                   >
+                    {t('导出性能批处理')}
+                  </div>
+                  <div
+                    className='rounded-lg p-3 mb-3'
+                    style={{
+                      background: 'var(--semi-color-fill-0)',
+                      border: '1px solid var(--semi-color-border)',
+                    }}
+                  >
+                    <div className='flex flex-col md:flex-row md:items-center md:justify-between gap-3'>
+                      <div className='flex flex-col gap-1'>
+                        <Space wrap>
+                          <Tag color='blue'>
+                            {batchRecommendationLevelLabel}
+                          </Tag>
+                          {batchRecommendation.databaseType ? (
+                            <Tag color='grey'>
+                              DB {batchRecommendation.databaseType}
+                            </Tag>
+                          ) : null}
+                          <Text size='small' type='tertiary'>
+                            {t('记录')} {formatInteger(summary?.record_count)}
+                          </Text>
+                          <Text size='small' type='tertiary'>
+                            {t('存储')} {formatBytes(summary?.storage_bytes)}
+                          </Text>
+                          <Text size='small' type='tertiary'>
+                            {t('平均')} {formatBytes(avgRecordBytes)}
+                          </Text>
+                        </Space>
+                        <Text size='small' type='tertiary'>
+                          {batchRecommendationReason}
+                        </Text>
+                        <Text size='small' type='tertiary'>
+                          {t('推荐')}: scan {batchRecommendation.scan}, mark{' '}
+                          {batchRecommendation.mark}, delete{' '}
+                          {batchRecommendation.delete}
+                        </Text>
+                      </div>
+                      <Button
+                        size='small'
+                        type='primary'
+                        disabled={isUsingRecommendedBatch}
+                        onClick={applyBatchRecommendation}
+                      >
+                        {isUsingRecommendedBatch
+                          ? t('已使用推荐值')
+                          : t('应用推荐值')}
+                      </Button>
+                    </div>
+                  </div>
+                  <Row gutter={16}>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='export_scan_batch_size'
+                        label={t('扫描批处理')}
+                        min={batchSizeBounds.min}
+                        max={batchSizeBounds.max}
+                        step={100}
+                        extraText={t('每次从数据库读取的会话日志行数')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            export_scan_batch_size: clampBatchSize(
+                              value,
+                              batchSizeBounds,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='export_mark_batch_size'
+                        label={t('标记批处理')}
+                        min={batchSizeBounds.min}
+                        max={batchSizeBounds.max}
+                        step={100}
+                        extraText={t('导出完成后批量标记记录的 ID 数量')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            export_mark_batch_size: clampBatchSize(
+                              value,
+                              batchSizeBounds,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='export_delete_batch_size'
+                        label={t('删除批处理')}
+                        min={batchSizeBounds.min}
+                        max={batchSizeBounds.max}
+                        step={100}
+                        extraText={t('导出后清理源记录时每批删除数量')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            export_delete_batch_size: clampBatchSize(
+                              value,
+                              batchSizeBounds,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+
+                  <div
+                    className='text-sm font-semibold mt-6 mb-3 border-t pt-4'
+                    style={{
+                      borderColor: 'var(--semi-color-border)',
+                      color: 'var(--semi-color-text-0)',
+                    }}
+                  >
                     {t('自动导出与清理')}
                   </div>
                   <Row gutter={16}>
@@ -1648,7 +1913,9 @@ const ConversationLog = () => {
                           '开启后仅上传 tar.gz（不含子目录与 manifest.json），以「S3 对象前缀」为基名按 前缀、前缀-2、前缀-3 … 轮换',
                         )}
                         disabled={!settings.s3?.enabled}
-                        onChange={(value) => updateS3('rotation_enabled', value)}
+                        onChange={(value) =>
+                          updateS3('rotation_enabled', value)
+                        }
                       />
                     </Col>
                     <Col xs={24} sm={12} lg={8}>
@@ -1664,7 +1931,8 @@ const ConversationLog = () => {
                           '达到该数量后轮换到下一目录，并将满目录标记为 *-个数-completed',
                         )}
                         disabled={
-                          !settings.s3?.enabled || !settings.s3?.rotation_enabled
+                          !settings.s3?.enabled ||
+                          !settings.s3?.rotation_enabled
                         }
                         onChange={(value) =>
                           updateS3('rotation_max_objects', value)

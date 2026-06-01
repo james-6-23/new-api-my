@@ -141,9 +141,7 @@ function QualityRuleTable({ rules, t }) {
             <th className='py-2 pr-3 text-right font-medium'>
               {t('候选通过')}
             </th>
-            <th className='py-2 pr-3 text-right font-medium'>
-              {t('通过率')}
-            </th>
+            <th className='py-2 pr-3 text-right font-medium'>{t('通过率')}</th>
             <th className='py-2 pr-3 text-right font-medium'>
               {t('剔除/去重')}
             </th>
@@ -156,9 +154,7 @@ function QualityRuleTable({ rules, t }) {
               key={rule.key || rule.name}
               className='border-b border-[var(--semi-color-border)] last:border-b-0'
             >
-              <td className='py-2 pr-3 font-medium'>
-                {rule.name || rule.key}
-              </td>
+              <td className='py-2 pr-3 font-medium'>{rule.name || rule.key}</td>
               <td className='py-2 pr-3 text-[var(--semi-color-text-1)]'>
                 {rule.requirement || '-'}
               </td>
@@ -197,7 +193,8 @@ function QualityRuleList({ rules, t }) {
             <div className='truncate font-medium'>{rule.name || rule.key}</div>
             <div className='mt-0.5 text-xs text-[var(--semi-color-text-2)]'>
               {formatInteger(rule.passed_count)} /{' '}
-              {formatInteger(rule.candidate_count)} · {formatRate(rule.pass_rate)}
+              {formatInteger(rule.candidate_count)} ·{' '}
+              {formatRate(rule.pass_rate)}
               {Number(rule.removed_count || 0) > 0
                 ? ` · ${t('剔除/去重')} ${formatInteger(rule.removed_count)}`
                 : ''}
@@ -319,6 +316,12 @@ function computeJobPercent(job) {
     return Math.min(
       99,
       Math.round((job.exported_records / job.total_records) * 100),
+    );
+  }
+  if (job.snapshot_max_id > 0 && job.scan_position_id > 0) {
+    return Math.min(
+      99,
+      Math.round((job.scan_position_id / job.snapshot_max_id) * 100),
     );
   }
   if (job.status === 'running') return 1;
@@ -735,8 +738,7 @@ const ExportJobs = ({
               pageSizeOpts: [20, 50, 100],
               showSizeChanger: true,
               onPageChange: (nextPage) => loadJobs(nextPage, pageSize),
-              onPageSizeChange: (nextPageSize) =>
-                loadJobs(1, nextPageSize),
+              onPageSizeChange: (nextPageSize) => loadJobs(1, nextPageSize),
             }}
             scroll={{ x: 1300 }}
             empty={t('暂无任务')}

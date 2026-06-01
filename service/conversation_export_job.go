@@ -28,9 +28,8 @@ import (
 )
 
 const (
-	conversationExportScanBatchSize   = 500
-	conversationExportMarkBatchSize   = 500
-	conversationExportDeleteBatchSize = 500
+	conversationExportCompressionWorkers   = 2
+	conversationExportCompressionQueueSize = 2
 
 	sessionBucketCount   = 4096
 	sessionBucketMaxOpen = 128
@@ -457,7 +456,11 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 		}
 	}
 
-	filterBytes, err := common.Marshal(req.Filter)
+	filter, err := snapshotConversationExportQuery(ctx, req.Filter)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot export query: %w", err)
+	}
+	filterBytes, err := common.Marshal(filter)
 	if err != nil {
 		return nil, err
 	}
@@ -584,6 +587,15 @@ func conversationExportValidQuery(query model.ConversationLogQuery) (model.Conve
 	return query, true
 }
 
+func snapshotConversationExportQuery(ctx context.Context, query model.ConversationLogQuery) (model.ConversationLogQuery, error) {
+	maxID, err := model.GetMaxConversationLogID(ctx, query)
+	if err != nil {
+		return query, err
+	}
+	query.MaxID = &maxID
+	return query, nil
+}
+
 // executeExportJob is the actual work: scan, shard, write tar.gz, manifest.
 func executeExportJob(ctx context.Context, job *model.ConversationExportJob) error {
 	var query model.ConversationLogQuery
@@ -592,19 +604,31 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 			return fmt.Errorf("invalid filter json: %w", err)
 		}
 	}
-	// Cheap totals so the operator UI can show "exported / total" without
-	// loading every row into memory. Use the DB to count, not in-memory
-	// iteration — for a 50 GiB log table the latter OOMs the process.
-	// Distinct session count is only needed for session-mode exports.
-	needSessions := job.Mode == conversation_log_setting.ExportModeSessionJSONL
-	recordsEligible, sessionsEligible, err := model.CountEligibleConversationLogs(ctx, query, needSessions)
-	if err != nil {
-		return fmt.Errorf("count eligible conversation logs: %w", err)
+	if query.MaxID == nil {
+		var err error
+		query, err = snapshotConversationExportQuery(ctx, query)
+		if err != nil {
+			return fmt.Errorf("snapshot export query: %w", err)
+		}
+		filterBytes, err := common.Marshal(query)
+		if err != nil {
+			return err
+		}
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"filter_json": string(filterBytes),
+		})
+	}
+	snapshotMaxID := 0
+	if query.MaxID != nil {
+		snapshotMaxID = *query.MaxID
 	}
 	updateJobProgress(job.JobId, map[string]interface{}{
-		"total_records":  recordsEligible,
-		"total_sessions": sessionsEligible,
-		"progress":       "starting export",
+		"snapshot_max_id":  snapshotMaxID,
+		"scan_position_id": 0,
+		"scanned_records":  0,
+		"total_records":    0,
+		"total_sessions":   0,
+		"progress":         fmt.Sprintf("starting snapshot export: id <= %d", snapshotMaxID),
 	})
 
 	tmpDir := filepath.Join(job.OutputDirectory, ".tmp")
@@ -622,17 +646,16 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		tmpDir:           tmpDir,
 		shardTargetBytes: job.ShardTargetBytes,
 		shardMaxBytes:    job.ShardMaxBytes,
-		totalEligible:    recordsEligible,
+		snapshotMaxID:    snapshotMaxID,
 	}
 	defer func() {
+		state.abortShardCompression()
 		_ = state.closeProcessedSourceIDs()
 	}()
 
 	var processErr error
 	exportSummary := ConversationExportSummary{
 		Mode:                     job.Mode,
-		APIExportableRecords:     recordsEligible,
-		TotalSessions:            sessionsEligible,
 		RejectedSessionsByReason: map[string]int64{},
 	}
 	var qualityPreflight ConversationQualityPreflightReport
@@ -646,12 +669,16 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		return processErr
 	}
 
-	if err := state.closeCurrentShard(); err != nil {
+	if err := state.closeCurrentShard(ctx); err != nil {
+		return err
+	}
+	if err := state.waitForShardCompression(ctx); err != nil {
 		return err
 	}
 	exportSummary.Mode = job.Mode
-	exportSummary.APIExportableRecords = recordsEligible
-	exportSummary.TotalSessions = sessionsEligible
+	if job.Mode == conversation_log_setting.ExportModeAPIHijackJSONL {
+		exportSummary.APIExportableRecords = state.totalRecordCount
+	}
 	exportSummary.SessionExportableSessions = state.totalSessionCount
 	if exportSummary.RejectedSessionsByReason == nil {
 		exportSummary.RejectedSessionsByReason = map[string]int64{}
@@ -685,9 +712,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		QualityReport:    qualityReport,
 		Shards:           state.shards,
 		Totals: TopManifestTotals{
-			RecordsEligible:   recordsEligible,
+			RecordsEligible:   exportSummary.APIExportableRecords,
 			RecordsExported:   state.totalRecordCount,
-			SessionsEligible:  sessionsEligible,
+			SessionsEligible:  exportSummary.TotalSessions,
 			SessionsExported:  state.totalSessionCount,
 			UncompressedBytes: state.totalUncompressed,
 			CompressedBytes:   state.totalCompressed,
@@ -741,7 +768,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		updateJobProgress(job.JobId, map[string]interface{}{
 			"progress": "deleting processed source records",
 		})
-		deleted, err := model.DeleteConversationLogsByExportBatchID(ctx, job.JobId, conversationExportDeleteBatchSize)
+		deleted, err := model.DeleteConversationLogsByExportBatchID(ctx, job.JobId, exportDeleteBatchSize())
 		if err != nil {
 			return fmt.Errorf("delete exported conversation logs after manifest: %w", err)
 		}
@@ -755,7 +782,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		updateJobProgress(job.JobId, map[string]interface{}{
 			"progress": "deleting invalid source records",
 		})
-		deleted, err := model.DeleteConversationLogsByInvalidValidationStatus(ctx, query, ConversationValidationValid, conversationExportDeleteBatchSize)
+		deleted, err := model.DeleteConversationLogsByInvalidValidationStatus(ctx, query, ConversationValidationValid, exportDeleteBatchSize())
 		if err != nil {
 			return fmt.Errorf("delete invalid conversation logs after auto export: %w", err)
 		}
@@ -772,10 +799,13 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 
 	updateJobProgress(job.JobId, map[string]interface{}{
 		"manifest_path":       manifestPath,
-		"total_records":       recordsEligible,
+		"total_records":       exportSummary.APIExportableRecords,
 		"exported_records":    state.totalRecordCount,
-		"total_sessions":      sessionsEligible,
+		"total_sessions":      exportSummary.TotalSessions,
 		"exported_sessions":   state.totalSessionCount,
+		"snapshot_max_id":     snapshotMaxID,
+		"scan_position_id":    state.scanPositionID,
+		"scanned_records":     state.scannedSourceRecords,
 		"uncompressed_bytes":  state.totalUncompressed,
 		"compressed_bytes":    state.totalCompressed,
 		"shard_count":         len(state.shards),
@@ -790,8 +820,8 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 //
 // To bound memory at >10 GiB shard sizes, the in-progress JSONL is streamed to
 // a temp file on disk (bufio-buffered, hash computed inline). closeCurrentShard
-// then streams that file into the tar.gz without ever holding the full payload
-// in RAM.
+// seals those files and hands them to a bounded compressor pool, which streams
+// the tar.gz without ever holding the full payload in RAM.
 type shardWriterState struct {
 	jobID            string
 	mode             string
@@ -801,10 +831,11 @@ type shardWriterState struct {
 	tmpDir           string
 	shardTargetBytes int64
 	shardMaxBytes    int64
-	// totalEligible is the DB-side count of rows the job is expected to
-	// process. Used purely for the progress text — the writer never indexes by
-	// it.
-	totalEligible int64
+	// Snapshot scan progress avoids a costly COUNT/COUNT(DISTINCT) pass on
+	// large tables. It is an ID-range progress hint, not an exact row count.
+	snapshotMaxID        int
+	scanPositionID       int
+	scannedSourceRecords int64
 
 	// Current shard accumulator (streaming).
 	currentIndex       int
@@ -828,6 +859,7 @@ type shardWriterState struct {
 	totalSessionCount int64
 	totalUncompressed int64
 	totalCompressed   int64
+	compressor        *shardCompressorPool
 
 	// Session-mode cleanup ids. session_jsonl exports intentionally filter out
 	// H1-H4 failures and duplicate/subsequence sessions. When delete-after is
@@ -858,6 +890,209 @@ type shardDataWriter struct {
 type shardDataFilePayload struct {
 	ShardDataFile
 	SourcePath string
+}
+
+type shardCompressionJob struct {
+	Index             int
+	InnerName         string
+	TmpTarPath        string
+	TarPath           string
+	DataPayloads      []shardDataFilePayload
+	ManifestBytes     []byte
+	PathManifestBytes []byte
+	IDsPath           string
+	IDCount           int64
+	Shard             TopManifestShard
+}
+
+type shardCompressionResult struct {
+	Index   int
+	Shard   TopManifestShard
+	IDsPath string
+	IDCount int64
+}
+
+type shardCompressorPool struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	jobs     chan shardCompressionJob
+	jobWG    sync.WaitGroup
+	workerWG sync.WaitGroup
+
+	submitMu sync.Mutex
+	mu       sync.Mutex
+	err      error
+	results  []shardCompressionResult
+	closed   bool
+}
+
+func newShardCompressorPool(ctx context.Context, workers, queueSize int) *shardCompressorPool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if queueSize < 0 {
+		queueSize = 0
+	}
+	poolCtx, cancel := context.WithCancel(ctx)
+	pool := &shardCompressorPool{
+		ctx:    poolCtx,
+		cancel: cancel,
+		jobs:   make(chan shardCompressionJob, queueSize),
+	}
+	for i := 0; i < workers; i++ {
+		pool.workerWG.Add(1)
+		go pool.worker()
+	}
+	return pool
+}
+
+func (p *shardCompressorPool) worker() {
+	defer p.workerWG.Done()
+	for job := range p.jobs {
+		result, err := compressShardJob(p.ctx, job)
+		if err != nil {
+			p.setErr(fmt.Errorf("compress shard %d: %w", job.Index, err))
+		} else {
+			p.addResult(result)
+		}
+		p.jobWG.Done()
+	}
+}
+
+func (p *shardCompressorPool) Submit(job shardCompressionJob) error {
+	if p == nil {
+		return fmt.Errorf("shard compressor is nil")
+	}
+	p.submitMu.Lock()
+	defer p.submitMu.Unlock()
+	if err := p.Err(); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return fmt.Errorf("shard compressor is closed")
+	}
+	p.jobWG.Add(1)
+	p.mu.Unlock()
+	select {
+	case p.jobs <- job:
+		return nil
+	case <-p.ctx.Done():
+		p.jobWG.Done()
+		if err := p.Err(); err != nil {
+			return err
+		}
+		return p.ctx.Err()
+	}
+}
+
+func (p *shardCompressorPool) Wait() ([]shardCompressionResult, error) {
+	if p == nil {
+		return nil, nil
+	}
+	p.submitMu.Lock()
+	p.mu.Lock()
+	if !p.closed {
+		close(p.jobs)
+		p.closed = true
+	}
+	p.mu.Unlock()
+	p.submitMu.Unlock()
+	p.jobWG.Wait()
+	p.workerWG.Wait()
+	results := p.Results()
+	if err := p.Err(); err != nil {
+		return results, err
+	}
+	return results, nil
+}
+
+func (p *shardCompressorPool) CancelAndWait() {
+	if p == nil {
+		return
+	}
+	p.cancel()
+	_, _ = p.Wait()
+}
+
+func (p *shardCompressorPool) Err() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
+}
+
+func (p *shardCompressorPool) Results() []shardCompressionResult {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	results := append([]shardCompressionResult(nil), p.results...)
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Index < results[j].Index
+	})
+	return results
+}
+
+func (p *shardCompressorPool) setErr(err error) {
+	if p == nil || err == nil {
+		return
+	}
+	shouldCancel := false
+	p.mu.Lock()
+	if p.err == nil {
+		p.err = err
+		shouldCancel = true
+	}
+	p.mu.Unlock()
+	if shouldCancel {
+		p.cancel()
+	}
+}
+
+func (p *shardCompressorPool) addResult(result shardCompressionResult) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.results = append(p.results, result)
+	p.mu.Unlock()
+}
+
+func compressShardJob(ctx context.Context, job shardCompressionJob) (shardCompressionResult, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return shardCompressionResult{}, err
+		}
+	}
+	if err := streamShardTarGz(job.TmpTarPath, job.InnerName, job.DataPayloads, job.ManifestBytes, job.PathManifestBytes); err != nil {
+		return shardCompressionResult{}, err
+	}
+	compressedInfo, err := os.Stat(job.TmpTarPath)
+	if err != nil {
+		return shardCompressionResult{}, err
+	}
+	if err := os.Rename(job.TmpTarPath, job.TarPath); err != nil {
+		return shardCompressionResult{}, err
+	}
+	for _, payload := range job.DataPayloads {
+		_ = os.Remove(payload.SourcePath)
+	}
+	shard := job.Shard
+	shard.CompressedBytes = compressedInfo.Size()
+	return shardCompressionResult{
+		Index:   job.Index,
+		Shard:   shard,
+		IDsPath: job.IDsPath,
+		IDCount: job.IDCount,
+	}, nil
 }
 
 // ensureCurrentShard opens the streaming temp file lazily on the first
@@ -986,33 +1221,56 @@ func (s *shardWriterState) maybePushProgress(force bool) {
 		s.currentRecordCnt,
 		float64(s.currentSize)/(1<<30),
 	)
-	if s.totalEligible > 0 {
-		pct := float64(records) / float64(s.totalEligible) * 100
-		if pct > 100 {
-			pct = 100
+	if s.snapshotMaxID > 0 {
+		pct := float64(s.scanPositionID) / float64(s.snapshotMaxID) * 100
+		if pct > 99 {
+			pct = 99
+		}
+		if pct < 0 {
+			pct = 0
 		}
 		progressText = fmt.Sprintf(
-			"shard %d: %d/%d records (%.1f%%), %.2f GiB",
-			s.currentIndex+1,
-			records,
-			s.totalEligible,
+			"scan id %d/%d (%.1f%%), %d scanned, %d exported, %.2f GiB",
+			s.scanPositionID,
+			s.snapshotMaxID,
 			pct,
+			s.scannedSourceRecords,
+			records,
 			float64(uncompressed)/(1<<30),
 		)
 	}
 	updateJobProgress(s.jobID, map[string]interface{}{
-		"shard_count":        len(s.shards),
+		"shard_count":        s.currentIndex,
 		"exported_records":   records,
 		"exported_sessions":  s.totalSessionCount + s.currentSessionCnt,
+		"snapshot_max_id":    s.snapshotMaxID,
+		"scan_position_id":   s.scanPositionID,
+		"scanned_records":    s.scannedSourceRecords,
 		"uncompressed_bytes": uncompressed,
 		"compressed_bytes":   s.totalCompressed,
 		"progress":           progressText,
 	})
 }
 
-// closeCurrentShard finalises the temp category .jsonl files, packs them
-// (streaming) into a tar.gz next to its manifest, and resets shard state.
-func (s *shardWriterState) closeCurrentShard() error {
+func (s *shardWriterState) observeScannedBatch(logs []*model.ConversationLog) {
+	if s == nil || len(logs) == 0 {
+		return
+	}
+	s.scannedSourceRecords += int64(len(logs))
+	last := logs[len(logs)-1]
+	if last != nil && last.Id > s.scanPositionID {
+		s.scanPositionID = last.Id
+	}
+}
+
+// closeCurrentShard finalises the temp category .jsonl files and queues the
+// tar.gz work for the bounded background compressor. Source rows are still not
+// marked exported until all compression jobs finish and the top-level manifest
+// is written.
+func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
+	if err := s.compressionErr(); err != nil {
+		return err
+	}
 	if len(s.currentDataWriters) == 0 || s.currentSize == 0 {
 		if s.currentIDsFile != nil {
 			_ = s.currentIDsBuf.Flush()
@@ -1030,7 +1288,6 @@ func (s *shardWriterState) closeCurrentShard() error {
 		return nil
 	}
 
-	// 1. Flush and close temp jsonl files.
 	if err := s.currentIDsBuf.Flush(); err != nil {
 		return err
 	}
@@ -1081,7 +1338,6 @@ func (s *shardWriterState) closeCurrentShard() error {
 		legacySHA = dataFiles[0].SHA256
 	}
 
-	// 2. Build shard manifest.
 	shardManifest := ShardManifest{
 		JobID:             s.jobID,
 		ShardIndex:        s.currentIndex,
@@ -1107,64 +1363,56 @@ func (s *shardWriterState) closeCurrentShard() error {
 		return err
 	}
 
-	// 3. Stream the temp .jsonl into tar.gz, then atomically rename.
 	tmpTarPath := filepath.Join(s.tmpDir, fileBase+".tar.gz")
-	if err := streamShardTarGz(tmpTarPath, innerName, dataPayloads, manifestBytes, pathManifestBytes); err != nil {
-		return err
-	}
-	compressedInfo, err := os.Stat(tmpTarPath)
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(tmpTarPath, tarPath); err != nil {
-		return err
-	}
-	// 4. Drop temp jsonl files now that they are fully captured in the tar.gz.
-	for _, payload := range dataPayloads {
-		_ = os.Remove(payload.SourcePath)
-	}
-
-	// 5. Keep the sidecar id file until the top-level manifest is finalized.
-	// Records are marked exported only after the full delivery package is
-	// complete; a failed job therefore never hides source rows from a retry.
+	idsPath := ""
 	if s.currentIDCount > 0 {
-		s.shardIDPaths = append(s.shardIDPaths, s.currentIDsPath)
+		idsPath = s.currentIDsPath
 	} else {
 		_ = os.Remove(s.currentIDsPath)
 	}
 
-	// 6. Record the shard in the job's shard list.
-	s.shards = append(s.shards, TopManifestShard{
+	job := shardCompressionJob{
 		Index:             s.currentIndex,
-		File:              filepath.Base(tarPath),
-		SHA256:            dataFilesSHA,
-		UncompressedBytes: uncompressed,
-		CompressedBytes:   compressedInfo.Size(),
-		RecordCount:       s.currentRecordCnt,
-		SessionCount:      s.currentSessionCnt,
-		DataFiles:         dataFiles,
-		FirstRecordID:     s.currentFirstID,
-		LastRecordID:      s.currentLastID,
-		RequestTimeMin:    s.currentTimeMin,
-		RequestTimeMax:    s.currentTimeMax,
-	})
+		InnerName:         innerName,
+		TmpTarPath:        tmpTarPath,
+		TarPath:           tarPath,
+		DataPayloads:      dataPayloads,
+		ManifestBytes:     manifestBytes,
+		PathManifestBytes: pathManifestBytes,
+		IDsPath:           idsPath,
+		IDCount:           s.currentIDCount,
+		Shard: TopManifestShard{
+			Index:             s.currentIndex,
+			File:              filepath.Base(tarPath),
+			SHA256:            dataFilesSHA,
+			UncompressedBytes: uncompressed,
+			RecordCount:       s.currentRecordCnt,
+			SessionCount:      s.currentSessionCnt,
+			DataFiles:         dataFiles,
+			FirstRecordID:     s.currentFirstID,
+			LastRecordID:      s.currentLastID,
+			RequestTimeMin:    s.currentTimeMin,
+			RequestTimeMax:    s.currentTimeMax,
+		},
+	}
+
 	s.totalRecordCount += s.currentRecordCnt
 	s.totalSessionCount += s.currentSessionCnt
 	s.totalUncompressed += uncompressed
-	s.totalCompressed += compressedInfo.Size()
 
-	// 7. Update DB progress so the operator's polling reflects the new shard.
+	if err := s.ensureCompressor(ctx).Submit(job); err != nil {
+		return err
+	}
 	updateJobProgress(s.jobID, map[string]interface{}{
-		"shard_count":        len(s.shards),
+		"shard_count":        s.currentIndex,
 		"exported_records":   s.totalRecordCount,
 		"exported_sessions":  s.totalSessionCount,
 		"uncompressed_bytes": s.totalUncompressed,
 		"compressed_bytes":   s.totalCompressed,
-		"progress":           fmt.Sprintf("shard %d closed (%d records, %.2f GiB uncompressed)", s.currentIndex, s.currentRecordCnt, float64(s.totalUncompressed)/(1<<30)),
+		"progress":           fmt.Sprintf("shard %d queued for compression (%d records, %.2f GiB uncompressed)", s.currentIndex, s.currentRecordCnt, float64(s.totalUncompressed)/(1<<30)),
 	})
 	s.lastProgressAt = time.Now()
 
-	// 8. Reset for next shard.
 	s.currentDataWriters = nil
 	s.currentIDsFile = nil
 	s.currentIDsBuf = nil
@@ -1178,6 +1426,63 @@ func (s *shardWriterState) closeCurrentShard() error {
 	s.currentFirstID = 0
 	s.currentLastID = 0
 	return nil
+}
+
+func (s *shardWriterState) ensureCompressor(ctx context.Context) *shardCompressorPool {
+	if s.compressor == nil {
+		s.compressor = newShardCompressorPool(ctx, conversationExportCompressionWorkers, conversationExportCompressionQueueSize)
+	}
+	return s.compressor
+}
+
+func (s *shardWriterState) compressionErr() error {
+	if s == nil || s.compressor == nil {
+		return nil
+	}
+	return s.compressor.Err()
+}
+
+func (s *shardWriterState) waitForShardCompression(ctx context.Context) error {
+	if s == nil || s.compressor == nil {
+		return nil
+	}
+	results, err := s.compressor.Wait()
+	if err != nil {
+		return err
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	for _, result := range results {
+		s.shards = append(s.shards, result.Shard)
+		s.totalCompressed += result.Shard.CompressedBytes
+		if result.IDCount > 0 && result.IDsPath != "" {
+			s.shardIDPaths = append(s.shardIDPaths, result.IDsPath)
+		}
+	}
+	s.compressor = nil
+	if len(results) > 0 {
+		updateJobProgress(s.jobID, map[string]interface{}{
+			"shard_count":        len(s.shards),
+			"exported_records":   s.totalRecordCount,
+			"exported_sessions":  s.totalSessionCount,
+			"uncompressed_bytes": s.totalUncompressed,
+			"compressed_bytes":   s.totalCompressed,
+			"progress":           fmt.Sprintf("compressed %d shard(s), %.2f GiB uncompressed", len(s.shards), float64(s.totalUncompressed)/(1<<30)),
+		})
+		s.lastProgressAt = time.Now()
+	}
+	return nil
+}
+
+func (s *shardWriterState) abortShardCompression() {
+	if s == nil || s.compressor == nil {
+		return
+	}
+	s.compressor.CancelAndWait()
+	s.compressor = nil
 }
 
 func shardDataFilesFromPayloads(payloads []shardDataFilePayload) []ShardDataFile {
@@ -1319,7 +1624,7 @@ func (s *shardWriterState) markClosedShardRecordsExported(ctx context.Context) e
 				return err
 			}
 		}
-		if err := markConversationLogIDsFromFile(path, s.jobID, exportedAt, conversationExportMarkBatchSize); err != nil {
+		if err := markConversationLogIDsFromFile(path, s.jobID, exportedAt, exportMarkBatchSize()); err != nil {
 			return fmt.Errorf("mark exported records for shard %d: %w", i+1, err)
 		}
 		_ = os.Remove(path)
@@ -1380,7 +1685,7 @@ func (s *shardWriterState) markProcessedSourceRecordsExported(ctx context.Contex
 			return err
 		}
 	}
-	if err := markConversationLogIDsFromFile(s.processedIDsPath, s.jobID, common.GetTimestamp(), conversationExportMarkBatchSize); err != nil {
+	if err := markConversationLogIDsFromFile(s.processedIDsPath, s.jobID, common.GetTimestamp(), exportMarkBatchSize()); err != nil {
 		return err
 	}
 	_ = os.Remove(s.processedIDsPath)
@@ -1504,18 +1809,23 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	if !ok {
 		return nil
 	}
-	return model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
+	return forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := state.compressionErr(); err != nil {
+			return err
+		}
+		state.observeScannedBatch(logs)
 		for _, item := range logs {
-			if !ValidateAPIRecord(item).Exportable {
+			prepared := prepareConversationExportLog(item)
+			if !prepared.validation.Exportable {
 				continue
 			}
 			rec := StrictAPIRecord{
 				SessionID:    item.SessionId,
 				Provider:     item.Provider,
-				RequestBody:  effectiveConversationRequestBody(item),
+				RequestBody:  prepared.EffectiveRequestBody(),
 				ResponseBody: item.ResponseBody,
 				RequestTime:  item.RequestTime,
 				ResponseTime: item.ResponseTime,
@@ -1526,7 +1836,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 			}
 			lineLen := int64(len(line) + 1) // include trailing newline
 			if state.wouldOverflowMax(lineLen) {
-				if err := state.closeCurrentShard(); err != nil {
+				if err := state.closeCurrentShard(ctx); err != nil {
 					return err
 				}
 			}
@@ -1534,7 +1844,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 				return err
 			}
 			if state.shouldRotateAfter() {
-				if err := state.closeCurrentShard(); err != nil {
+				if err := state.closeCurrentShard(ctx); err != nil {
 					return err
 				}
 			}
@@ -2002,8 +2312,11 @@ func streamSessionSpoolToShards(ctx context.Context, spool *sessionExportSpool, 
 				return err
 			}
 			lineLen := int64(len(dataLine) + 1)
+			if err := state.compressionErr(); err != nil {
+				return err
+			}
 			if state.wouldOverflowMax(lineLen) {
-				if err := state.closeCurrentShard(); err != nil {
+				if err := state.closeCurrentShard(ctx); err != nil {
 					return err
 				}
 			}
@@ -2014,7 +2327,7 @@ func streamSessionSpoolToShards(ctx context.Context, spool *sessionExportSpool, 
 				return err
 			}
 			if state.shouldRotateAfter() {
-				if err := state.closeCurrentShard(); err != nil {
+				if err := state.closeCurrentShard(ctx); err != nil {
 					return err
 				}
 			}
@@ -2120,12 +2433,14 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 		return nil, 0, nil
 	}
 	var eligible int64
-	err = model.ForEachConversationLog(ctx, validQuery, conversationExportScanBatchSize, func(logs []*model.ConversationLog) error {
+	err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		state.observeScannedBatch(logs)
 		for _, item := range logs {
-			if !ValidateAPIRecord(item).Exportable {
+			prepared := prepareConversationExportLog(item)
+			if !prepared.validation.Exportable {
 				continue
 			}
 			if item.SessionId == "" {
@@ -2138,7 +2453,7 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 				RelayFormat:  item.RelayFormat,
 				FinalFormat:  item.FinalRequestFormat,
 				RequestPath:  item.RequestPath,
-				RequestBody:  effectiveConversationRequestBody(item),
+				RequestBody:  prepared.EffectiveRequestBody(),
 				ResponseBody: item.ResponseBody,
 				RequestTime:  item.RequestTime,
 				ResponseTime: item.ResponseTime,
@@ -2512,7 +2827,7 @@ func DeleteExportJobArtifacts(job *model.ConversationExportJob) error {
 
 func markConversationLogIDsFromFile(path, batchID string, exportedAt int64, batchSize int) error {
 	if batchSize <= 0 {
-		batchSize = conversationExportMarkBatchSize
+		batchSize = exportMarkBatchSize()
 	}
 	file, err := os.Open(path)
 	if err != nil {

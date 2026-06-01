@@ -33,6 +33,12 @@ const (
 	defaultS3RotationMaxObjects = 200
 	minS3RotationMaxObjects     = 1
 	maxS3RotationMaxObjects     = 100000
+
+	defaultExportScanBatchSize   = 5000
+	defaultExportMarkBatchSize   = 2000
+	defaultExportDeleteBatchSize = 2000
+	minExportBatchSize           = 100
+	maxExportBatchSize           = 10000
 )
 
 type S3Setting struct {
@@ -68,6 +74,9 @@ type ConversationLogSetting struct {
 	DefaultShardMaxBytes    int64 `json:"default_shard_max_bytes"`
 	ExportJobConcurrency    int   `json:"export_job_concurrency"`
 	ExportJobRetentionDays  int   `json:"export_job_retention_days"`
+	ExportScanBatchSize     int   `json:"export_scan_batch_size"`
+	ExportMarkBatchSize     int   `json:"export_mark_batch_size"`
+	ExportDeleteBatchSize   int   `json:"export_delete_batch_size"`
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
@@ -92,6 +101,9 @@ var conversationLogSetting = ConversationLogSetting{
 	DefaultShardMaxBytes:    defaultShardMaxBytes,
 	ExportJobConcurrency:    1,
 	ExportJobRetentionDays:  14,
+	ExportScanBatchSize:     defaultExportScanBatchSize,
+	ExportMarkBatchSize:     defaultExportMarkBatchSize,
+	ExportDeleteBatchSize:   defaultExportDeleteBatchSize,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -130,6 +142,9 @@ func GetSetting() ConversationLogSetting {
 	if setting.ExportJobRetentionDays < 0 {
 		setting.ExportJobRetentionDays = 0
 	}
+	setting.ExportScanBatchSize = clampExportBatchSize(setting.ExportScanBatchSize, defaultExportScanBatchSize)
+	setting.ExportMarkBatchSize = clampExportBatchSize(setting.ExportMarkBatchSize, defaultExportMarkBatchSize)
+	setting.ExportDeleteBatchSize = clampExportBatchSize(setting.ExportDeleteBatchSize, defaultExportDeleteBatchSize)
 
 	if setting.AutoExportThresholdBytes <= 0 {
 		setting.AutoExportThresholdBytes = defaultAutoExportThresholdBytes
@@ -167,6 +182,17 @@ func clampShardBytes(value, fallback int64) int64 {
 
 func ShardBytesBounds() (min, max int64) {
 	return minShardBytes, maxShardBytes
+}
+
+func clampExportBatchSize(value, fallback int) int {
+	if value < minExportBatchSize || value > maxExportBatchSize {
+		return fallback
+	}
+	return value
+}
+
+func ExportBatchSizeBounds() (min, max int) {
+	return minExportBatchSize, maxExportBatchSize
 }
 
 // RotationBaseFromPrefix derives the rotation base directory from the S3 object

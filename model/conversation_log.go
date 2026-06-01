@@ -72,6 +72,7 @@ type ConversationLogQuery struct {
 	Provider         string `json:"provider"`
 	ValidationStatus string `json:"validation_status"`
 	Exported         *bool  `json:"exported"`
+	MaxID            *int   `json:"max_id,omitempty"`
 }
 
 type ConversationLogSummary struct {
@@ -313,6 +314,9 @@ func applyConversationLogQuery(db *gorm.DB, query ConversationLogQuery) *gorm.DB
 			db = db.Where("exported_at = ?", 0)
 		}
 	}
+	if query.MaxID != nil {
+		db = db.Where("id <= ?", *query.MaxID)
+	}
 	return db
 }
 
@@ -504,6 +508,19 @@ func CountEligibleConversationLogs(ctx context.Context, query ConversationLogQue
 	return records, sessions, nil
 }
 
+func GetMaxConversationLogID(ctx context.Context, query ConversationLogQuery) (int, error) {
+	var log ConversationLog
+	err := applyConversationLogQuery(conversationLogDBWithContext(ctx).Model(&ConversationLog{}), query).
+		Select("id").
+		Order("id desc").
+		Limit(1).
+		Find(&log).Error
+	if err != nil {
+		return 0, err
+	}
+	return log.Id, nil
+}
+
 func CountEligibleConversationLogsCached(ctx context.Context, query ConversationLogQuery, countSessions bool) (int64, int64, error) {
 	key := conversationLogQueryCacheKey("eligible", query, "sessions="+strconv.FormatBool(countSessions))
 	cache := getConversationLogEligibleCache()
@@ -535,9 +552,14 @@ func CountEligibleConversationLogsCached(ctx context.Context, query Conversation
 }
 
 func ForEachConversationLog(ctx context.Context, query ConversationLogQuery, batchSize int, fn func([]*ConversationLog) error) error {
+	return ForEachConversationLogSelected(ctx, query, nil, batchSize, fn)
+}
+
+func ForEachConversationLogSelected(ctx context.Context, query ConversationLogQuery, columns []string, batchSize int, fn func([]*ConversationLog) error) error {
 	if batchSize <= 0 {
 		batchSize = 100
 	}
+	columns = ensureConversationLogIDSelected(columns)
 	lastID := 0
 	for {
 		if ctx != nil {
@@ -546,7 +568,11 @@ func ForEachConversationLog(ctx context.Context, query ConversationLogQuery, bat
 			}
 		}
 		var logs []*ConversationLog
-		err := applyConversationLogQuery(conversationLogDBWithContext(ctx).Model(&ConversationLog{}), query).
+		db := applyConversationLogQuery(conversationLogDBWithContext(ctx).Model(&ConversationLog{}), query)
+		if len(columns) > 0 {
+			db = db.Select(columns)
+		}
+		err := db.
 			Where("id > ?", lastID).
 			Order("id asc").
 			Limit(batchSize).
@@ -562,6 +588,21 @@ func ForEachConversationLog(ctx context.Context, query ConversationLogQuery, bat
 		}
 		lastID = logs[len(logs)-1].Id
 	}
+}
+
+func ensureConversationLogIDSelected(columns []string) []string {
+	if len(columns) == 0 {
+		return nil
+	}
+	for _, column := range columns {
+		if strings.EqualFold(strings.TrimSpace(column), "id") {
+			return columns
+		}
+	}
+	next := make([]string, 0, len(columns)+1)
+	next = append(next, "id")
+	next = append(next, columns...)
+	return next
 }
 
 func MarkConversationLogsExported(ids []int, batchID string, exportedAt int64) error {

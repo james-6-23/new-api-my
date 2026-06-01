@@ -39,9 +39,15 @@ func GetConversationLogSummary(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	minBatch, maxBatch := conversation_log_setting.ExportBatchSizeBounds()
 	common.ApiSuccess(c, gin.H{
-		"summary":  summary,
-		"settings": conversation_log_setting.GetSetting(),
+		"summary":                     summary,
+		"settings":                    conversation_log_setting.GetSetting(),
+		"export_batch_recommendation": service.BuildConversationExportBatchRecommendation(summary),
+		"export_batch_size_bounds": gin.H{
+			"min": minBatch,
+			"max": maxBatch,
+		},
 	})
 }
 
@@ -132,6 +138,10 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		DefaultExportMode *string                             `json:"default_export_mode"`
 		S3                *conversation_log_setting.S3Setting `json:"s3"`
 
+		ExportScanBatchSize   *int `json:"export_scan_batch_size"`
+		ExportMarkBatchSize   *int `json:"export_mark_batch_size"`
+		ExportDeleteBatchSize *int `json:"export_delete_batch_size"`
+
 		AutoExportEnabled              *bool   `json:"auto_export_enabled"`
 		AutoExportThresholdBytes       *int64  `json:"auto_export_threshold_bytes"`
 		AutoExportShardMaxBytes        *int64  `json:"auto_export_shard_max_bytes"`
@@ -204,6 +214,24 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 	}
+	if req.ExportScanBatchSize != nil {
+		if err := updateConversationExportBatchSize("export_scan_batch_size", *req.ExportScanBatchSize); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.ExportMarkBatchSize != nil {
+		if err := updateConversationExportBatchSize("export_mark_batch_size", *req.ExportMarkBatchSize); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.ExportDeleteBatchSize != nil {
+		if err := updateConversationExportBatchSize("export_delete_batch_size", *req.ExportDeleteBatchSize); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
 	if req.AutoExportEnabled != nil {
 		if err := model.UpdateOption("conversation_log_setting.auto_export_enabled", strconv.FormatBool(*req.AutoExportEnabled)); err != nil {
 			common.ApiError(c, err)
@@ -261,6 +289,14 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		}
 	}
 	common.ApiSuccess(c, conversation_log_setting.GetSetting())
+}
+
+func updateConversationExportBatchSize(key string, value int) error {
+	minBatch, maxBatch := conversation_log_setting.ExportBatchSizeBounds()
+	if value < minBatch || value > maxBatch {
+		return fmt.Errorf("%s must be in [%d, %d]", key, minBatch, maxBatch)
+	}
+	return model.UpdateOption("conversation_log_setting."+key, strconv.Itoa(value))
 }
 
 func TestConversationLogS3Connection(c *gin.Context) {

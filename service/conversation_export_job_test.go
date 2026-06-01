@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -76,7 +77,8 @@ func TestShardWriterStateSplitsDataFilesByKind(t *testing.T) {
 	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"msg"}`), []int{3}, 1, 120, 130, conversationDataKindMessages))
 	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"chat"}`), []int{4}, 1, 140, 150, conversationDataKindCompletions))
 	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"mixed"}`), []int{5}, 1, 160, 170, "unknown"))
-	require.NoError(t, state.closeCurrentShard())
+	require.NoError(t, state.closeCurrentShard(context.Background()))
+	require.NoError(t, state.waitForShardCompression(context.Background()))
 
 	require.Len(t, state.shards, 1)
 	entries := readTarGzEntries(t, filepath.Join(outputDir, state.shards[0].File))
@@ -94,6 +96,64 @@ func TestShardWriterStateSplitsDataFilesByKind(t *testing.T) {
 	require.Equal(t, "shard-0001/messages-data-1.jsonl", manifest.DataFiles[1].Path)
 	require.Equal(t, "shard-0001/completions-data-1.jsonl", manifest.DataFiles[2].Path)
 	require.Equal(t, "shard-0001/mixed-data-1.jsonl", manifest.DataFiles[3].Path)
+}
+
+func TestShardWriterStateWaitsForQueuedShardCompression(t *testing.T) {
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "out")
+	tmpDir := filepath.Join(dir, "tmp")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+	state := &shardWriterState{
+		mode:             "api_hijack_jsonl",
+		outputDir:        outputDir,
+		tmpDir:           tmpDir,
+		createdAt:        1710000000,
+		shardTargetBytes: 1 << 20,
+		shardMaxBytes:    1 << 20,
+	}
+	require.NoError(t, state.appendLine([]byte(`{"id":1}`), []int{1}, 0, 100, 110, conversationDataKindResponses))
+	require.NoError(t, state.closeCurrentShard(context.Background()))
+	require.NoError(t, state.appendLine([]byte(`{"id":2}`), []int{2}, 0, 120, 130, conversationDataKindMessages))
+	require.NoError(t, state.closeCurrentShard(context.Background()))
+
+	require.EqualValues(t, 2, state.totalRecordCount)
+	require.Len(t, state.shards, 0)
+	require.NoError(t, state.waitForShardCompression(context.Background()))
+
+	require.Len(t, state.shards, 2)
+	require.Equal(t, 1, state.shards[0].Index)
+	require.Equal(t, 2, state.shards[1].Index)
+	require.Len(t, state.shardIDPaths, 2)
+	require.FileExists(t, filepath.Join(outputDir, state.shards[0].File))
+	require.FileExists(t, filepath.Join(outputDir, state.shards[1].File))
+	require.Greater(t, state.totalCompressed, int64(0))
+}
+
+func TestShardCompressorPoolReturnsCompressionError(t *testing.T) {
+	dir := t.TempDir()
+	pool := newShardCompressorPool(context.Background(), 1, 1)
+	require.NoError(t, pool.Submit(shardCompressionJob{
+		Index:      1,
+		InnerName:  "shard-0001",
+		TmpTarPath: filepath.Join(dir, "missing.tar.gz"),
+		TarPath:    filepath.Join(dir, "out.tar.gz"),
+		DataPayloads: []shardDataFilePayload{{
+			ShardDataFile: ShardDataFile{
+				Path:              "shard-0001/responses-data-1.jsonl",
+				UncompressedBytes: 10,
+			},
+			SourcePath: filepath.Join(dir, "missing.jsonl"),
+		}},
+		ManifestBytes:     []byte(`{}`),
+		PathManifestBytes: []byte(`{}`),
+	}))
+
+	results, err := pool.Wait()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "compress shard 1")
+	require.Empty(t, results)
 }
 
 func TestConversationDataKindForRecordsPreservesSessionIntegrity(t *testing.T) {
@@ -215,10 +275,185 @@ func TestAutoExportDeleteAfterRemovesInvalidRowsInScope(t *testing.T) {
 
 	require.NoError(t, executeExportJob(context.Background(), job))
 
+	fresh, err := model.GetConversationExportJobByJobID(job.JobId)
+	require.NoError(t, err)
+	require.Equal(t, inScopeInvalid.Id, fresh.SnapshotMaxID)
+	require.Equal(t, inScopeValid.Id, fresh.ScanPositionID)
+	require.EqualValues(t, 1, fresh.ScannedRecords)
+	require.EqualValues(t, 1, fresh.TotalRecords)
+
 	var remaining []*model.ConversationLog
 	require.NoError(t, model.LOG_DB.Order("id asc").Find(&remaining).Error)
 	require.Len(t, remaining, 1)
 	require.Equal(t, outOfScopeInvalid.SessionId, remaining[0].SessionId)
+}
+
+func TestSnapshotConversationExportQueryFreezesMaxID(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	now := int64(1710000000)
+
+	first := &model.ConversationLog{
+		CreatedAt:        now,
+		ValidationStatus: ConversationValidationValid,
+	}
+	require.NoError(t, model.CreateConversationLog(first))
+
+	frozen, err := snapshotConversationExportQuery(context.Background(), model.ConversationLogQuery{})
+	require.NoError(t, err)
+	require.NotNil(t, frozen.MaxID)
+	require.Equal(t, first.Id, *frozen.MaxID)
+
+	second := &model.ConversationLog{
+		CreatedAt:        now + 1,
+		ValidationStatus: ConversationValidationValid,
+	}
+	require.NoError(t, model.CreateConversationLog(second))
+
+	records, _, err := model.CountEligibleConversationLogs(context.Background(), frozen, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, records)
+
+	var seenIDs []int
+	require.NoError(t, model.ForEachConversationLog(context.Background(), frozen, 1, func(logs []*model.ConversationLog) error {
+		for _, log := range logs {
+			seenIDs = append(seenIDs, log.Id)
+		}
+		return nil
+	}))
+	require.Equal(t, []int{first.Id}, seenIDs)
+}
+
+func TestSnapshotConversationExportQueryFreezesEmptyScope(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+
+	frozen, err := snapshotConversationExportQuery(context.Background(), model.ConversationLogQuery{})
+	require.NoError(t, err)
+	require.NotNil(t, frozen.MaxID)
+	require.Equal(t, 0, *frozen.MaxID)
+
+	require.NoError(t, model.CreateConversationLog(&model.ConversationLog{
+		CreatedAt:        1710000000,
+		ValidationStatus: ConversationValidationValid,
+	}))
+
+	records, _, err := model.CountEligibleConversationLogs(context.Background(), frozen, false)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, records)
+}
+
+func TestForEachConversationExportLogSelectsOnlyExportColumns(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	now := int64(1710000000)
+	source := &model.ConversationLog{
+		CreatedAt:               now,
+		SessionId:               "sess_select",
+		SessionIdConfidence:     "low",
+		Provider:                "openai",
+		ModelName:               "gpt-5",
+		RelayFormat:             "openai_responses",
+		FinalRequestFormat:      "openai_responses",
+		RequestPath:             "/v1/responses",
+		RequestBody:             `{"model":"gpt-5","input":"hi"}`,
+		ResponseBody:            `{"output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]}`,
+		ClientRequestBody:       `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+		ClientResponseBody:      strings.Repeat("client-response", 128),
+		UpstreamRequestBody:     `{"model":"gpt-5","input":"hi","tools":[]}`,
+		UpstreamResponseBodyRaw: strings.Repeat("upstream-response", 128),
+		StreamChunksPath:        "/tmp/chunks.jsonl",
+		UsageJSON:               `{"total_tokens":2}`,
+		RequestTime:             now + 1,
+		ResponseTime:            now + 2,
+		ValidationStatus:        ConversationValidationValid,
+		InvalidReason:           "debug_reason",
+		StorageBytes:            4096,
+	}
+	require.NoError(t, model.CreateConversationLog(source))
+
+	var scanned []*model.ConversationLog
+	require.NoError(t, forEachConversationExportLog(context.Background(), model.ConversationLogQuery{}, func(logs []*model.ConversationLog) error {
+		scanned = append(scanned, logs...)
+		return nil
+	}))
+
+	require.Len(t, scanned, 1)
+	got := scanned[0]
+	require.Equal(t, source.Id, got.Id)
+	require.Equal(t, "sess_select", got.SessionId)
+	require.Equal(t, "low", got.SessionIdConfidence)
+	require.Equal(t, "openai", got.Provider)
+	require.Equal(t, "gpt-5", got.ModelName)
+	require.Equal(t, "openai_responses", got.RelayFormat)
+	require.Equal(t, "openai_responses", got.FinalRequestFormat)
+	require.Equal(t, "/v1/responses", got.RequestPath)
+	require.Equal(t, source.RequestBody, got.RequestBody)
+	require.Equal(t, source.ResponseBody, got.ResponseBody)
+	require.Equal(t, source.ClientRequestBody, got.ClientRequestBody)
+	require.Equal(t, source.UpstreamRequestBody, got.UpstreamRequestBody)
+	require.Equal(t, source.RequestTime, got.RequestTime)
+	require.Equal(t, source.ResponseTime, got.ResponseTime)
+	require.Equal(t, ConversationValidationValid, got.ValidationStatus)
+	require.Equal(t, "debug_reason", got.InvalidReason)
+
+	require.Zero(t, got.CreatedAt)
+	require.Empty(t, got.ClientResponseBody)
+	require.Empty(t, got.UpstreamResponseBodyRaw)
+	require.Empty(t, got.StreamChunksPath)
+	require.Empty(t, got.UsageJSON)
+	require.Zero(t, got.StorageBytes)
+}
+
+func TestBuildConversationExportBatchRecommendationSQLiteLimitsMarkDelete(t *testing.T) {
+	restoreDBFlags := setConversationExportRecommendationDBFlags(true, false, false)
+	defer restoreDBFlags()
+	t.Setenv("LOG_SQL_DSN", "")
+
+	recommendation := BuildConversationExportBatchRecommendation(model.ConversationLogSummary{
+		RecordCount:  200000,
+		StorageBytes: 6 << 30,
+	})
+
+	require.Equal(t, "sqlite", recommendation.DatabaseType)
+	require.Equal(t, "sqlite_parameter_limit", recommendation.Reason)
+	require.True(t, recommendation.SQLiteLimited)
+	require.Equal(t, 7000, recommendation.ScanBatchSize)
+	require.Equal(t, 900, recommendation.MarkBatchSize)
+	require.Equal(t, 900, recommendation.DeleteBatchSize)
+}
+
+func TestBuildConversationExportBatchRecommendationLargeRecordBody(t *testing.T) {
+	restoreDBFlags := setConversationExportRecommendationDBFlags(false, true, false)
+	defer restoreDBFlags()
+	t.Setenv("LOG_SQL_DSN", "")
+
+	recommendation := BuildConversationExportBatchRecommendation(model.ConversationLogSummary{
+		RecordCount:  100,
+		StorageBytes: 100 * 300 * 1024,
+	})
+
+	require.Equal(t, "mysql", recommendation.DatabaseType)
+	require.Equal(t, "large", recommendation.Level)
+	require.Equal(t, "large_record_body", recommendation.Reason)
+	require.False(t, recommendation.SQLiteLimited)
+	require.Equal(t, 2500, recommendation.ScanBatchSize)
+	require.Equal(t, 3000, recommendation.MarkBatchSize)
+	require.Equal(t, 3000, recommendation.DeleteBatchSize)
+}
+
+func setConversationExportRecommendationDBFlags(sqlite, mysql, postgres bool) func() {
+	previousSQLite := common.UsingSQLite
+	previousMySQL := common.UsingMySQL
+	previousPostgreSQL := common.UsingPostgreSQL
+	previousLogSQLType := common.LogSqlType
+	common.UsingSQLite = sqlite
+	common.UsingMySQL = mysql
+	common.UsingPostgreSQL = postgres
+	common.LogSqlType = common.DatabaseTypeSQLite
+	return func() {
+		common.UsingSQLite = previousSQLite
+		common.UsingMySQL = previousMySQL
+		common.UsingPostgreSQL = previousPostgreSQL
+		common.LogSqlType = previousLogSQLType
+	}
 }
 
 func setupConversationExportJobTestDB(t *testing.T) {
