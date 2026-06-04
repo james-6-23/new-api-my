@@ -56,6 +56,45 @@ type conversationS3UploadTask struct {
 	Progress string
 }
 
+type conversationS3UploadTaskQueue struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	taskCh  chan conversationS3UploadTask
+	closeCh sync.Once
+	sendMu  sync.Mutex
+	closed  bool
+	wg      sync.WaitGroup
+
+	job     *model.ConversationExportJob
+	setting conversation_log_setting.S3Setting
+	client  *http.Client
+
+	errMu    sync.Mutex
+	firstErr error
+}
+
+type conversationExportS3ShardUploadPipeline struct {
+	queue   *conversationS3UploadTaskQueue
+	planner *conversationExportS3ShardUploadPlanner
+
+	mu        sync.Mutex
+	nextIndex int
+	pending   map[int]TopManifestShard
+}
+
+type conversationExportS3ShardUploadPlanner struct {
+	job     *model.ConversationExportJob
+	setting conversation_log_setting.S3Setting
+	client  *http.Client
+
+	rotation      bool
+	endpointURL   *url.URL
+	maxObjects    int
+	state         rotationDirState
+	ensuredDirs   map[string]struct{}
+	completedDirs []rotationDirState
+}
+
 type ConversationS3ConnectionTestResult struct {
 	Endpoint        string `json:"endpoint"`
 	Region          string `json:"region"`
@@ -131,6 +170,20 @@ func uploadConversationExportS3Tasks(ctx context.Context, job *model.Conversatio
 	if len(tasks) == 0 {
 		return nil
 	}
+	queue := newConversationS3UploadTaskQueue(ctx, job, setting, newConversationS3HTTPClient())
+	for _, task := range tasks {
+		if err := queue.Submit(ctx, task); err != nil {
+			queue.CancelAndWait()
+			return err
+		}
+	}
+	return queue.Wait()
+}
+
+func newConversationS3UploadTaskQueue(ctx context.Context, job *model.ConversationExportJob, setting conversation_log_setting.S3Setting, client *http.Client) *conversationS3UploadTaskQueue {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	concurrency := setting.UploadConcurrency
 	if concurrency <= 0 {
 		concurrency = conversation_log_setting.GetSetting().S3.UploadConcurrency
@@ -142,37 +195,27 @@ func uploadConversationExportS3Tasks(ctx context.Context, job *model.Conversatio
 	if concurrency > maxConcurrency {
 		concurrency = maxConcurrency
 	}
-	if concurrency > len(tasks) {
-		concurrency = len(tasks)
-	}
 
 	uploadCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	client := newConversationS3HTTPClient()
-	taskCh := make(chan conversationS3UploadTask)
-	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
-	setErr := func(err error) {
-		if err == nil {
-			return
-		}
-		errMu.Lock()
-		if firstErr == nil {
-			firstErr = err
-			cancel()
-		}
-		errMu.Unlock()
+	if client == nil {
+		client = newConversationS3HTTPClient()
+	}
+	queue := &conversationS3UploadTaskQueue{
+		ctx:     uploadCtx,
+		cancel:  cancel,
+		taskCh:  make(chan conversationS3UploadTask, concurrency),
+		job:     job,
+		setting: setting,
+		client:  client,
 	}
 
 	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
+		queue.wg.Add(1)
 		go func() {
-			defer wg.Done()
-			for task := range taskCh {
-				if err := uploadCtx.Err(); err != nil {
-					setErr(err)
+			defer queue.wg.Done()
+			for task := range queue.taskCh {
+				if err := queue.ctx.Err(); err != nil {
+					queue.setErr(err)
 					return
 				}
 				if strings.TrimSpace(task.Progress) != "" {
@@ -180,31 +223,251 @@ func uploadConversationExportS3Tasks(ctx context.Context, job *model.Conversatio
 						"progress": task.Progress,
 					})
 				}
-				if err := uploadConversationExportArtifactToS3(uploadCtx, client, job, setting, task.Target); err != nil {
-					setErr(err)
+				if err := uploadConversationExportArtifactToS3(queue.ctx, client, job, setting, task.Target); err != nil {
+					queue.setErr(err)
 					return
 				}
 			}
 		}()
 	}
+	return queue
+}
 
-sendLoop:
-	for _, task := range tasks {
-		select {
-		case taskCh <- task:
-		case <-uploadCtx.Done():
-			break sendLoop
+func (q *conversationS3UploadTaskQueue) Submit(ctx context.Context, task conversationS3UploadTask) error {
+	if q == nil {
+		return fmt.Errorf("s3 upload queue is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := q.Err(); err != nil {
+		return err
+	}
+	q.sendMu.Lock()
+	defer q.sendMu.Unlock()
+	if q.closed {
+		return fmt.Errorf("s3 upload queue is closed")
+	}
+	select {
+	case q.taskCh <- task:
+		return nil
+	case <-q.ctx.Done():
+		if err := q.Err(); err != nil {
+			return err
+		}
+		return q.ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (q *conversationS3UploadTaskQueue) Wait() error {
+	if q == nil {
+		return nil
+	}
+	q.closeCh.Do(func() {
+		q.sendMu.Lock()
+		q.closed = true
+		close(q.taskCh)
+		q.sendMu.Unlock()
+	})
+	q.wg.Wait()
+	if err := q.Err(); err != nil {
+		return err
+	}
+	return q.ctx.Err()
+}
+
+func (q *conversationS3UploadTaskQueue) CancelAndWait() {
+	if q == nil {
+		return
+	}
+	q.cancel()
+	_ = q.Wait()
+}
+
+func (q *conversationS3UploadTaskQueue) Err() error {
+	if q == nil {
+		return nil
+	}
+	q.errMu.Lock()
+	defer q.errMu.Unlock()
+	return q.firstErr
+}
+
+func (q *conversationS3UploadTaskQueue) setErr(err error) {
+	if q == nil || err == nil {
+		return
+	}
+	q.errMu.Lock()
+	if q.firstErr == nil {
+		q.firstErr = err
+		q.cancel()
+	}
+	q.errMu.Unlock()
+}
+
+func newConversationExportS3ShardUploadPipeline(ctx context.Context, job *model.ConversationExportJob, setting conversation_log_setting.S3Setting) (*conversationExportS3ShardUploadPipeline, error) {
+	if job == nil {
+		return nil, fmt.Errorf("missing export job")
+	}
+	setting = normalizeConversationS3Setting(setting)
+	if err := validateConversationS3Setting(setting); err != nil {
+		return nil, err
+	}
+	client := newConversationS3HTTPClient()
+	planner, err := newConversationExportS3ShardUploadPlanner(ctx, job, setting, client)
+	if err != nil {
+		return nil, err
+	}
+	return &conversationExportS3ShardUploadPipeline{
+		queue:     newConversationS3UploadTaskQueue(ctx, job, setting, client),
+		planner:   planner,
+		nextIndex: 1,
+		pending:   make(map[int]TopManifestShard),
+	}, nil
+}
+
+func (p *conversationExportS3ShardUploadPipeline) SubmitShard(ctx context.Context, shard TopManifestShard) error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if shard.Index <= 0 {
+		return fmt.Errorf("invalid shard index %d", shard.Index)
+	}
+	p.pending[shard.Index] = shard
+	for {
+		next, ok := p.pending[p.nextIndex]
+		if !ok {
+			return nil
+		}
+		task, err := p.planner.TaskForShard(ctx, next)
+		if err != nil {
+			p.queue.CancelAndWait()
+			return err
+		}
+		if err := p.queue.Submit(ctx, task); err != nil {
+			p.queue.CancelAndWait()
+			return err
+		}
+		delete(p.pending, p.nextIndex)
+		p.nextIndex++
+	}
+}
+
+func (p *conversationExportS3ShardUploadPipeline) Wait(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	if err := p.queue.Wait(); err != nil {
+		return err
+	}
+	return p.planner.Finish(ctx)
+}
+
+func (p *conversationExportS3ShardUploadPipeline) CancelAndWait() {
+	if p == nil {
+		return
+	}
+	p.queue.CancelAndWait()
+}
+
+func (p *conversationExportS3ShardUploadPipeline) Err() error {
+	if p == nil {
+		return nil
+	}
+	return p.queue.Err()
+}
+
+func newConversationExportS3ShardUploadPlanner(ctx context.Context, job *model.ConversationExportJob, setting conversation_log_setting.S3Setting, client *http.Client) (*conversationExportS3ShardUploadPlanner, error) {
+	planner := &conversationExportS3ShardUploadPlanner{
+		job:     job,
+		setting: setting,
+		client:  client,
+	}
+	if !setting.RotationEnabled {
+		return planner, nil
+	}
+	maxObjects := setting.RotationMaxObjects
+	if maxObjects <= 0 {
+		min, _ := conversation_log_setting.RotationMaxObjectsBounds()
+		maxObjects = min
+	}
+	endpointURL, err := normalizeS3Endpoint(setting.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	state, err := scanActiveRotationDir(ctx, client, setting, endpointURL, maxObjects)
+	if err != nil {
+		return nil, fmt.Errorf("scan rotation directory: %s", redactS3UploadError(err.Error(), setting))
+	}
+	planner.rotation = true
+	planner.endpointURL = endpointURL
+	planner.maxObjects = maxObjects
+	planner.state = state
+	planner.ensuredDirs = make(map[string]struct{})
+	return planner, nil
+}
+
+func (p *conversationExportS3ShardUploadPlanner) TaskForShard(ctx context.Context, shard TopManifestShard) (conversationS3UploadTask, error) {
+	if p == nil || p.job == nil {
+		return conversationS3UploadTask{}, fmt.Errorf("missing s3 upload planner")
+	}
+	if strings.TrimSpace(shard.File) == "" {
+		return conversationS3UploadTask{}, fmt.Errorf("missing shard file")
+	}
+	localPath := filepath.Join(p.job.OutputDirectory, shard.File)
+	if !p.rotation {
+		target := newS3UploadTarget(p.setting.Prefix, p.job.OutputDirectory, localPath)
+		return conversationS3UploadTask{
+			Target:   target,
+			Progress: fmt.Sprintf("uploading S3 shard %d: %s", shard.Index, target.FileName),
+		}, nil
+	}
+	if p.state.objectCount >= p.maxObjects {
+		p.completedDirs = append(p.completedDirs, p.state)
+		p.state = nextRotationDir(p.state)
+	}
+	if _, ok := p.ensuredDirs[p.state.dirName]; !ok {
+		if err := ensureRotationDirMarker(ctx, p.client, p.setting, p.endpointURL, p.state.dirName); err != nil {
+			return conversationS3UploadTask{}, fmt.Errorf("ensure rotation dir %s: %s", p.state.dirName, redactS3UploadError(err.Error(), p.setting))
+		}
+		p.ensuredDirs[p.state.dirName] = struct{}{}
+	}
+	target := s3UploadTarget{
+		LocalPath: localPath,
+		FileName:  shard.File,
+		ObjectKey: buildRotationObjectKey("", p.state.dirName, shard.File),
+	}
+	task := conversationS3UploadTask{
+		Target:   target,
+		Progress: fmt.Sprintf("uploading S3 shard %d to %s: %s", shard.Index, p.state.dirName, shard.File),
+	}
+	p.state.objectCount++
+	if p.state.objectCount >= p.maxObjects {
+		p.completedDirs = append(p.completedDirs, p.state)
+		p.state = nextRotationDir(p.state)
+	}
+	return task, nil
+}
+
+func (p *conversationExportS3ShardUploadPlanner) Finish(ctx context.Context) error {
+	if p == nil || !p.rotation {
+		return nil
+	}
+	for _, completed := range p.completedDirs {
+		if err := finalizeRotationDir(ctx, p.client, p.setting, p.endpointURL, completed, p.maxObjects); err != nil {
+			return fmt.Errorf("finalize rotation dir %s: %s", completed.dirName, redactS3UploadError(err.Error(), p.setting))
 		}
 	}
-	close(taskCh)
-	wg.Wait()
-
-	errMu.Lock()
-	defer errMu.Unlock()
-	if firstErr != nil {
-		return firstErr
+	if len(p.completedDirs) > 0 && p.state.objectCount == 0 {
+		if err := ensureRotationDirMarker(ctx, p.client, p.setting, p.endpointURL, p.state.dirName); err != nil {
+			return fmt.Errorf("ensure next rotation dir %s: %s", p.state.dirName, redactS3UploadError(err.Error(), p.setting))
+		}
 	}
-	return ctx.Err()
+	return nil
 }
 
 func validateConversationS3Setting(setting conversation_log_setting.S3Setting) error {

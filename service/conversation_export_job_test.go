@@ -5,10 +5,14 @@ import (
 	"compress/gzip"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -112,6 +116,71 @@ func TestShardWriterStateWaitsForQueuedShardCompression(t *testing.T) {
 	require.Len(t, state.shardIDPaths, 2)
 	require.FileExists(t, filepath.Join(outputDir, state.shards[0].File))
 	require.FileExists(t, filepath.Join(outputDir, state.shards[1].File))
+	require.Greater(t, state.totalCompressed, int64(0))
+}
+
+func TestShardWriterStateUploadsShardAsCompressionCompletes(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+
+	var putCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NotEmpty(t, r.Header.Get("Authorization"))
+		if r.Method != http.MethodPut {
+			t.Fatalf("unexpected S3 request: %s %s", r.Method, r.URL.String())
+		}
+		atomic.AddInt32(&putCount, 1)
+		w.Header().Set("ETag", `"etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "out")
+	tmpDir := filepath.Join(dir, "tmp")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+	job := &model.ConversationExportJob{
+		JobId:           "s3-streaming-test",
+		Mode:            conversation_log_setting.ExportModeAPIHijackJSONL,
+		Trigger:         "auto",
+		OutputDirectory: outputDir,
+		S3Upload:        true,
+	}
+	uploader, err := newConversationExportS3ShardUploadPipeline(context.Background(), job, conversation_log_setting.S3Setting{
+		Enabled:           true,
+		Endpoint:          server.URL,
+		Region:            "ap-southeast-1",
+		Bucket:            "temporary-3",
+		AccessKey:         "ak",
+		SecretKey:         "sk",
+		Prefix:            "exports/conversation",
+		UploadConcurrency: 1,
+	})
+	require.NoError(t, err)
+
+	state := &shardWriterState{
+		jobID:            job.JobId,
+		mode:             job.Mode,
+		trigger:          job.Trigger,
+		outputDir:        outputDir,
+		tmpDir:           tmpDir,
+		createdAt:        1710000000,
+		shardTargetBytes: 1 << 20,
+		shardMaxBytes:    1 << 20,
+		s3Uploader:       uploader,
+	}
+	defer state.abortShardCompression()
+
+	require.NoError(t, state.appendLine([]byte(`{"id":1}`), []int{1}, 0, 100, 110, conversationDataKindResponses))
+	require.NoError(t, state.closeCurrentShard(context.Background()))
+
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&putCount) > 0
+	}, time.Second, 10*time.Millisecond)
+	require.NoError(t, state.waitForShardCompression(context.Background()))
+	require.NoError(t, state.waitForS3Uploads(context.Background()))
+	require.Len(t, state.shards, 1)
 	require.Greater(t, state.totalCompressed, int64(0))
 }
 
@@ -464,7 +533,7 @@ func setupConversationExportJobTestDB(t *testing.T) {
 	previous := model.LOG_DB
 	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "conversation-export-job.db")), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.ConversationLog{}, &model.ConversationExportJob{}))
+	require.NoError(t, db.AutoMigrate(&model.ConversationLog{}, &model.ConversationExportJob{}, &model.ConversationS3UploadLog{}))
 	model.LOG_DB = db
 	t.Cleanup(func() {
 		model.LOG_DB = previous

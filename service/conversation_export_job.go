@@ -641,6 +641,16 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	}
 	defer os.RemoveAll(tmpDir)
 
+	var s3Uploader *conversationExportS3ShardUploadPipeline
+	if job.S3Upload {
+		s3Setting := conversation_log_setting.GetSetting().S3
+		uploader, err := newConversationExportS3ShardUploadPipeline(ctx, job, s3Setting)
+		if err != nil {
+			return err
+		}
+		s3Uploader = uploader
+	}
+
 	state := &shardWriterState{
 		jobID:            job.JobId,
 		mode:             job.Mode,
@@ -651,6 +661,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		shardTargetBytes: job.ShardTargetBytes,
 		shardMaxBytes:    job.ShardMaxBytes,
 		snapshotMaxID:    snapshotMaxID,
+		s3Uploader:       s3Uploader,
 	}
 	defer func() {
 		state.abortShardCompression()
@@ -740,7 +751,10 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	})
 
 	if job.S3Upload {
-		if err := uploadConversationExportArtifactsToS3(ctx, job, manifestPath, state.shards); err != nil {
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"progress": "waiting for S3 uploads to finish",
+		})
+		if err := state.waitForS3Uploads(ctx); err != nil {
 			return err
 		}
 		updateJobProgress(job.JobId, map[string]interface{}{
@@ -864,6 +878,8 @@ type shardWriterState struct {
 	totalUncompressed int64
 	totalCompressed   int64
 	compressor        *shardCompressorPool
+	s3Uploader        *conversationExportS3ShardUploadPipeline
+	resultMu          sync.Mutex
 
 	// Session-mode cleanup ids. session_jsonl exports intentionally filter out
 	// H1-H4 failures and duplicate/subsequence sessions. When delete-after is
@@ -925,6 +941,7 @@ type shardCompressorPool struct {
 	err      error
 	results  []shardCompressionResult
 	closed   bool
+	onResult func(shardCompressionResult) error
 }
 
 func newShardCompressorPool(ctx context.Context, workers, queueSize int) *shardCompressorPool {
@@ -958,6 +975,11 @@ func (p *shardCompressorPool) worker() {
 			p.setErr(fmt.Errorf("compress shard %d: %w", job.Index, err))
 		} else {
 			p.addResult(result)
+			if p.onResult != nil {
+				if err := p.onResult(result); err != nil {
+					p.setErr(fmt.Errorf("handle compressed shard %d: %w", job.Index, err))
+				}
+			}
 		}
 		p.jobWG.Done()
 	}
@@ -1398,15 +1420,66 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 func (s *shardWriterState) ensureCompressor(ctx context.Context) *shardCompressorPool {
 	if s.compressor == nil {
 		s.compressor = newShardCompressorPool(ctx, conversationExportCompressionWorkers, conversationExportCompressionQueueSize)
+		if s.s3Uploader != nil {
+			s.compressor.onResult = func(result shardCompressionResult) error {
+				return s.handleShardCompressionResult(ctx, result, true)
+			}
+		}
 	}
 	return s.compressor
 }
 
 func (s *shardWriterState) compressionErr() error {
 	if s == nil || s.compressor == nil {
+		if s != nil && s.s3Uploader != nil {
+			return s.s3Uploader.Err()
+		}
 		return nil
 	}
+	if s.s3Uploader != nil {
+		if err := s.s3Uploader.Err(); err != nil {
+			return err
+		}
+	}
 	return s.compressor.Err()
+}
+
+func (s *shardWriterState) handleShardCompressionResult(ctx context.Context, result shardCompressionResult, submitS3 bool) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	s.resultMu.Lock()
+	s.shards = append(s.shards, result.Shard)
+	sort.Slice(s.shards, func(i, j int) bool {
+		return s.shards[i].Index < s.shards[j].Index
+	})
+	s.totalCompressed += result.Shard.CompressedBytes
+	if result.IDCount > 0 && result.IDsPath != "" {
+		s.shardIDPaths = append(s.shardIDPaths, result.IDsPath)
+	}
+	shardCount := len(s.shards)
+	totalCompressed := s.totalCompressed
+	totalUncompressed := s.totalUncompressed
+	totalRecordCount := s.totalRecordCount
+	totalSessionCount := s.totalSessionCount
+	s.resultMu.Unlock()
+
+	updateJobProgress(s.jobID, map[string]interface{}{
+		"shard_count":        shardCount,
+		"exported_records":   totalRecordCount,
+		"exported_sessions":  totalSessionCount,
+		"uncompressed_bytes": totalUncompressed,
+		"compressed_bytes":   totalCompressed,
+		"progress":           fmt.Sprintf("compressed %d shard(s), %.2f GiB uncompressed", shardCount, float64(totalUncompressed)/(1<<30)),
+	})
+	s.lastProgressAt = time.Now()
+
+	if submitS3 && s.s3Uploader != nil {
+		return s.s3Uploader.SubmitShard(ctx, result.Shard)
+	}
+	return nil
 }
 
 func (s *shardWriterState) waitForShardCompression(ctx context.Context) error {
@@ -1422,34 +1495,44 @@ func (s *shardWriterState) waitForShardCompression(ctx context.Context) error {
 			return err
 		}
 	}
+	if s.s3Uploader != nil {
+		s.compressor = nil
+		return nil
+	}
 	for _, result := range results {
-		s.shards = append(s.shards, result.Shard)
-		s.totalCompressed += result.Shard.CompressedBytes
-		if result.IDCount > 0 && result.IDsPath != "" {
-			s.shardIDPaths = append(s.shardIDPaths, result.IDsPath)
+		if err := s.handleShardCompressionResult(ctx, result, false); err != nil {
+			return err
 		}
 	}
 	s.compressor = nil
-	if len(results) > 0 {
-		updateJobProgress(s.jobID, map[string]interface{}{
-			"shard_count":        len(s.shards),
-			"exported_records":   s.totalRecordCount,
-			"exported_sessions":  s.totalSessionCount,
-			"uncompressed_bytes": s.totalUncompressed,
-			"compressed_bytes":   s.totalCompressed,
-			"progress":           fmt.Sprintf("compressed %d shard(s), %.2f GiB uncompressed", len(s.shards), float64(s.totalUncompressed)/(1<<30)),
-		})
-		s.lastProgressAt = time.Now()
+	return nil
+}
+
+func (s *shardWriterState) waitForS3Uploads(ctx context.Context) error {
+	if s == nil || s.s3Uploader == nil {
+		return nil
 	}
+	if err := s.s3Uploader.Wait(ctx); err != nil {
+		return err
+	}
+	s.s3Uploader = nil
 	return nil
 }
 
 func (s *shardWriterState) abortShardCompression() {
 	if s == nil || s.compressor == nil {
+		if s != nil && s.s3Uploader != nil {
+			s.s3Uploader.CancelAndWait()
+			s.s3Uploader = nil
+		}
 		return
 	}
 	s.compressor.CancelAndWait()
 	s.compressor = nil
+	if s.s3Uploader != nil {
+		s.s3Uploader.CancelAndWait()
+		s.s3Uploader = nil
+	}
 }
 
 func shardDataFilesFromPayloads(payloads []shardDataFilePayload) []ShardDataFile {
