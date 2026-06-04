@@ -131,12 +131,13 @@ func DeleteConversationLogs(c *gin.Context) {
 
 func UpdateConversationLogSettings(c *gin.Context) {
 	var req struct {
-		CaptureEnabled    *bool                               `json:"capture_enabled"`
-		RetentionDays     *int                                `json:"retention_days"`
-		MaxStorageGB      *int                                `json:"max_storage_gb"`
-		ExportDirectory   *string                             `json:"export_directory"`
-		DefaultExportMode *string                             `json:"default_export_mode"`
-		S3                *conversation_log_setting.S3Setting `json:"s3"`
+		CaptureEnabled     *bool                               `json:"capture_enabled"`
+		RetentionDays      *int                                `json:"retention_days"`
+		MaxStorageGB       *int                                `json:"max_storage_gb"`
+		LocalExportEnabled *bool                               `json:"local_export_enabled"`
+		ExportDirectory    *string                             `json:"export_directory"`
+		DefaultExportMode  *string                             `json:"default_export_mode"`
+		S3                 *conversation_log_setting.S3Setting `json:"s3"`
 
 		ExportScanBatchSize   *int `json:"export_scan_batch_size"`
 		ExportMarkBatchSize   *int `json:"export_mark_batch_size"`
@@ -176,6 +177,12 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 		if err := model.UpdateOption("conversation_log_setting.max_storage_gb", strconv.Itoa(*req.MaxStorageGB)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.LocalExportEnabled != nil {
+		if err := model.UpdateOption("conversation_log_setting.local_export_enabled", strconv.FormatBool(*req.LocalExportEnabled)); err != nil {
 			common.ApiError(c, err)
 			return
 		}

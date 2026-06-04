@@ -395,12 +395,13 @@ func conversationExportQualityConclusion(pass bool, failedCount int64, removedCo
 
 // ExportJobCreateRequest is the request payload for POST /export_jobs.
 type ExportJobCreateRequest struct {
-	Mode              string                     `json:"mode"`
-	Filter            model.ConversationLogQuery `json:"filter"`
-	ShardTargetBytes  int64                      `json:"shard_target_bytes"`
-	ShardMaxBytes     int64                      `json:"shard_max_bytes"`
-	DeleteAfterExport bool                       `json:"delete_after_export"`
-	S3Upload          bool                       `json:"s3_upload"`
+	Mode               string                     `json:"mode"`
+	Filter             model.ConversationLogQuery `json:"filter"`
+	ShardTargetBytes   int64                      `json:"shard_target_bytes"`
+	ShardMaxBytes      int64                      `json:"shard_max_bytes"`
+	DeleteAfterExport  bool                       `json:"delete_after_export"`
+	S3Upload           bool                       `json:"s3_upload"`
+	LocalExportEnabled *bool                      `json:"local_export_enabled,omitempty"`
 	// Trigger annotates how the job was started: "manual" (default) or "auto".
 	// Used for filename generation and audit/observability only.
 	Trigger string `json:"trigger,omitempty"`
@@ -452,6 +453,10 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 			return nil, err
 		}
 	}
+	localExportEnabled := exportJobLocalExportEnabled(req, settings)
+	if !localExportEnabled && !req.S3Upload {
+		return nil, fmt.Errorf("local export is disabled; enable S3 upload or turn on local export")
+	}
 
 	filter, err := snapshotConversationExportQuery(ctx, req.Filter)
 	if err != nil {
@@ -472,20 +477,21 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 		return nil, fmt.Errorf("create output directory: %w", err)
 	}
 	job := &model.ConversationExportJob{
-		CreatedAt:         now,
-		UpdatedAt:         now,
-		JobId:             jobID,
-		CreatedByUserId:   userID,
-		Mode:              mode,
-		FilterJSON:        string(filterBytes),
-		ShardTargetBytes:  targetBytes,
-		ShardMaxBytes:     maxBytes,
-		DeleteAfterExport: req.DeleteAfterExport,
-		S3Upload:          req.S3Upload,
-		Status:            model.ConversationExportJobStatusPending,
-		BatchId:           jobID,
-		OutputDirectory:   outputDir,
-		Trigger:           req.Trigger,
+		CreatedAt:           now,
+		UpdatedAt:           now,
+		JobId:               jobID,
+		CreatedByUserId:     userID,
+		Mode:                mode,
+		FilterJSON:          string(filterBytes),
+		ShardTargetBytes:    targetBytes,
+		ShardMaxBytes:       maxBytes,
+		DeleteAfterExport:   req.DeleteAfterExport,
+		S3Upload:            req.S3Upload,
+		LocalExportDisabled: !localExportEnabled,
+		Status:              model.ConversationExportJobStatusPending,
+		BatchId:             jobID,
+		OutputDirectory:     outputDir,
+		Trigger:             req.Trigger,
 	}
 	if err := model.CreateConversationExportJob(job); err != nil {
 		_ = os.RemoveAll(outputDir)
@@ -494,6 +500,17 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 
 	go runConversationExportJob(jobID)
 	return job, nil
+}
+
+func exportJobLocalExportEnabled(req ExportJobCreateRequest, settings conversation_log_setting.ConversationLogSetting) bool {
+	localExportEnabled := settings.LocalExportEnabled
+	if req.LocalExportEnabled != nil {
+		localExportEnabled = *req.LocalExportEnabled
+	}
+	if !settings.LocalExportEnabled {
+		localExportEnabled = false
+	}
+	return localExportEnabled
 }
 
 func exportJobDeliveryMode(reqMode string, settings conversation_log_setting.ConversationLogSetting) string {
@@ -602,6 +619,9 @@ func snapshotConversationExportQuery(ctx context.Context, query model.Conversati
 
 // executeExportJob is the actual work: scan, shard, write gzip JSONL, manifest.
 func executeExportJob(ctx context.Context, job *model.ConversationExportJob) error {
+	if job.LocalExportDisabled && !job.S3Upload {
+		return fmt.Errorf("local export disabled requires S3 upload")
+	}
 	var query model.ConversationLogQuery
 	if strings.TrimSpace(job.FilterJSON) != "" {
 		if err := common.Unmarshal([]byte(job.FilterJSON), &query); err != nil {
@@ -813,6 +833,17 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	progress := fmt.Sprintf("done: %d shard(s), %d record(s)", len(state.shards), state.totalRecordCount)
 	if deletedInvalid > 0 {
 		progress += fmt.Sprintf(", %d invalid source record(s) deleted", deletedInvalid)
+	}
+
+	if job.LocalExportDisabled {
+		updateJobProgress(job.JobId, map[string]interface{}{
+			"progress": "removing local export artifacts",
+		})
+		if err := cleanupLocalExportArtifacts(job); err != nil {
+			return fmt.Errorf("remove local export artifacts: %w", err)
+		}
+		manifestPath = ""
+		progress += ", local artifacts removed"
 	}
 
 	updateJobProgress(job.JobId, map[string]interface{}{
@@ -2844,6 +2875,25 @@ func DeleteExportJobArtifacts(job *model.ConversationExportJob) error {
 		return nil
 	}
 	return os.RemoveAll(job.OutputDirectory)
+}
+
+func cleanupLocalExportArtifacts(job *model.ConversationExportJob) error {
+	if job == nil || strings.TrimSpace(job.OutputDirectory) == "" {
+		return nil
+	}
+	outputDirectory := job.OutputDirectory
+	if err := os.RemoveAll(outputDirectory); err != nil {
+		return err
+	}
+	job.OutputDirectory = ""
+	job.ManifestPath = ""
+	if strings.TrimSpace(job.JobId) == "" {
+		return nil
+	}
+	return model.UpdateConversationExportJobFields(job.JobId, map[string]interface{}{
+		"output_directory": "",
+		"manifest_path":    "",
+	})
 }
 
 func markConversationLogIDsFromFile(path, batchID string, exportedAt int64, batchSize int) error {

@@ -228,6 +228,51 @@ func TestExportJobDeliveryModeCoercesSessionToAPIHijack(t *testing.T) {
 	)
 }
 
+func TestExportJobLocalExportEnabledHonorsGlobalDisable(t *testing.T) {
+	trueValue := true
+	falseValue := false
+
+	require.True(t, exportJobLocalExportEnabled(ExportJobCreateRequest{}, conversation_log_setting.ConversationLogSetting{
+		LocalExportEnabled: true,
+	}))
+	require.False(t, exportJobLocalExportEnabled(ExportJobCreateRequest{
+		LocalExportEnabled: &falseValue,
+	}, conversation_log_setting.ConversationLogSetting{
+		LocalExportEnabled: true,
+	}))
+	require.False(t, exportJobLocalExportEnabled(ExportJobCreateRequest{
+		LocalExportEnabled: &trueValue,
+	}, conversation_log_setting.ConversationLogSetting{
+		LocalExportEnabled: false,
+	}))
+}
+
+func TestCleanupLocalExportArtifactsClearsPaths(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+
+	outputDir := filepath.Join(t.TempDir(), "export")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	manifestPath := filepath.Join(outputDir, "manifest.json")
+	require.NoError(t, os.WriteFile(manifestPath, []byte(`{}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "shard-0001.jsonl.gz"), []byte("data"), 0o644))
+
+	job := &model.ConversationExportJob{
+		JobId:           "job-local-cleanup",
+		OutputDirectory: outputDir,
+		ManifestPath:    manifestPath,
+	}
+	require.NoError(t, model.CreateConversationExportJob(job))
+
+	require.NoError(t, cleanupLocalExportArtifacts(job))
+	_, err := os.Stat(outputDir)
+	require.True(t, os.IsNotExist(err))
+
+	fresh, err := model.GetConversationExportJobByJobID(job.JobId)
+	require.NoError(t, err)
+	require.Empty(t, fresh.OutputDirectory)
+	require.Empty(t, fresh.ManifestPath)
+}
+
 func TestConversationDataKindForRecordsPreservesSessionIntegrity(t *testing.T) {
 	require.Equal(t, conversationDataKindResponses, conversationDataKindForRecords([]*model.ConversationLog{
 		{RequestPath: "/v1/responses"},

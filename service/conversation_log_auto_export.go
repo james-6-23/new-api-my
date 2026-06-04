@@ -83,13 +83,14 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 	// shard_target_bytes must be in [1 GiB, shardMax]; pick the same value so
 	// every auto-export gzip shard is capped at exactly the configured ceiling.
 	req := ExportJobCreateRequest{
-		Mode:              mode,
-		ShardTargetBytes:  shardMax,
-		ShardMaxBytes:     shardMax,
-		DeleteAfterExport: settings.AutoExportDeleteAfter,
-		S3Upload:          settings.S3.Enabled,
-		Trigger:           "auto",
-		OutputRoot:        settings.AutoExportDirectory,
+		Mode:               mode,
+		ShardTargetBytes:   shardMax,
+		ShardMaxBytes:      shardMax,
+		DeleteAfterExport:  settings.AutoExportDeleteAfter,
+		S3Upload:           settings.S3.Enabled,
+		LocalExportEnabled: common.GetPointer(settings.LocalExportEnabled),
+		Trigger:            "auto",
+		OutputRoot:         settings.AutoExportDirectory,
 	}
 	job, err := CreateConversationExportJob(ctx, 0, req)
 	if err != nil {

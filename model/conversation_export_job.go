@@ -24,12 +24,13 @@ type ConversationExportJob struct {
 	JobId           string `json:"job_id" gorm:"type:varchar(64);uniqueIndex"`
 	CreatedByUserId int    `json:"created_by_user_id" gorm:"index"`
 
-	Mode              string `json:"mode" gorm:"type:varchar(32);index;default:''"`
-	FilterJSON        string `json:"filter_json" gorm:"type:text"`
-	ShardTargetBytes  int64  `json:"shard_target_bytes" gorm:"bigint;default:0"`
-	ShardMaxBytes     int64  `json:"shard_max_bytes" gorm:"bigint;default:0"`
-	DeleteAfterExport bool   `json:"delete_after_export" gorm:"default:false"`
-	S3Upload          bool   `json:"s3_upload" gorm:"default:false"`
+	Mode                string `json:"mode" gorm:"type:varchar(32);index;default:''"`
+	FilterJSON          string `json:"filter_json" gorm:"type:text"`
+	ShardTargetBytes    int64  `json:"shard_target_bytes" gorm:"bigint;default:0"`
+	ShardMaxBytes       int64  `json:"shard_max_bytes" gorm:"bigint;default:0"`
+	DeleteAfterExport   bool   `json:"delete_after_export" gorm:"default:false"`
+	S3Upload            bool   `json:"s3_upload" gorm:"default:false"`
+	LocalExportDisabled bool   `json:"local_export_disabled" gorm:"default:false"`
 
 	Status       string `json:"status" gorm:"type:varchar(16);index;default:'pending'"`
 	Progress     string `json:"progress" gorm:"type:varchar(255);default:''"`

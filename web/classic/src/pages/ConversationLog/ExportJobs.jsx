@@ -371,6 +371,7 @@ function normalizeExportJobFilter(filter = {}) {
 const ExportJobs = ({
   defaultMode = 'api_hijack_jsonl',
   defaultS3Upload = false,
+  localExportEnabled = true,
   getFilterParams,
 }) => {
   const { t } = useTranslation();
@@ -385,6 +386,7 @@ const ExportJobs = ({
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [total, setTotal] = useState(0);
+  const canCreateExport = localExportEnabled || defaultS3Upload;
 
   const loadJobs = async (nextPage = page, nextPageSize = pageSize) => {
     setLoading(true);
@@ -425,6 +427,10 @@ const ExportJobs = ({
   }, [jobs, autoRefresh, page, pageSize]);
 
   const onCreate = async (values) => {
+    if (!canCreateExport) {
+      showError(t('关闭本地导出时需要先启用 S3 上传'));
+      return;
+    }
     setCreating(true);
     try {
       const currentFilter =
@@ -435,7 +441,8 @@ const ExportJobs = ({
         shard_target_bytes: Math.round((values.shard_target_mb || 10240) * MB),
         shard_max_bytes: Math.round((values.shard_max_mb || 10240) * MB),
         delete_after_export: !!values.delete_after_export,
-        s3_upload: !!values.s3_upload,
+        s3_upload: !localExportEnabled ? true : !!values.s3_upload,
+        local_export_enabled: localExportEnabled,
       };
       const res = await API.post('/api/conversation_logs/export_jobs', payload);
       const { success, message } = res.data;
@@ -618,11 +625,19 @@ const ExportJobs = ({
       align: 'right',
     },
     {
-      title: 'S3',
+      title: t('交付'),
       dataIndex: 's3_upload',
-      width: 80,
-      render: (v) =>
-        v ? <Tag color='green'>{t('上传')}</Tag> : <Tag>{t('本地')}</Tag>,
+      width: 140,
+      render: (v, record) => (
+        <Space spacing={4} wrap>
+          {v ? <Tag color='green'>{t('上传')}</Tag> : null}
+          {record.local_export_disabled ? (
+            <Tag color='orange'>{t('不保留本地')}</Tag>
+          ) : (
+            <Tag>{t('本地')}</Tag>
+          )}
+        </Space>
+      ),
     },
     {
       title: t('记录数'),
@@ -715,6 +730,7 @@ const ExportJobs = ({
               theme='solid'
               type='primary'
               icon={<IconPlay />}
+              disabled={!canCreateExport}
               onClick={() => setCreateVisible(true)}
             >
               {t('新建正式交付任务')}
@@ -755,7 +771,7 @@ const ExportJobs = ({
         width={520}
       >
         <Form
-          key={`${defaultMode || 'api_hijack_jsonl'}-${defaultS3Upload ? 's3' : 'local'}`}
+          key={`${defaultMode || 'api_hijack_jsonl'}-${defaultS3Upload ? 's3' : 'local'}-${localExportEnabled ? 'keep-local' : 's3-only'}`}
           getFormApi={(api) => (createFormRef.current = api)}
           onSubmit={onCreate}
           initValues={{
@@ -763,7 +779,7 @@ const ExportJobs = ({
             shard_target_mb: 10240,
             shard_max_mb: 10240,
             delete_after_export: true,
-            s3_upload: defaultS3Upload,
+            s3_upload: defaultS3Upload || !localExportEnabled,
           }}
         >
           <Form.Select
@@ -793,17 +809,35 @@ const ExportJobs = ({
           <Form.Checkbox field='delete_after_export'>
             {t('导出完成后删除源记录')}
           </Form.Checkbox>
-          <Form.Checkbox field='s3_upload' disabled={!defaultS3Upload}>
+          <Form.Checkbox
+            field='s3_upload'
+            disabled={!defaultS3Upload || !localExportEnabled}
+          >
             {t('导出完成后上传到 S3')}
           </Form.Checkbox>
-          {!defaultS3Upload && (
+          {!localExportEnabled && defaultS3Upload && (
+            <Text type='warning' size='small'>
+              {t('本地保留已关闭，任务完成后仅保留 S3 上传结果')}
+            </Text>
+          )}
+          {!localExportEnabled && !defaultS3Upload && (
+            <Text type='danger' size='small'>
+              {t('关闭本地导出时需要先启用 S3 上传')}
+            </Text>
+          )}
+          {localExportEnabled && !defaultS3Upload && (
             <Text type='tertiary' size='small'>
               {t('需要先在采集配置中启用并保存 S3 设置')}
             </Text>
           )}
           <div className='mt-4 flex justify-end gap-2'>
             <Button onClick={() => setCreateVisible(false)}>{t('取消')}</Button>
-            <Button type='primary' htmlType='submit' loading={creating}>
+            <Button
+              type='primary'
+              htmlType='submit'
+              loading={creating}
+              disabled={!canCreateExport}
+            >
               {t('创建')}
             </Button>
           </div>
@@ -868,7 +902,10 @@ const ExportJobs = ({
                   key: t('完成时间'),
                   value: formatTimestamp(detail.finished_at),
                 },
-                { key: t('输出目录'), value: detail.output_directory },
+                {
+                  key: t('输出目录'),
+                  value: detail.output_directory || t('未保留本地文件'),
+                },
               ]}
             />
             <QualityReportPanel job={detail} t={t} />
@@ -880,7 +917,7 @@ const ExportJobs = ({
                 <Text type='danger'>{detail.error_message}</Text>
               </Card>
             )}
-            {detail.manifest_path && (
+            {detail.manifest_path && detail.output_directory && (
               <Button
                 icon={<IconDownload />}
                 onClick={() => downloadManifest(detail.job_id)}
@@ -888,7 +925,7 @@ const ExportJobs = ({
                 {t('下载 manifest.json')}
               </Button>
             )}
-            {detail.shard_count > 0 && (
+            {detail.shard_count > 0 && detail.output_directory && (
               <div>
                 <Title heading={6}>{t('分片下载')}</Title>
                 <Space wrap>

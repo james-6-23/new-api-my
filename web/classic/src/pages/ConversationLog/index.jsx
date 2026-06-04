@@ -73,6 +73,7 @@ const defaultSettings = {
   capture_enabled: true,
   retention_days: 30,
   max_storage_gb: 50,
+  local_export_enabled: true,
   export_directory: 'data/conversation_exports',
   default_export_mode: 'api_hijack_jsonl',
   s3: {
@@ -1460,6 +1461,7 @@ const ConversationLog = () => {
           <ExportJobs
             defaultMode={settings.default_export_mode}
             defaultS3Upload={settings.s3?.enabled === true}
+            localExportEnabled={settings.local_export_enabled !== false}
             getFilterParams={getFilterParams}
           />
         </Tabs.TabPane>
@@ -1563,10 +1565,30 @@ const ConversationLog = () => {
                         }
                       />
                     </Col>
-                    <Col xs={24} md={16}>
+                    <Col xs={24} md={8}>
+                      <Form.Switch
+                        field='local_export_enabled'
+                        label={t('保留本地导出文件')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={
+                          settings.local_export_enabled === false
+                            ? t('关闭后正式导出必须启用 S3 上传')
+                            : t('开启后在服务器本地保留正式导出分片')
+                        }
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            local_export_enabled: value,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} md={8}>
                       <Form.Input
                         field='export_directory'
                         label={t('本地导出目录')}
+                        disabled={settings.local_export_enabled === false}
                         onChange={(value) =>
                           setSettings({ ...settings, export_directory: value })
                         }

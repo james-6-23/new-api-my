@@ -39,13 +39,14 @@ func CreateExportJob(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, gin.H{
-		"job_id":             job.JobId,
-		"status":             job.Status,
-		"output_directory":   job.OutputDirectory,
-		"mode":               job.Mode,
-		"shard_target_bytes": job.ShardTargetBytes,
-		"shard_max_bytes":    job.ShardMaxBytes,
-		"s3_upload":          job.S3Upload,
+		"job_id":                job.JobId,
+		"status":                job.Status,
+		"output_directory":      job.OutputDirectory,
+		"mode":                  job.Mode,
+		"shard_target_bytes":    job.ShardTargetBytes,
+		"shard_max_bytes":       job.ShardMaxBytes,
+		"s3_upload":             job.S3Upload,
+		"local_export_disabled": job.LocalExportDisabled,
 	})
 }
 

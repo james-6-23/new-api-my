@@ -25,3 +25,12 @@ func TestGetSettingClampsS3UploadConcurrency(t *testing.T) {
 	require.Equal(t, 1, min)
 	require.Equal(t, 32, max)
 }
+
+func TestGetSettingDefaultsLocalExportEnabled(t *testing.T) {
+	previous := conversationLogSetting
+	t.Cleanup(func() {
+		conversationLogSetting = previous
+	})
+
+	require.True(t, GetSetting().LocalExportEnabled)
+}

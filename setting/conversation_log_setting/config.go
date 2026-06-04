@@ -68,12 +68,13 @@ type S3Setting struct {
 }
 
 type ConversationLogSetting struct {
-	CaptureEnabled    bool      `json:"capture_enabled"`
-	RetentionDays     int       `json:"retention_days"`
-	MaxStorageGB      int       `json:"max_storage_gb"`
-	ExportDirectory   string    `json:"export_directory"`
-	DefaultExportMode string    `json:"default_export_mode"`
-	S3                S3Setting `json:"s3"`
+	CaptureEnabled     bool      `json:"capture_enabled"`
+	RetentionDays      int       `json:"retention_days"`
+	MaxStorageGB       int       `json:"max_storage_gb"`
+	LocalExportEnabled bool      `json:"local_export_enabled"`
+	ExportDirectory    string    `json:"export_directory"`
+	DefaultExportMode  string    `json:"default_export_mode"`
+	S3                 S3Setting `json:"s3"`
 
 	DefaultShardTargetBytes int64 `json:"default_shard_target_bytes"`
 	DefaultShardMaxBytes    int64 `json:"default_shard_max_bytes"`
@@ -100,6 +101,7 @@ var conversationLogSetting = ConversationLogSetting{
 	CaptureEnabled:          true,
 	RetentionDays:           30,
 	MaxStorageGB:            50,
+	LocalExportEnabled:      true,
 	ExportDirectory:         filepath.Join("data", "conversation_exports"),
 	DefaultExportMode:       ExportModeAPIHijackJSONL,
 	DefaultShardTargetBytes: defaultShardTargetBytes,
