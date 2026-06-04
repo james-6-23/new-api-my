@@ -328,10 +328,7 @@ function computeJobPercent(job) {
   return 0;
 }
 
-const modeOptions = [
-  { value: 'session_jsonl', label: 'Session JSONL' },
-  { value: 'api_hijack_jsonl', label: 'API Hijack JSONL' },
-];
+const modeOptions = [{ value: 'api_hijack_jsonl', label: 'API Hijack JSONL' }];
 
 function normalizeExportJobFilter(filter = {}) {
   const next = { ...filter };
@@ -372,7 +369,7 @@ function normalizeExportJobFilter(filter = {}) {
 }
 
 const ExportJobs = ({
-  defaultMode = 'session_jsonl',
+  defaultMode = 'api_hijack_jsonl',
   defaultS3Upload = false,
   getFilterParams,
 }) => {
@@ -525,7 +522,7 @@ const ExportJobs = ({
   };
 
   const downloadShard = (jobId, n) => {
-    const fallback = `shard-${String(n).padStart(4, '0')}.tar.gz`;
+    const fallback = `shard-${String(n).padStart(4, '0')}.jsonl.gz`;
     const job = jobs.find((j) => j.job_id === jobId);
     let name = fallback;
     if (job?.created_at) {
@@ -540,7 +537,7 @@ const ExportJobs = ({
       const modeTag = job.mode === 'session_jsonl' ? 'session' : 'api';
       const trigger = job.trigger?.trim() || 'manual';
       const short = (job.job_id || '').slice(0, 8);
-      name = `conversation-logs-${modeTag}-${trigger}-${ts}-${short}-shard${String(n).padStart(4, '0')}.tar.gz`;
+      name = `conversation-logs-${modeTag}-${trigger}-${ts}-${short}-shard${String(n).padStart(4, '0')}.jsonl.gz`;
     }
     downloadBlob(
       `/api/conversation_logs/export_jobs/${jobId}/shards/${n}`,
@@ -702,7 +699,7 @@ const ExportJobs = ({
             </Title>
             <Text type='tertiary'>
               {t(
-                '按 MB 粒度配置分片大小,把合规数据打包成 v3.0 正式交付 tar.gz。包内包含分类 data jsonl、shard-manifest.json 和 path-manifest.json。',
+                '按 MB 粒度配置分片大小，把合规数据导出为 API Hijack JSONL，并生成 gzip 压缩分片。',
               )}
             </Text>
           </div>
@@ -758,11 +755,11 @@ const ExportJobs = ({
         width={520}
       >
         <Form
-          key={`${defaultMode || 'session_jsonl'}-${defaultS3Upload ? 's3' : 'local'}`}
+          key={`${defaultMode || 'api_hijack_jsonl'}-${defaultS3Upload ? 's3' : 'local'}`}
           getFormApi={(api) => (createFormRef.current = api)}
           onSubmit={onCreate}
           initValues={{
-            mode: defaultMode || 'session_jsonl',
+            mode: defaultMode || 'api_hijack_jsonl',
             shard_target_mb: 10240,
             shard_max_mb: 10240,
             delete_after_export: true,
@@ -904,7 +901,7 @@ const ExportJobs = ({
                       icon={<IconDownload />}
                       onClick={() => downloadShard(detail.job_id, n)}
                     >
-                      shard-{String(n).padStart(4, '0')}.tar.gz
+                      shard-{String(n).padStart(4, '0')}.jsonl.gz
                     </Button>
                   ))}
                 </Space>

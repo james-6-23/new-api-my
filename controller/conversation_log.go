@@ -204,6 +204,13 @@ func UpdateConversationLogSettings(c *gin.Context) {
 				return
 			}
 		}
+		if req.S3.UploadConcurrency != 0 {
+			minConcurrency, maxConcurrency := conversation_log_setting.S3UploadConcurrencyBounds()
+			if req.S3.UploadConcurrency < minConcurrency || req.S3.UploadConcurrency > maxConcurrency {
+				common.ApiErrorMsg(c, fmt.Sprintf("s3.upload_concurrency must be in [%d, %d]", minConcurrency, maxConcurrency))
+				return
+			}
+		}
 		data, err := common.Marshal(req.S3)
 		if err != nil {
 			common.ApiError(c, err)

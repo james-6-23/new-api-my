@@ -23,16 +23,19 @@ const (
 	defaultAutoExportCheckInterval  = 300 // seconds (5 minutes)
 
 	// S3 rotation defaults. When rotation is enabled, export artifacts are
-	// uploaded flat (tar.gz only, no per-job subdirectory and no manifest.json)
+	// uploaded flat (compressed shard files only, no per-job subdirectory and no manifest.json)
 	// into a rotating set of directories derived from the S3 object prefix:
 	// {prefix}, {prefix}-2, {prefix}-3, ... Each directory accepts at most
-	// RotationMaxObjects tar.gz files before the uploader rolls over to the next
+	// RotationMaxObjects compressed shard files before the uploader rolls over to the next
 	// one and drops a "{dir}-{count}-completed/" marker object so operators can
 	// see the directory is finished at a glance.
 	defaultS3RotationBaseDir    = "backup"
 	defaultS3RotationMaxObjects = 200
+	defaultS3UploadConcurrency  = 4
 	minS3RotationMaxObjects     = 1
 	maxS3RotationMaxObjects     = 100000
+	minS3UploadConcurrency      = 1
+	maxS3UploadConcurrency      = 32
 
 	defaultExportScanBatchSize   = 5000
 	defaultExportMarkBatchSize   = 2000
@@ -52,14 +55,16 @@ type S3Setting struct {
 
 	// RotationEnabled switches the upload layout from the legacy
 	// "{prefix}/{job-dir}/{manifest.json + shards}" scheme to a flat rotating
-	// scheme: each shard tar.gz is uploaded directly into a rotating directory
+	// scheme: each compressed shard is uploaded directly into a rotating directory
 	// derived from the prefix ("{prefix}", "{prefix}-2", "{prefix}-3", ...), with
 	// no per-job subdirectory and no manifest.json. When false, upload behaviour
 	// is unchanged (fully backward compatible).
 	RotationEnabled bool `json:"rotation_enabled"`
-	// RotationMaxObjects is the max number of tar.gz objects a single rotation
+	// RotationMaxObjects is the max number of compressed shard objects a single rotation
 	// directory holds before rolling over to the next one.
 	RotationMaxObjects int `json:"rotation_max_objects"`
+	// UploadConcurrency is the max number of shard objects uploaded to S3 at once.
+	UploadConcurrency int `json:"upload_concurrency"`
 }
 
 type ConversationLogSetting struct {
@@ -80,7 +85,7 @@ type ConversationLogSetting struct {
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
-	// packs them into tar.gz shards capped at AutoExportShardMaxBytes, then (if
+	// packs them into gzip JSONL shards capped at AutoExportShardMaxBytes, then (if
 	// AutoExportDeleteAfter is true) wipes the source rows so storage frees up.
 	AutoExportEnabled              bool   `json:"auto_export_enabled"`
 	AutoExportThresholdBytes       int64  `json:"auto_export_threshold_bytes"`
@@ -96,7 +101,7 @@ var conversationLogSetting = ConversationLogSetting{
 	RetentionDays:           30,
 	MaxStorageGB:            50,
 	ExportDirectory:         filepath.Join("data", "conversation_exports"),
-	DefaultExportMode:       ExportModeSessionJSONL,
+	DefaultExportMode:       ExportModeAPIHijackJSONL,
 	DefaultShardTargetBytes: defaultShardTargetBytes,
 	DefaultShardMaxBytes:    defaultShardMaxBytes,
 	ExportJobConcurrency:    1,
@@ -108,7 +113,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
 	AutoExportShardMaxBytes:        defaultAutoExportShardMaxBytes,
-	AutoExportMode:                 ExportModeSessionJSONL,
+	AutoExportMode:                 ExportModeAPIHijackJSONL,
 	AutoExportDirectory:            filepath.Join("data", "conversation_exports", "auto"),
 	AutoExportCheckIntervalSeconds: defaultAutoExportCheckInterval,
 	AutoExportDeleteAfter:          true,
@@ -129,9 +134,7 @@ func GetSetting() ConversationLogSetting {
 	if setting.ExportDirectory == "" {
 		setting.ExportDirectory = filepath.Join("data", "conversation_exports")
 	}
-	if !IsValidExportMode(setting.DefaultExportMode) {
-		setting.DefaultExportMode = ExportModeSessionJSONL
-	}
+	setting.DefaultExportMode = DeliveryExportMode(setting.DefaultExportMode)
 	setting.DefaultShardTargetBytes = clampShardBytes(setting.DefaultShardTargetBytes, defaultShardTargetBytes)
 	setting.DefaultShardMaxBytes = clampShardBytes(setting.DefaultShardMaxBytes, defaultShardMaxBytes)
 	if setting.DefaultShardMaxBytes < setting.DefaultShardTargetBytes {
@@ -150,9 +153,7 @@ func GetSetting() ConversationLogSetting {
 		setting.AutoExportThresholdBytes = defaultAutoExportThresholdBytes
 	}
 	setting.AutoExportShardMaxBytes = clampShardBytes(setting.AutoExportShardMaxBytes, defaultAutoExportShardMaxBytes)
-	if !IsValidExportMode(setting.AutoExportMode) {
-		setting.AutoExportMode = ExportModeSessionJSONL
-	}
+	setting.AutoExportMode = DeliveryExportMode(setting.AutoExportMode)
 	if setting.AutoExportDirectory == "" {
 		setting.AutoExportDirectory = filepath.Join("data", "conversation_exports", "auto")
 	}
@@ -161,6 +162,7 @@ func GetSetting() ConversationLogSetting {
 	}
 
 	setting.S3.RotationMaxObjects = clampRotationMaxObjects(setting.S3.RotationMaxObjects)
+	setting.S3.UploadConcurrency = clampS3UploadConcurrency(setting.S3.UploadConcurrency)
 	return setting
 }
 
@@ -171,6 +173,13 @@ func IsValidExportMode(mode string) bool {
 	default:
 		return false
 	}
+}
+
+func DeliveryExportMode(mode string) string {
+	if strings.TrimSpace(mode) == ExportModeAPIHijackJSONL {
+		return ExportModeAPIHijackJSONL
+	}
+	return ExportModeAPIHijackJSONL
 }
 
 func clampShardBytes(value, fallback int64) int64 {
@@ -219,4 +228,17 @@ func clampRotationMaxObjects(value int) int {
 // can validate operator input before persisting the setting.
 func RotationMaxObjectsBounds() (min, max int) {
 	return minS3RotationMaxObjects, maxS3RotationMaxObjects
+}
+
+func clampS3UploadConcurrency(value int) int {
+	if value < minS3UploadConcurrency || value > maxS3UploadConcurrency {
+		return defaultS3UploadConcurrency
+	}
+	return value
+}
+
+// S3UploadConcurrencyBounds exposes the valid [min, max] range so the
+// controller can validate operator input before persisting the setting.
+func S3UploadConcurrencyBounds() (min, max int) {
+	return minS3UploadConcurrency, maxS3UploadConcurrency
 }

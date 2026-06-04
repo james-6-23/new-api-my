@@ -67,14 +67,14 @@ import S3UploadLogs from './S3UploadLogs';
 
 const { Text, Title } = Typography;
 
-const exportModes = ['session_jsonl', 'api_hijack_jsonl'];
+const exportModes = ['api_hijack_jsonl'];
 
 const defaultSettings = {
   capture_enabled: true,
   retention_days: 30,
   max_storage_gb: 50,
   export_directory: 'data/conversation_exports',
-  default_export_mode: 'session_jsonl',
+  default_export_mode: 'api_hijack_jsonl',
   s3: {
     enabled: false,
     endpoint: '',
@@ -85,11 +85,12 @@ const defaultSettings = {
     prefix: '',
     rotation_enabled: false,
     rotation_max_objects: 200,
+    upload_concurrency: 4,
   },
   auto_export_enabled: false,
   auto_export_threshold_bytes: 10 * 1024 * 1024 * 1024,
   auto_export_shard_max_bytes: 10 * 1024 * 1024 * 1024,
-  auto_export_mode: 'session_jsonl',
+  auto_export_mode: 'api_hijack_jsonl',
   auto_export_directory: 'data/conversation_exports/auto',
   auto_export_check_interval_seconds: 300,
   auto_export_delete_after: true,
@@ -294,7 +295,7 @@ const ConversationLog = () => {
   const [s3RotationStatus, setS3RotationStatus] = useState(null);
   const [exportLoading, setExportLoading] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
-  const [mode, setMode] = useState('session_jsonl');
+  const [mode, setMode] = useState('api_hijack_jsonl');
   const [settings, setSettings] = useState(defaultSettings);
   const [summary, setSummary] = useState(null);
   const [batchRecommendationHint, setBatchRecommendationHint] = useState(null);
@@ -1549,7 +1550,6 @@ const ConversationLog = () => {
                         field='default_export_mode'
                         label={t('默认导出模式')}
                         optionList={[
-                          { label: t('Session JSONL'), value: 'session_jsonl' },
                           {
                             label: t('API Hijack JSONL'),
                             value: 'api_hijack_jsonl',
@@ -1708,7 +1708,9 @@ const ConversationLog = () => {
                         label={t('启用自动导出')}
                         checkedText={t('开')}
                         uncheckedText={t('关')}
-                        extraText={t('存储占用达到阈值时自动打包导出 tar.gz')}
+                        extraText={t(
+                          '存储占用达到阈值时自动导出 gzip JSONL 分片',
+                        )}
                         onChange={(value) =>
                           setSettings({
                             ...settings,
@@ -1737,7 +1739,7 @@ const ConversationLog = () => {
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
                         field='auto_export_shard_max_mb'
-                        label={t('单个压缩包最大 (MB)')}
+                        label={t('单个 gzip 文件最大 (MB)')}
                         min={64}
                         max={65536}
                         step={64}
@@ -1758,7 +1760,6 @@ const ConversationLog = () => {
                         field='auto_export_mode'
                         label={t('自动导出模式')}
                         optionList={[
-                          { label: t('Session JSONL'), value: 'session_jsonl' },
                           {
                             label: t('API Hijack JSONL'),
                             value: 'api_hijack_jsonl',
@@ -1901,6 +1902,22 @@ const ConversationLog = () => {
                         onChange={(value) => updateS3('secret_key', value)}
                       />
                     </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='s3.upload_concurrency'
+                        label={t('S3 上传并发数')}
+                        min={1}
+                        max={32}
+                        step={1}
+                        precision={0}
+                        style={{ width: '100%' }}
+                        extraText={t('单个导出任务内同时上传的分片数量')}
+                        disabled={!settings.s3?.enabled}
+                        onChange={(value) =>
+                          updateS3('upload_concurrency', value)
+                        }
+                      />
+                    </Col>
                   </Row>
                   <Row gutter={16} className='mt-2'>
                     <Col xs={24} sm={12} lg={8}>
@@ -1910,7 +1927,7 @@ const ConversationLog = () => {
                         checkedText={t('开')}
                         uncheckedText={t('关')}
                         extraText={t(
-                          '开启后仅上传 tar.gz（不含子目录与 manifest.json），以「S3 对象前缀」为基名按 前缀、前缀-2、前缀-3 … 轮换',
+                          '开启后仅上传 gzip JSONL 分片（不含子目录与 manifest.json），以「S3 对象前缀」为基名按 前缀、前缀-2、前缀-3 … 轮换',
                         )}
                         disabled={!settings.s3?.enabled}
                         onChange={(value) =>
@@ -1921,7 +1938,7 @@ const ConversationLog = () => {
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
                         field='s3.rotation_max_objects'
-                        label={t('每个目录最多 tar.gz 个数')}
+                        label={t('每个目录最多分片数')}
                         min={1}
                         max={100000}
                         step={1}

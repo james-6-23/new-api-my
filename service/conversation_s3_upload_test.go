@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
 
 	"github.com/stretchr/testify/require"
@@ -19,6 +20,20 @@ func TestBuildS3ObjectKeyUsesPrefixJobDirAndFileName(t *testing.T) {
 	key := buildS3ObjectKey("/exports/conversation/", "session_jsonl-20260528T010203-abcdef12", "manifest.json")
 
 	require.Equal(t, "exports/conversation/session_jsonl-20260528T010203-abcdef12/manifest.json", key)
+}
+
+func TestBuildConversationExportS3ShardTargetsSkipsManifest(t *testing.T) {
+	outputDir := filepath.Join(t.TempDir(), "api_hijack_jsonl-20260528T010203-abcdef12")
+	job := &model.ConversationExportJob{OutputDirectory: outputDir}
+
+	targets := buildConversationExportS3ShardTargets("/exports/conversation/", job, []TopManifestShard{
+		{File: "conversation-logs-api-auto-20260528T010203-abcdef12-shard0001.jsonl.gz"},
+	})
+
+	require.Len(t, targets, 1)
+	require.Equal(t, "conversation-logs-api-auto-20260528T010203-abcdef12-shard0001.jsonl.gz", targets[0].FileName)
+	require.Equal(t, "exports/conversation/api_hijack_jsonl-20260528T010203-abcdef12/conversation-logs-api-auto-20260528T010203-abcdef12-shard0001.jsonl.gz", targets[0].ObjectKey)
+	require.NotContains(t, targets[0].ObjectKey, "manifest.json")
 }
 
 func TestUploadS3ObjectFromFileUsesPathStyleForLocalEndpoint(t *testing.T) {

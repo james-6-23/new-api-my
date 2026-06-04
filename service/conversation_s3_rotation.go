@@ -23,11 +23,11 @@ import (
 // When S3Setting.RotationEnabled is true, export shards are uploaded flat into
 // a rotating set of directories instead of the legacy per-job subdirectory:
 //
-//	{prefix}/{base}/conversation-logs-....tar.gz
-//	{prefix}/{base}-2/conversation-logs-....tar.gz
+//	{prefix}/{base}/conversation-logs-....jsonl.gz
+//	{prefix}/{base}-2/conversation-logs-....jsonl.gz
 //	{prefix}/{base}-3/...
 //
-// Each directory holds at most RotationMaxObjects tar.gz files. Once a directory
+// Each directory holds at most RotationMaxObjects compressed shard files. Once a directory
 // is full, a zero-byte marker object "{base}-N-{count}-completed/" is written
 // next to it (same parent) so operators can tell at a glance the directory
 // reached its target, then the uploader rolls over to "{base}-(N+1)".
@@ -53,7 +53,7 @@ type s3ListCommonPrefix struct {
 }
 
 // rotationDirState describes the directory the uploader should write into next,
-// plus how many tar.gz objects it already holds.
+// plus how many compressed shard objects it already holds.
 type rotationDirState struct {
 	// index is the 1-based directory ordinal. index 1 => "{base}", index 2 =>
 	// "{base}-2", and so on.
@@ -61,13 +61,13 @@ type rotationDirState struct {
 	// dirName is the directory name relative to the prefix, e.g. "backup" or
 	// "backup-3" (no trailing slash).
 	dirName string
-	// objectCount is the number of tar.gz objects already in the directory.
+	// objectCount is the number of compressed shard objects already in the directory.
 	objectCount int
 }
 
 type rotationDirInspection struct {
-	tarGzCount      int
-	hasSubdirectory bool
+	shardObjectCount int
+	hasSubdirectory  bool
 }
 
 type ConversationS3RotationStatus struct {
@@ -124,7 +124,7 @@ func rotationDirOrdinal(base, dirName string) (int, bool) {
 	return ordinal, true
 }
 
-// uploadConversationExportShardsRotating uploads only the shard tar.gz files,
+// uploadConversationExportShardsRotating uploads only the compressed shard files,
 // flat, into the rotating directory scheme. manifest.json is intentionally not
 // uploaded in this mode.
 func uploadConversationExportShardsRotating(ctx context.Context, job *model.ConversationExportJob, shards []TopManifestShard, setting conversation_log_setting.S3Setting) error {
@@ -166,6 +166,8 @@ func uploadConversationExportShardsRotating(ctx context.Context, job *model.Conv
 		return fmt.Errorf("scan rotation directory: %s", redactS3UploadError(err.Error(), setting))
 	}
 	ensuredDirs := make(map[string]struct{})
+	completedDirs := make([]rotationDirState, 0)
+	tasks := make([]conversationS3UploadTask, 0, len(uploads))
 
 	for i, up := range uploads {
 		if err := ctx.Err(); err != nil {
@@ -173,9 +175,7 @@ func uploadConversationExportShardsRotating(ctx context.Context, job *model.Conv
 		}
 		// Roll over before writing if the current directory is full.
 		if state.objectCount >= maxObjects {
-			if err := finalizeRotationDir(ctx, client, setting, endpointURL, state, maxObjects); err != nil {
-				return fmt.Errorf("finalize rotation dir %s: %s", state.dirName, redactS3UploadError(err.Error(), setting))
-			}
+			completedDirs = append(completedDirs, state)
 			state = nextRotationDir(state)
 		}
 		if _, ok := ensuredDirs[state.dirName]; !ok {
@@ -188,29 +188,34 @@ func uploadConversationExportShardsRotating(ctx context.Context, job *model.Conv
 		// state.dirName is the full rotation directory (e.g. "backup-2"); the
 		// object key is just "{dir}/{file}" since the prefix IS the base.
 		objectKey := buildRotationObjectKey("", state.dirName, up.fileName)
-		updateJobProgress(job.JobId, map[string]interface{}{
-			"progress": fmt.Sprintf("uploading S3 object %d/%d to %s: %s", i+1, len(uploads), state.dirName, up.fileName),
-		})
 		target := s3UploadTarget{
 			LocalPath: up.localPath,
 			FileName:  up.fileName,
 			ObjectKey: objectKey,
 		}
-		if err := uploadConversationExportArtifactToS3(ctx, client, job, setting, target); err != nil {
-			return err
-		}
+		tasks = append(tasks, conversationS3UploadTask{
+			Target:   target,
+			Progress: fmt.Sprintf("uploading S3 object %d/%d to %s: %s", i+1, len(uploads), state.dirName, up.fileName),
+		})
 		state.objectCount++
+		if state.objectCount >= maxObjects {
+			completedDirs = append(completedDirs, state)
+			state = nextRotationDir(state)
+		}
 	}
 
-	// If the last directory exactly reached the cap, finalize it now so the
-	// completion marker shows up without waiting for the next job.
-	if state.objectCount >= maxObjects {
-		if err := finalizeRotationDir(ctx, client, setting, endpointURL, state, maxObjects); err != nil {
-			return fmt.Errorf("finalize rotation dir %s: %s", state.dirName, redactS3UploadError(err.Error(), setting))
+	if err := uploadConversationExportS3Tasks(ctx, job, setting, tasks); err != nil {
+		return err
+	}
+
+	for _, completed := range completedDirs {
+		if err := finalizeRotationDir(ctx, client, setting, endpointURL, completed, maxObjects); err != nil {
+			return fmt.Errorf("finalize rotation dir %s: %s", completed.dirName, redactS3UploadError(err.Error(), setting))
 		}
-		next := nextRotationDir(state)
-		if err := ensureRotationDirMarker(ctx, client, setting, endpointURL, next.dirName); err != nil {
-			return fmt.Errorf("ensure next rotation dir %s: %s", next.dirName, redactS3UploadError(err.Error(), setting))
+	}
+	if len(completedDirs) > 0 && state.objectCount == 0 {
+		if err := ensureRotationDirMarker(ctx, client, setting, endpointURL, state.dirName); err != nil {
+			return fmt.Errorf("ensure next rotation dir %s: %s", state.dirName, redactS3UploadError(err.Error(), setting))
 		}
 	}
 	return nil
@@ -406,7 +411,7 @@ func preserveTrailingSlashObjectURL(reqURL *url.URL, objectKey string) {
 }
 
 // scanActiveRotationDir lists the bucket to find the highest-numbered rotation
-// directory that is not yet finalized, and counts how many tar.gz objects it
+// directory that is not yet finalized, and counts how many compressed shard objects it
 // already holds. The rotation base is the S3 object prefix itself ("backup",
 // "backup-2", ... at the bucket root, or under a parent path for multi-segment
 // prefixes). When the highest directory is already full (>= maxObjects) it
@@ -431,7 +436,7 @@ func scanActiveRotationDir(ctx context.Context, client *http.Client, setting con
 	// Find rotation directories and completion markers separately. Empty
 	// directory markers alone do not prove that rotation has advanced; object
 	// store consoles can leave stale zero-byte "folders" behind. We only treat a
-	// directory as occupied when it contains direct tar.gz objects or legacy
+	// directory as occupied when it contains direct shard objects or legacy
 	// subdirectories.
 	directories := make([]int, 0)
 	highestCompleted := 0
@@ -464,17 +469,17 @@ func scanActiveRotationDir(ctx context.Context, client *http.Client, setting con
 		if err != nil {
 			return rotationDirState{}, err
 		}
-		if inspection.tarGzCount == 0 && !inspection.hasSubdirectory {
+		if inspection.shardObjectCount == 0 && !inspection.hasSubdirectory {
 			continue
 		}
-		state := rotationDirState{index: ord, dirName: dir, objectCount: inspection.tarGzCount}
+		state := rotationDirState{index: ord, dirName: dir, objectCount: inspection.shardObjectCount}
 		// A pre-rotation backup directory may contain legacy per-job
-		// subdirectories instead of root-level tar.gz files. Treat that layout as
-		// occupied and start the new flat tar.gz rotation in the next ordinal.
-		if inspection.tarGzCount == 0 && inspection.hasSubdirectory {
+		// subdirectories instead of root-level shard files. Treat that layout as
+		// occupied and start the new flat rotation in the next ordinal.
+		if inspection.shardObjectCount == 0 && inspection.hasSubdirectory {
 			return nextRotationDir(state), nil
 		}
-		if inspection.tarGzCount >= maxObjects {
+		if inspection.shardObjectCount >= maxObjects {
 			return nextRotationDir(state), nil
 		}
 		return state, nil
@@ -531,13 +536,13 @@ func listS3CommonPrefixesWithStyle(ctx context.Context, client *http.Client, set
 	return prefixes, nil
 }
 
-// countS3TarGzObjects counts objects ending in ".tar.gz" directly under prefix.
-func countS3TarGzObjects(ctx context.Context, client *http.Client, setting conversation_log_setting.S3Setting, endpointURL *url.URL, prefix string) (int, error) {
+// countS3ShardObjects counts compressed shard objects directly under prefix.
+func countS3ShardObjects(ctx context.Context, client *http.Client, setting conversation_log_setting.S3Setting, endpointURL *url.URL, prefix string) (int, error) {
 	inspection, err := inspectS3RotationDir(ctx, client, setting, endpointURL, prefix)
 	if err != nil {
 		return 0, err
 	}
-	return inspection.tarGzCount, nil
+	return inspection.shardObjectCount, nil
 }
 
 func inspectS3RotationDir(ctx context.Context, client *http.Client, setting conversation_log_setting.S3Setting, endpointURL *url.URL, prefix string) (rotationDirInspection, error) {
@@ -567,8 +572,8 @@ func inspectS3RotationDirWithStyle(ctx context.Context, client *http.Client, set
 			inspection.hasSubdirectory = true
 		}
 		for _, obj := range result.Contents {
-			if strings.HasSuffix(strings.ToLower(obj.Key), ".tar.gz") {
-				inspection.tarGzCount++
+			if isConversationExportShardObject(obj.Key) {
+				inspection.shardObjectCount++
 			}
 		}
 		if !result.IsTruncated || strings.TrimSpace(result.NextContinuationToken) == "" {
@@ -577,6 +582,11 @@ func inspectS3RotationDirWithStyle(ctx context.Context, client *http.Client, set
 		continuation = result.NextContinuationToken
 	}
 	return inspection, nil
+}
+
+func isConversationExportShardObject(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	return strings.HasSuffix(key, ".jsonl.gz") || strings.HasSuffix(key, ".tar.gz")
 }
 
 // listS3ObjectsV2 performs a single ListObjectsV2 request.

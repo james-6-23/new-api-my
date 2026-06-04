@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -50,6 +51,11 @@ type s3UploadResult struct {
 	FileSize      int64
 }
 
+type conversationS3UploadTask struct {
+	Target   s3UploadTarget
+	Progress string
+}
+
 type ConversationS3ConnectionTestResult struct {
 	Endpoint        string `json:"endpoint"`
 	Region          string `json:"region"`
@@ -80,7 +86,7 @@ type s3CompleteMultipartUploadResult struct {
 	ETag string `xml:"ETag"`
 }
 
-func uploadConversationExportArtifactsToS3(ctx context.Context, job *model.ConversationExportJob, manifestPath string, shards []TopManifestShard) error {
+func uploadConversationExportArtifactsToS3(ctx context.Context, job *model.ConversationExportJob, _ string, shards []TopManifestShard) error {
 	if job == nil {
 		return fmt.Errorf("missing export job")
 	}
@@ -91,32 +97,114 @@ func uploadConversationExportArtifactsToS3(ctx context.Context, job *model.Conve
 	if setting.RotationEnabled {
 		return uploadConversationExportShardsRotating(ctx, job, shards, setting)
 	}
-	targets := make([]s3UploadTarget, 0, len(shards)+1)
-	targets = append(targets, newS3UploadTarget(setting.Prefix, job.OutputDirectory, manifestPath))
+	targets := buildConversationExportS3ShardTargets(setting.Prefix, job, shards)
+	if len(targets) == 0 {
+		return nil
+	}
+
+	tasks := make([]conversationS3UploadTask, 0, len(targets))
+	for i, target := range targets {
+		tasks = append(tasks, conversationS3UploadTask{
+			Target:   target,
+			Progress: fmt.Sprintf("uploading S3 object %d/%d: %s", i+1, len(targets), target.FileName),
+		})
+	}
+	return uploadConversationExportS3Tasks(ctx, job, setting, tasks)
+}
+
+func buildConversationExportS3ShardTargets(prefix string, job *model.ConversationExportJob, shards []TopManifestShard) []s3UploadTarget {
+	if job == nil {
+		return nil
+	}
+	targets := make([]s3UploadTarget, 0, len(shards))
 	for _, shard := range shards {
 		if strings.TrimSpace(shard.File) == "" {
 			continue
 		}
 		localPath := filepath.Join(job.OutputDirectory, shard.File)
-		targets = append(targets, newS3UploadTarget(setting.Prefix, job.OutputDirectory, localPath))
+		targets = append(targets, newS3UploadTarget(prefix, job.OutputDirectory, localPath))
 	}
-	if len(targets) == 0 {
+	return targets
+}
+
+func uploadConversationExportS3Tasks(ctx context.Context, job *model.ConversationExportJob, setting conversation_log_setting.S3Setting, tasks []conversationS3UploadTask) error {
+	if len(tasks) == 0 {
 		return nil
 	}
+	concurrency := setting.UploadConcurrency
+	if concurrency <= 0 {
+		concurrency = conversation_log_setting.GetSetting().S3.UploadConcurrency
+	}
+	minConcurrency, maxConcurrency := conversation_log_setting.S3UploadConcurrencyBounds()
+	if concurrency < minConcurrency {
+		concurrency = minConcurrency
+	}
+	if concurrency > maxConcurrency {
+		concurrency = maxConcurrency
+	}
+	if concurrency > len(tasks) {
+		concurrency = len(tasks)
+	}
+
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	client := newConversationS3HTTPClient()
-	for i, target := range targets {
-		if err := ctx.Err(); err != nil {
-			return err
+	taskCh := make(chan conversationS3UploadTask)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	setErr := func(err error) {
+		if err == nil {
+			return
 		}
-		updateJobProgress(job.JobId, map[string]interface{}{
-			"progress": fmt.Sprintf("uploading S3 object %d/%d: %s", i+1, len(targets), target.FileName),
-		})
-		if err := uploadConversationExportArtifactToS3(ctx, client, job, setting, target); err != nil {
-			return err
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskCh {
+				if err := uploadCtx.Err(); err != nil {
+					setErr(err)
+					return
+				}
+				if strings.TrimSpace(task.Progress) != "" {
+					updateJobProgress(job.JobId, map[string]interface{}{
+						"progress": task.Progress,
+					})
+				}
+				if err := uploadConversationExportArtifactToS3(uploadCtx, client, job, setting, task.Target); err != nil {
+					setErr(err)
+					return
+				}
+			}
+		}()
+	}
+
+sendLoop:
+	for _, task := range tasks {
+		select {
+		case taskCh <- task:
+		case <-uploadCtx.Done():
+			break sendLoop
 		}
 	}
-	return nil
+	close(taskCh)
+	wg.Wait()
+
+	errMu.Lock()
+	defer errMu.Unlock()
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
 }
 
 func validateConversationS3Setting(setting conversation_log_setting.S3Setting) error {

@@ -1,7 +1,6 @@
 package service
 
 import (
-	"archive/tar"
 	"bufio"
 	"compress/gzip"
 	"context"
@@ -20,45 +19,32 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestStreamShardTarGzIncludesPathManifest(t *testing.T) {
+func TestStreamShardJSONLGzWritesRawJSONL(t *testing.T) {
 	dir := t.TempDir()
-	jsonlPath := filepath.Join(dir, "responses-data-1.jsonl")
+	jsonlPath := filepath.Join(dir, "data.jsonl")
 	data := []byte("{\"session_id\":\"sess_1\"}\n")
 	require.NoError(t, os.WriteFile(jsonlPath, data, 0o644))
 
 	dataFile := ShardDataFile{
-		Path:              "shard-0001/responses-data-1.jsonl",
-		Kind:              conversationDataKindResponses,
+		Path:              "data.jsonl",
+		Kind:              conversationDataKindData,
 		RecordCount:       1,
 		SourceRecordCount: 1,
 		SessionCount:      0,
 		UncompressedBytes: int64(len(data)),
 		SHA256:            "test-sha",
 	}
-	shardManifest := []byte(`{"record_count":1}`)
-	pathManifest, err := common.Marshal(buildShardPathManifest("shard-0001", []ShardDataFile{dataFile}))
-	require.NoError(t, err)
 
-	tarPath := filepath.Join(dir, "shard.tar.gz")
-	require.NoError(t, streamShardTarGz(tarPath, "shard-0001", []shardDataFilePayload{{
+	gzPath := filepath.Join(dir, "shard.jsonl.gz")
+	require.NoError(t, streamShardJSONLGz(gzPath, []shardDataFilePayload{{
 		ShardDataFile: dataFile,
 		SourcePath:    jsonlPath,
-	}}, shardManifest, pathManifest))
+	}}))
 
-	entries := readTarGzEntries(t, tarPath)
-
-	require.Equal(t, data, entries["shard-0001/responses-data-1.jsonl"])
-	require.JSONEq(t, string(shardManifest), string(entries["shard-0001/shard-manifest.json"]))
-	require.Contains(t, string(entries["shard-0001/path-manifest.json"]), `"path":"shard-0001/responses-data-1.jsonl"`)
-
-	var parsed ShardPathManifest
-	require.NoError(t, common.Unmarshal(entries["shard-0001/path-manifest.json"], &parsed))
-	require.Equal(t, "tar.gz", parsed.PackageFormat)
-	require.Equal(t, "jsonl", parsed.DataFormat)
-	require.Equal(t, "UTF-8", parsed.Encoding)
+	require.Equal(t, data, readGzipBytes(t, gzPath))
 }
 
-func TestShardWriterStateSplitsDataFilesByKind(t *testing.T) {
+func TestShardWriterStateWritesSingleJSONLGz(t *testing.T) {
 	dir := t.TempDir()
 	outputDir := filepath.Join(dir, "out")
 	tmpDir := filepath.Join(dir, "tmp")
@@ -81,21 +67,19 @@ func TestShardWriterStateSplitsDataFilesByKind(t *testing.T) {
 	require.NoError(t, state.waitForShardCompression(context.Background()))
 
 	require.Len(t, state.shards, 1)
-	entries := readTarGzEntries(t, filepath.Join(outputDir, state.shards[0].File))
-	require.Equal(t, []byte("{\"trajectory_id\":\"resp\"}\n"), entries["shard-0001/responses-data-1.jsonl"])
-	require.Equal(t, []byte("{\"trajectory_id\":\"msg\"}\n"), entries["shard-0001/messages-data-1.jsonl"])
-	require.Equal(t, []byte("{\"trajectory_id\":\"chat\"}\n"), entries["shard-0001/completions-data-1.jsonl"])
-	require.Equal(t, []byte("{\"trajectory_id\":\"mixed\"}\n"), entries["shard-0001/mixed-data-1.jsonl"])
-
-	var manifest ShardManifest
-	require.NoError(t, common.Unmarshal(entries["shard-0001/shard-manifest.json"], &manifest))
-	require.EqualValues(t, 5, manifest.RecordCount)
-	require.EqualValues(t, 4, manifest.SessionCount)
-	require.Len(t, manifest.DataFiles, 4)
-	require.Equal(t, "shard-0001/responses-data-1.jsonl", manifest.DataFiles[0].Path)
-	require.Equal(t, "shard-0001/messages-data-1.jsonl", manifest.DataFiles[1].Path)
-	require.Equal(t, "shard-0001/completions-data-1.jsonl", manifest.DataFiles[2].Path)
-	require.Equal(t, "shard-0001/mixed-data-1.jsonl", manifest.DataFiles[3].Path)
+	require.True(t, strings.HasSuffix(state.shards[0].File, ".jsonl.gz"))
+	data := readGzipBytes(t, filepath.Join(outputDir, state.shards[0].File))
+	require.Equal(t, []byte(
+		"{\"trajectory_id\":\"resp\"}\n"+
+			"{\"trajectory_id\":\"msg\"}\n"+
+			"{\"trajectory_id\":\"chat\"}\n"+
+			"{\"trajectory_id\":\"mixed\"}\n",
+	), data)
+	require.EqualValues(t, 5, state.shards[0].RecordCount)
+	require.EqualValues(t, 4, state.shards[0].SessionCount)
+	require.Len(t, state.shards[0].DataFiles, 1)
+	require.Equal(t, "data.jsonl", state.shards[0].DataFiles[0].Path)
+	require.Equal(t, conversationDataKindData, state.shards[0].DataFiles[0].Kind)
 }
 
 func TestShardWriterStateWaitsForQueuedShardCompression(t *testing.T) {
@@ -136,24 +120,43 @@ func TestShardCompressorPoolReturnsCompressionError(t *testing.T) {
 	pool := newShardCompressorPool(context.Background(), 1, 1)
 	require.NoError(t, pool.Submit(shardCompressionJob{
 		Index:      1,
-		InnerName:  "shard-0001",
-		TmpTarPath: filepath.Join(dir, "missing.tar.gz"),
-		TarPath:    filepath.Join(dir, "out.tar.gz"),
+		TmpPath:    filepath.Join(dir, "missing.jsonl.gz"),
+		OutputPath: filepath.Join(dir, "out.jsonl.gz"),
 		DataPayloads: []shardDataFilePayload{{
 			ShardDataFile: ShardDataFile{
-				Path:              "shard-0001/responses-data-1.jsonl",
+				Path:              "data.jsonl",
 				UncompressedBytes: 10,
 			},
 			SourcePath: filepath.Join(dir, "missing.jsonl"),
 		}},
-		ManifestBytes:     []byte(`{}`),
-		PathManifestBytes: []byte(`{}`),
 	}))
 
 	results, err := pool.Wait()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "compress shard 1")
 	require.Empty(t, results)
+}
+
+func TestExportJobDeliveryModeCoercesSessionToAPIHijack(t *testing.T) {
+	settings := conversation_log_setting.ConversationLogSetting{
+		DefaultExportMode: conversation_log_setting.ExportModeSessionJSONL,
+	}
+
+	require.Equal(
+		t,
+		conversation_log_setting.ExportModeAPIHijackJSONL,
+		exportJobDeliveryMode("", settings),
+	)
+	require.Equal(
+		t,
+		conversation_log_setting.ExportModeAPIHijackJSONL,
+		exportJobDeliveryMode(conversation_log_setting.ExportModeSessionJSONL, settings),
+	)
+	require.Equal(
+		t,
+		conversation_log_setting.ExportModeAPIHijackJSONL,
+		exportJobDeliveryMode(conversation_log_setting.ExportModeAPIHijackJSONL, settings),
+	)
 }
 
 func TestConversationDataKindForRecordsPreservesSessionIntegrity(t *testing.T) {
@@ -468,10 +471,10 @@ func setupConversationExportJobTestDB(t *testing.T) {
 	})
 }
 
-func readTarGzEntries(t *testing.T, tarPath string) map[string][]byte {
+func readGzipBytes(t *testing.T, gzPath string) []byte {
 	t.Helper()
 
-	file, err := os.Open(tarPath)
+	file, err := os.Open(gzPath)
 	require.NoError(t, err)
 	defer file.Close()
 
@@ -479,19 +482,9 @@ func readTarGzEntries(t *testing.T, tarPath string) map[string][]byte {
 	require.NoError(t, err)
 	defer gz.Close()
 
-	tr := tar.NewReader(gz)
-	entries := map[string][]byte{}
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		require.NoError(t, err)
-		body, err := io.ReadAll(tr)
-		require.NoError(t, err)
-		entries[header.Name] = body
-	}
-	return entries
+	body, err := io.ReadAll(gz)
+	require.NoError(t, err)
+	return body
 }
 
 func TestBuildExportJobOutputDirNameUsesModeTimestampAndShortID(t *testing.T) {

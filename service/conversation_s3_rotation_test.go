@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
@@ -79,8 +80,14 @@ func TestCompletedMarkerOrdinal(t *testing.T) {
 }
 
 func TestBuildRotationObjectKey(t *testing.T) {
-	require.Equal(t, "backup/file.tar.gz", buildRotationObjectKey("", "backup", "file.tar.gz"))
-	require.Equal(t, "exports/backup-2/file.tar.gz", buildRotationObjectKey("exports/", "backup-2", "file.tar.gz"))
+	require.Equal(t, "backup/file.jsonl.gz", buildRotationObjectKey("", "backup", "file.jsonl.gz"))
+	require.Equal(t, "exports/backup-2/file.jsonl.gz", buildRotationObjectKey("exports/", "backup-2", "file.jsonl.gz"))
+}
+
+func TestIsConversationExportShardObjectRecognizesCurrentAndLegacyFormats(t *testing.T) {
+	require.True(t, isConversationExportShardObject("backup/shard-0001.jsonl.gz"))
+	require.True(t, isConversationExportShardObject("backup/shard-0001.tar.gz"))
+	require.False(t, isConversationExportShardObject("backup/manifest.json"))
 }
 
 func TestNextRotationDir(t *testing.T) {
@@ -98,14 +105,18 @@ func TestNextRotationDir(t *testing.T) {
 // fakeS3 records PUT object keys and serves a configurable ListObjectsV2
 // response so we can exercise the rotation upload end to end.
 type fakeS3 struct {
-	mu              sync.Mutex
-	putKeys         []string
-	listCommon      []string // CommonPrefixes (directory names) to return for delimiter list
-	tarGzByDir      map[string]int
-	subdirsByDir    map[string][]string
-	existingObjects map[string]struct{}
-	dirMarkerKeys   []string
-	completedMarker []string
+	mu                  sync.Mutex
+	putKeys             []string
+	listCommon          []string // CommonPrefixes (directory names) to return for delimiter list
+	shardObjectsByDir   map[string]int
+	subdirsByDir        map[string][]string
+	existingObjects     map[string]struct{}
+	dirMarkerKeys       []string
+	completedMarker     []string
+	putDelay            time.Duration
+	failObjectKey       string
+	activeObjectPuts    int
+	maxActiveObjectPuts int
 }
 
 func (f *fakeS3) handler(t *testing.T) http.HandlerFunc {
@@ -128,8 +139,27 @@ func (f *fakeS3) handler(t *testing.T) http.HandlerFunc {
 				w.WriteHeader(http.StatusNotFound)
 			}
 		case http.MethodPut:
-			f.mu.Lock()
 			key := f.objectKeyFromRequest(r)
+			if key == f.failObjectKey {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			isShardObject := !strings.HasSuffix(key, "-completed/") && !strings.HasSuffix(key, "/")
+			if isShardObject && f.putDelay > 0 {
+				f.mu.Lock()
+				f.activeObjectPuts++
+				if f.activeObjectPuts > f.maxActiveObjectPuts {
+					f.maxActiveObjectPuts = f.activeObjectPuts
+				}
+				f.mu.Unlock()
+				time.Sleep(f.putDelay)
+				defer func() {
+					f.mu.Lock()
+					f.activeObjectPuts--
+					f.mu.Unlock()
+				}()
+			}
+			f.mu.Lock()
 			f.rememberObject(key)
 			if strings.HasSuffix(key, "-completed/") {
 				f.completedMarker = append(f.completedMarker, key)
@@ -165,9 +195,9 @@ func (f *fakeS3) writeList(w http.ResponseWriter, prefix string) {
 	b.WriteString(`<ListBucketResult>`)
 	// A directory listing uses prefix "{dir}/". A top-level listing uses "".
 	dirPrefix := strings.TrimSuffix(prefix, "/")
-	if n, ok := f.tarGzByDir[dirPrefix]; ok && prefix != "" {
+	if n, ok := f.shardObjectsByDir[dirPrefix]; ok && prefix != "" {
 		for i := 0; i < n; i++ {
-			b.WriteString(fmt.Sprintf(`<Contents><Key>%s/file-%d.tar.gz</Key></Contents>`, dirPrefix, i))
+			b.WriteString(fmt.Sprintf(`<Contents><Key>%s/file-%d.jsonl.gz</Key></Contents>`, dirPrefix, i))
 		}
 	}
 	if subdirs := f.subdirsByDir[dirPrefix]; len(subdirs) > 0 && prefix != "" {
@@ -195,11 +225,12 @@ func newRotationTestSetting(endpoint string, maxObjects int) conversation_log_se
 		Prefix:             "backup", // prefix itself is the rotation base
 		RotationEnabled:    true,
 		RotationMaxObjects: maxObjects,
+		UploadConcurrency:  1,
 	}
 }
 
 func TestScanActiveRotationDirEmptyBucket(t *testing.T) {
-	f := &fakeS3{tarGzByDir: map[string]int{}}
+	f := &fakeS3{shardObjectsByDir: map[string]int{}}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
 
@@ -218,8 +249,8 @@ func TestScanActiveRotationDirContinuesFromHighest(t *testing.T) {
 	// Bucket already has backup, backup-2 (full=200), and a completed marker for
 	// backup. The active dir should be backup-2 with 200 objects -> rolls to backup-3.
 	f := &fakeS3{
-		listCommon: []string{"backup", "backup-2", "backup-150-completed"},
-		tarGzByDir: map[string]int{"backup-2": 200},
+		listCommon:        []string{"backup", "backup-2", "backup-150-completed"},
+		shardObjectsByDir: map[string]int{"backup-2": 200},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -238,8 +269,8 @@ func TestScanActiveRotationDirContinuesFromHighest(t *testing.T) {
 
 func TestScanActiveRotationDirPartialHighest(t *testing.T) {
 	f := &fakeS3{
-		listCommon: []string{"backup", "backup-2"},
-		tarGzByDir: map[string]int{"backup-2": 50},
+		listCommon:        []string{"backup", "backup-2"},
+		shardObjectsByDir: map[string]int{"backup-2": 50},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -257,8 +288,8 @@ func TestScanActiveRotationDirPartialHighest(t *testing.T) {
 
 func TestGetConversationS3RotationStatusReportsNextDirectory(t *testing.T) {
 	f := &fakeS3{
-		listCommon: []string{"backup", "backup-2"},
-		tarGzByDir: map[string]int{"backup-2": 50},
+		listCommon:        []string{"backup", "backup-2"},
+		shardObjectsByDir: map[string]int{"backup-2": 50},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -286,9 +317,9 @@ func TestGetConversationS3RotationStatusReportsNextDirectory(t *testing.T) {
 
 func TestScanActiveRotationDirSkipsLegacySubdirectoryLayout(t *testing.T) {
 	f := &fakeS3{
-		listCommon:   []string{"backup"},
-		tarGzByDir:   map[string]int{"backup": 0},
-		subdirsByDir: map[string][]string{"backup": {"backup/legacy-job-1", "backup/legacy-job-2"}},
+		listCommon:        []string{"backup"},
+		shardObjectsByDir: map[string]int{"backup": 0},
+		subdirsByDir:      map[string][]string{"backup": {"backup/legacy-job-1", "backup/legacy-job-2"}},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -307,7 +338,7 @@ func TestScanActiveRotationDirSkipsLegacySubdirectoryLayout(t *testing.T) {
 func TestScanActiveRotationDirIgnoresStaleEmptyMarkersAfterLegacyLayout(t *testing.T) {
 	f := &fakeS3{
 		listCommon: []string{"backup", "backup-2", "backup-3", "backup-4", "backup-5", "backup-6", "backup-7", "backup-8"},
-		tarGzByDir: map[string]int{
+		shardObjectsByDir: map[string]int{
 			"backup":   0,
 			"backup-2": 0,
 			"backup-3": 0,
@@ -336,7 +367,7 @@ func TestScanActiveRotationDirIgnoresStaleEmptyMarkersAfterLegacyLayout(t *testi
 func TestScanActiveRotationDirIgnoresStaleEmptyMarkersAfterPartialDir(t *testing.T) {
 	f := &fakeS3{
 		listCommon: []string{"backup", "backup-2", "backup-3", "backup-4"},
-		tarGzByDir: map[string]int{
+		shardObjectsByDir: map[string]int{
 			"backup":   200,
 			"backup-2": 50,
 			"backup-3": 0,
@@ -359,8 +390,8 @@ func TestScanActiveRotationDirIgnoresStaleEmptyMarkersAfterPartialDir(t *testing
 
 func TestScanActiveRotationDirContinuesSparsePartialDirectory(t *testing.T) {
 	f := &fakeS3{
-		listCommon: []string{"backup-4"},
-		tarGzByDir: map[string]int{"backup-4": 50},
+		listCommon:        []string{"backup-4"},
+		shardObjectsByDir: map[string]int{"backup-4": 50},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -378,8 +409,8 @@ func TestScanActiveRotationDirContinuesSparsePartialDirectory(t *testing.T) {
 
 func TestScanActiveRotationDirRollsOverSparseFullDirectory(t *testing.T) {
 	f := &fakeS3{
-		listCommon: []string{"backup-4"},
-		tarGzByDir: map[string]int{"backup-4": 200},
+		listCommon:        []string{"backup-4"},
+		shardObjectsByDir: map[string]int{"backup-4": 200},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -397,8 +428,8 @@ func TestScanActiveRotationDirRollsOverSparseFullDirectory(t *testing.T) {
 
 func TestScanActiveRotationDirSkipsCompletedDirectoryEvenBelowCurrentCap(t *testing.T) {
 	f := &fakeS3{
-		listCommon: []string{"backup", "backup-2", "backup-2-200-completed"},
-		tarGzByDir: map[string]int{"backup-2": 50},
+		listCommon:        []string{"backup", "backup-2", "backup-2-200-completed"},
+		shardObjectsByDir: map[string]int{"backup-2": 50},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -415,7 +446,7 @@ func TestScanActiveRotationDirSkipsCompletedDirectoryEvenBelowCurrentCap(t *test
 }
 
 func TestFinalizeRotationDirWritesMarker(t *testing.T) {
-	f := &fakeS3{tarGzByDir: map[string]int{}}
+	f := &fakeS3{shardObjectsByDir: map[string]int{}}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
 
@@ -430,7 +461,7 @@ func TestFinalizeRotationDirWritesMarker(t *testing.T) {
 }
 
 func TestEnsureRotationDirMarkerCreatesMissingDirectory(t *testing.T) {
-	f := &fakeS3{tarGzByDir: map[string]int{}}
+	f := &fakeS3{shardObjectsByDir: map[string]int{}}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
 
@@ -448,8 +479,8 @@ func TestEnsureRotationDirMarkerCreatesMissingDirectory(t *testing.T) {
 
 func TestEnsureRotationDirMarkerSkipsExistingDirectory(t *testing.T) {
 	f := &fakeS3{
-		tarGzByDir:      map[string]int{},
-		existingObjects: map[string]struct{}{"backup-10/": {}},
+		shardObjectsByDir: map[string]int{},
+		existingObjects:   map[string]struct{}{"backup-10/": {}},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
@@ -469,14 +500,14 @@ func TestEnsureRotationDirMarkerSkipsExistingDirectory(t *testing.T) {
 func TestUploadRotatingCreatesNextDirectoryMarkerAfterCompletedHighest(t *testing.T) {
 	setupRotationTestDB(t)
 	f := &fakeS3{
-		listCommon: []string{"backup", "backup-9-200-completed"},
-		tarGzByDir: map[string]int{},
+		listCommon:        []string{"backup", "backup-9-200-completed"},
+		shardObjectsByDir: map[string]int{},
 	}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
 
 	dir := t.TempDir()
-	name := "conversation-logs-session-auto-shard0001.tar.gz"
+	name := "conversation-logs-session-auto-shard0001.jsonl.gz"
 	require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644))
 
 	job := newRotationTestJob(dir)
@@ -493,14 +524,14 @@ func TestUploadRotatingCreatesNextDirectoryMarkerAfterCompletedHighest(t *testin
 
 func TestUploadRotatingCreatesNextDirectoryMarkerAfterFinalizingFullDir(t *testing.T) {
 	setupRotationTestDB(t)
-	f := &fakeS3{tarGzByDir: map[string]int{}}
+	f := &fakeS3{shardObjectsByDir: map[string]int{}}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
 
 	dir := t.TempDir()
 	shards := make([]TopManifestShard, 0, 2)
 	for i := 1; i <= 2; i++ {
-		name := fmt.Sprintf("conversation-logs-session-auto-shard%04d.tar.gz", i)
+		name := fmt.Sprintf("conversation-logs-session-auto-shard%04d.jsonl.gz", i)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644))
 		shards = append(shards, TopManifestShard{Index: i, File: name})
 	}
@@ -516,8 +547,8 @@ func TestUploadRotatingCreatesNextDirectoryMarkerAfterFinalizingFullDir(t *testi
 	require.Contains(t, f.dirMarkerKeys, "backup/")
 	require.Contains(t, f.dirMarkerKeys, "backup-2/")
 	require.Equal(t, []string{
-		"backup/conversation-logs-session-auto-shard0001.tar.gz",
-		"backup/conversation-logs-session-auto-shard0002.tar.gz",
+		"backup/conversation-logs-session-auto-shard0001.jsonl.gz",
+		"backup/conversation-logs-session-auto-shard0002.jsonl.gz",
 	}, f.putKeys)
 	require.Contains(t, f.completedMarker, "backup-2-completed/")
 }
@@ -527,14 +558,14 @@ func TestUploadRotatingRollsOverAndMarks(t *testing.T) {
 	// Start from an empty bucket, cap = 2, upload 3 shards. Expect:
 	//   backup/shard1, backup/shard2  -> backup-2-... completed marker
 	//   backup-2/shard3
-	f := &fakeS3{tarGzByDir: map[string]int{}}
+	f := &fakeS3{shardObjectsByDir: map[string]int{}}
 	server := httptest.NewServer(f.handler(t))
 	defer server.Close()
 
 	dir := t.TempDir()
 	shards := make([]TopManifestShard, 0, 3)
 	for i := 1; i <= 3; i++ {
-		name := fmt.Sprintf("conversation-logs-session-auto-shard%04d.tar.gz", i)
+		name := fmt.Sprintf("conversation-logs-session-auto-shard%04d.jsonl.gz", i)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644))
 		shards = append(shards, TopManifestShard{Index: i, File: name})
 	}
@@ -552,9 +583,71 @@ func TestUploadRotatingRollsOverAndMarks(t *testing.T) {
 	defer f.mu.Unlock()
 	require.Equal(t, []string{"backup/", "backup-2/"}, f.dirMarkerKeys)
 	require.Len(t, f.putKeys, 3)
-	require.Equal(t, "backup/conversation-logs-session-auto-shard0001.tar.gz", f.putKeys[0])
-	require.Equal(t, "backup/conversation-logs-session-auto-shard0002.tar.gz", f.putKeys[1])
-	require.Equal(t, "backup-2/conversation-logs-session-auto-shard0003.tar.gz", f.putKeys[2])
+	require.Equal(t, "backup/conversation-logs-session-auto-shard0001.jsonl.gz", f.putKeys[0])
+	require.Equal(t, "backup/conversation-logs-session-auto-shard0002.jsonl.gz", f.putKeys[1])
+	require.Equal(t, "backup-2/conversation-logs-session-auto-shard0003.jsonl.gz", f.putKeys[2])
 	// backup filled to cap=2 -> completed marker "backup-2-completed/"
 	require.Contains(t, f.completedMarker, "backup-2-completed/")
+}
+
+func TestUploadRotatingUsesConfiguredUploadConcurrency(t *testing.T) {
+	setupRotationTestDB(t)
+	f := &fakeS3{
+		shardObjectsByDir: map[string]int{},
+		putDelay:          50 * time.Millisecond,
+	}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	dir := t.TempDir()
+	shards := make([]TopManifestShard, 0, 4)
+	expectedKeys := make([]string, 0, 4)
+	for i := 1; i <= 4; i++ {
+		name := fmt.Sprintf("conversation-logs-session-auto-shard%04d.jsonl.gz", i)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644))
+		shards = append(shards, TopManifestShard{Index: i, File: name})
+		expectedKeys = append(expectedKeys, "backup/"+name)
+	}
+
+	job := newRotationTestJob(dir)
+	setting := newRotationTestSetting(server.URL, 10)
+	setting.UploadConcurrency = 2
+
+	err := uploadConversationExportShardsRotating(context.Background(), job, shards, setting)
+	require.NoError(t, err)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.GreaterOrEqual(t, f.maxActiveObjectPuts, 2)
+	require.ElementsMatch(t, expectedKeys, f.putKeys)
+	require.Empty(t, f.completedMarker)
+}
+
+func TestUploadRotatingDoesNotFinalizeOnUploadFailure(t *testing.T) {
+	setupRotationTestDB(t)
+	f := &fakeS3{
+		shardObjectsByDir: map[string]int{},
+		failObjectKey:     "backup/conversation-logs-session-auto-shard0002.jsonl.gz",
+	}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+
+	dir := t.TempDir()
+	shards := make([]TopManifestShard, 0, 2)
+	for i := 1; i <= 2; i++ {
+		name := fmt.Sprintf("conversation-logs-session-auto-shard%04d.jsonl.gz", i)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644))
+		shards = append(shards, TopManifestShard{Index: i, File: name})
+	}
+
+	job := newRotationTestJob(dir)
+	setting := newRotationTestSetting(server.URL, 2)
+
+	err := uploadConversationExportShardsRotating(context.Background(), job, shards, setting)
+	require.Error(t, err)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.Empty(t, f.completedMarker)
+	require.NotContains(t, f.dirMarkerKeys, "backup-2/")
 }

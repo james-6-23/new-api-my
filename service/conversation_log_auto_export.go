@@ -75,16 +75,13 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		return
 	}
 
-	mode := settings.AutoExportMode
-	if !conversation_log_setting.IsValidExportMode(mode) {
-		mode = conversation_log_setting.ExportModeSessionJSONL
-	}
+	mode := conversation_log_setting.DeliveryExportMode(settings.AutoExportMode)
 	shardMax := settings.AutoExportShardMaxBytes
 	if shardMax <= 0 {
 		shardMax = int64(10) << 30
 	}
 	// shard_target_bytes must be in [1 GiB, shardMax]; pick the same value so
-	// every auto-export tarball is capped at exactly the configured ceiling.
+	// every auto-export gzip shard is capped at exactly the configured ceiling.
 	req := ExportJobCreateRequest{
 		Mode:              mode,
 		ShardTargetBytes:  shardMax,

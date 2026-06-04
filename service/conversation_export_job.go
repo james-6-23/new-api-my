@@ -1,7 +1,6 @@
 package service
 
 import (
-	"archive/tar"
 	"bufio"
 	"bytes"
 	"compress/gzip"
@@ -52,9 +51,10 @@ const (
 	conversationDataKindMessages    = "messages"
 	conversationDataKindCompletions = "completions"
 	conversationDataKindMixed       = "mixed"
+	conversationDataKindData        = "data"
 )
 
-// ShardManifest is the per-shard manifest packed inside each tar.gz next to the data JSONL files.
+// ShardManifest is kept for older tar.gz shard manifests and top-level shard metadata compatibility.
 type ShardManifest struct {
 	JobID             string          `json:"job_id"`
 	ShardIndex        int             `json:"shard_index"`
@@ -82,7 +82,7 @@ type ShardDataFile struct {
 	SHA256            string `json:"sha256"`
 }
 
-// ShardPathManifest documents the internal paths of each delivery tar.gz.
+// ShardPathManifest documents legacy internal paths for old tar.gz delivery packages.
 // traj v3.0 requires path explanations when the delivery package contains a
 // directory structure beyond a single flat file.
 type ShardPathManifest struct {
@@ -431,10 +431,7 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 	}
 
 	settings := conversation_log_setting.GetSetting()
-	mode := req.Mode
-	if !conversation_log_setting.IsValidExportMode(mode) {
-		mode = settings.DefaultExportMode
-	}
+	mode := exportJobDeliveryMode(req.Mode, settings)
 	targetBytes := req.ShardTargetBytes
 	if targetBytes <= 0 {
 		targetBytes = settings.DefaultShardTargetBytes
@@ -497,6 +494,13 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 
 	go runConversationExportJob(jobID)
 	return job, nil
+}
+
+func exportJobDeliveryMode(reqMode string, settings conversation_log_setting.ConversationLogSetting) string {
+	if strings.TrimSpace(reqMode) != "" {
+		return conversation_log_setting.DeliveryExportMode(reqMode)
+	}
+	return conversation_log_setting.DeliveryExportMode(settings.DefaultExportMode)
 }
 
 // runConversationExportJob is the worker entry point. It owns the job lifecycle:
@@ -596,7 +600,7 @@ func snapshotConversationExportQuery(ctx context.Context, query model.Conversati
 	return query, nil
 }
 
-// executeExportJob is the actual work: scan, shard, write tar.gz, manifest.
+// executeExportJob is the actual work: scan, shard, write gzip JSONL, manifest.
 func executeExportJob(ctx context.Context, job *model.ConversationExportJob) error {
 	var query model.ConversationLogQuery
 	if strings.TrimSpace(job.FilterJSON) != "" {
@@ -700,9 +704,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		JobID:            job.JobId,
 		SchemaVersion:    "1",
 		Mode:             job.Mode,
-		PackageFormat:    "tar.gz",
-		DataFilePath:     "shard-000N/{responses|messages|completions|mixed}-data-{record_count}.jsonl",
-		PathDescription:  "Each shard tar.gz contains one or more category data JSONL files plus shard-manifest.json and path-manifest.json under a shard-000N directory.",
+		PackageFormat:    "jsonl.gz",
+		DataFilePath:     "conversation-logs-{mode}-{trigger}-{timestamp}-{job}-shard000N.jsonl.gz",
+		PathDescription:  "Each shard is one gzip-compressed JSONL file. Decompress it to read one API-format record per line.",
 		CreatedAt:        job.CreatedAt,
 		FinishedAt:       common.GetTimestamp(),
 		ShardTargetBytes: job.ShardTargetBytes,
@@ -821,7 +825,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 // To bound memory at >10 GiB shard sizes, the in-progress JSONL is streamed to
 // a temp file on disk (bufio-buffered, hash computed inline). closeCurrentShard
 // seals those files and hands them to a bounded compressor pool, which streams
-// the tar.gz without ever holding the full payload in RAM.
+// the gzip JSONL without ever holding the full payload in RAM.
 type shardWriterState struct {
 	jobID            string
 	mode             string
@@ -893,16 +897,13 @@ type shardDataFilePayload struct {
 }
 
 type shardCompressionJob struct {
-	Index             int
-	InnerName         string
-	TmpTarPath        string
-	TarPath           string
-	DataPayloads      []shardDataFilePayload
-	ManifestBytes     []byte
-	PathManifestBytes []byte
-	IDsPath           string
-	IDCount           int64
-	Shard             TopManifestShard
+	Index        int
+	TmpPath      string
+	OutputPath   string
+	DataPayloads []shardDataFilePayload
+	IDsPath      string
+	IDCount      int64
+	Shard        TopManifestShard
 }
 
 type shardCompressionResult struct {
@@ -1072,14 +1073,14 @@ func compressShardJob(ctx context.Context, job shardCompressionJob) (shardCompre
 			return shardCompressionResult{}, err
 		}
 	}
-	if err := streamShardTarGz(job.TmpTarPath, job.InnerName, job.DataPayloads, job.ManifestBytes, job.PathManifestBytes); err != nil {
+	if err := streamShardJSONLGz(job.TmpPath, job.DataPayloads); err != nil {
 		return shardCompressionResult{}, err
 	}
-	compressedInfo, err := os.Stat(job.TmpTarPath)
+	compressedInfo, err := os.Stat(job.TmpPath)
 	if err != nil {
 		return shardCompressionResult{}, err
 	}
-	if err := os.Rename(job.TmpTarPath, job.TarPath); err != nil {
+	if err := os.Rename(job.TmpPath, job.OutputPath); err != nil {
 		return shardCompressionResult{}, err
 	}
 	for _, payload := range job.DataPayloads {
@@ -1118,27 +1119,26 @@ func (s *shardWriterState) ensureCurrentShard() error {
 }
 
 func (s *shardWriterState) ensureDataWriter(kind string) (*shardDataWriter, error) {
-	kind = normalizeConversationDataKind(kind)
 	if err := s.ensureCurrentShard(); err != nil {
 		return nil, err
 	}
-	if existing := s.currentDataWriters[kind]; existing != nil {
+	if existing := s.currentDataWriters[conversationDataKindData]; existing != nil {
 		return existing, nil
 	}
-	tmpName := fmt.Sprintf("shard-pending-%04d-%s.jsonl", s.currentIndex+1, kind)
+	tmpName := fmt.Sprintf("shard-pending-%04d-data.jsonl", s.currentIndex+1)
 	path := filepath.Join(s.tmpDir, tmpName)
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	writer := &shardDataWriter{
-		kind:   kind,
+		kind:   conversationDataKindData,
 		path:   path,
 		file:   file,
 		buf:    bufio.NewWriterSize(file, 1<<20),
 		hasher: sha256.New(),
 	}
-	s.currentDataWriters[kind] = writer
+	s.currentDataWriters[conversationDataKindData] = writer
 	return writer, nil
 }
 
@@ -1154,7 +1154,7 @@ func (s *shardWriterState) shouldRotateAfter() bool {
 	return s.currentSize >= s.shardTargetBytes
 }
 
-// appendLine streams one JSONL line into the current shard's category temp file.
+// appendLine streams one JSONL line into the current shard temp file.
 // Caller must ensure overflow checks have been done.
 func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount int64, timeMin, timeMax int64, dataKind string) error {
 	writer, err := s.ensureDataWriter(dataKind)
@@ -1263,8 +1263,8 @@ func (s *shardWriterState) observeScannedBatch(logs []*model.ConversationLog) {
 	}
 }
 
-// closeCurrentShard finalises the temp category .jsonl files and queues the
-// tar.gz work for the bounded background compressor. Source rows are still not
+// closeCurrentShard finalises the temp .jsonl file and queues the gzip work for
+// the bounded background compressor. Source rows are still not
 // marked exported until all compression jobs finish and the top-level manifest
 // is written.
 func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
@@ -1295,7 +1295,7 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 		return err
 	}
 	dataPayloads := make([]shardDataFilePayload, 0, len(s.currentDataWriters))
-	for _, kind := range orderedConversationDataKinds() {
+	for _, kind := range orderedShardDataWriterKinds(s.currentDataWriters) {
 		writer := s.currentDataWriters[kind]
 		if writer == nil || writer.size == 0 {
 			continue
@@ -1306,7 +1306,7 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 		if err := writer.file.Close(); err != nil {
 			return err
 		}
-		fileName := fmt.Sprintf("%s-data-%d.jsonl", writer.kind, writer.recordCount)
+		fileName := "data.jsonl"
 		dataPayloads = append(dataPayloads, shardDataFilePayload{
 			ShardDataFile: ShardDataFile{
 				Path:              "", // filled after innerName is known
@@ -1323,47 +1323,17 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 	}
 
 	s.currentIndex++
-	innerName := fmt.Sprintf("shard-%04d", s.currentIndex)
 	fileBase := buildShardFilename(s.jobID, s.mode, s.trigger, s.createdAt, s.currentIndex)
-	tarPath := filepath.Join(s.outputDir, fileBase+".tar.gz")
+	outputPath := filepath.Join(s.outputDir, fileBase+".jsonl.gz")
 
 	uncompressed := s.currentSize
-	for i := range dataPayloads {
-		dataPayloads[i].Path = innerName + "/" + dataPayloads[i].Path
-	}
 	dataFiles := shardDataFilesFromPayloads(dataPayloads)
-	dataFilesSHA := digestShardDataFiles(dataFiles)
 	legacySHA := ""
 	if len(dataFiles) == 1 {
 		legacySHA = dataFiles[0].SHA256
 	}
 
-	shardManifest := ShardManifest{
-		JobID:             s.jobID,
-		ShardIndex:        s.currentIndex,
-		Mode:              s.mode,
-		SchemaVersion:     "1",
-		RecordCount:       s.currentRecordCnt,
-		SessionCount:      s.currentSessionCnt,
-		UncompressedBytes: uncompressed,
-		SHA256DataJSONL:   legacySHA,
-		SHA256DataFiles:   dataFilesSHA,
-		DataFiles:         dataFiles,
-		RequestTimeMin:    s.currentTimeMin,
-		RequestTimeMax:    s.currentTimeMax,
-		FirstRecordID:     s.currentFirstID,
-		LastRecordID:      s.currentLastID,
-	}
-	manifestBytes, err := common.Marshal(shardManifest)
-	if err != nil {
-		return err
-	}
-	pathManifestBytes, err := common.Marshal(buildShardPathManifest(innerName, dataFiles))
-	if err != nil {
-		return err
-	}
-
-	tmpTarPath := filepath.Join(s.tmpDir, fileBase+".tar.gz")
+	tmpPath := filepath.Join(s.tmpDir, fileBase+".jsonl.gz")
 	idsPath := ""
 	if s.currentIDCount > 0 {
 		idsPath = s.currentIDsPath
@@ -1372,19 +1342,16 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 	}
 
 	job := shardCompressionJob{
-		Index:             s.currentIndex,
-		InnerName:         innerName,
-		TmpTarPath:        tmpTarPath,
-		TarPath:           tarPath,
-		DataPayloads:      dataPayloads,
-		ManifestBytes:     manifestBytes,
-		PathManifestBytes: pathManifestBytes,
-		IDsPath:           idsPath,
-		IDCount:           s.currentIDCount,
+		Index:        s.currentIndex,
+		TmpPath:      tmpPath,
+		OutputPath:   outputPath,
+		DataPayloads: dataPayloads,
+		IDsPath:      idsPath,
+		IDCount:      s.currentIDCount,
 		Shard: TopManifestShard{
 			Index:             s.currentIndex,
-			File:              filepath.Base(tarPath),
-			SHA256:            dataFilesSHA,
+			File:              filepath.Base(outputPath),
+			SHA256:            legacySHA,
 			UncompressedBytes: uncompressed,
 			RecordCount:       s.currentRecordCnt,
 			SessionCount:      s.currentSessionCnt,
@@ -1491,6 +1458,15 @@ func shardDataFilesFromPayloads(payloads []shardDataFilePayload) []ShardDataFile
 		files = append(files, payload.ShardDataFile)
 	}
 	return files
+}
+
+func orderedShardDataWriterKinds(writers map[string]*shardDataWriter) []string {
+	kinds := make([]string, 0, len(writers))
+	for kind := range writers {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
 }
 
 func digestShardDataFiles(files []ShardDataFile) string {
@@ -1734,11 +1710,10 @@ func buildShardPathManifest(shardName string, dataFiles []ShardDataFile) ShardPa
 	}
 }
 
-// streamShardTarGz writes a tar.gz containing category JSONL files (streamed),
-// shard-manifest.json, and path-manifest.json. Tar headers carry precomputed
-// uncompressed sizes, so the JSONL payloads are never loaded into memory.
-func streamShardTarGz(tarPath, shardName string, dataFiles []shardDataFilePayload, shardManifestJSON []byte, pathManifestJSON []byte) error {
-	out, err := os.Create(tarPath)
+// streamShardJSONLGz writes a gzip-compressed JSONL payload. Source JSONL files
+// are streamed directly so large shards are never held in memory.
+func streamShardJSONLGz(gzPath string, dataFiles []shardDataFilePayload) error {
+	out, err := os.Create(gzPath)
 	if err != nil {
 		return err
 	}
@@ -1747,10 +1722,6 @@ func streamShardTarGz(tarPath, shardName string, dataFiles []shardDataFilePayloa
 	gz := gzip.NewWriter(out)
 	defer gz.Close()
 
-	tw := tar.NewWriter(gz)
-	defer tw.Close()
-
-	now := time.Now()
 	buf := make([]byte, 1<<20) // 1 MiB copy buffer
 
 	for _, file := range dataFiles {
@@ -1758,48 +1729,13 @@ func streamShardTarGz(tarPath, shardName string, dataFiles []shardDataFilePayloa
 		if err != nil {
 			return err
 		}
-		if err := tw.WriteHeader(&tar.Header{
-			Name:    file.Path,
-			Mode:    0o644,
-			Size:    file.UncompressedBytes,
-			ModTime: now,
-		}); err != nil {
-			_ = in.Close()
-			return err
-		}
-		if _, err := io.CopyBuffer(tw, in, buf); err != nil {
+		if _, err := io.CopyBuffer(gz, in, buf); err != nil {
 			_ = in.Close()
 			return err
 		}
 		if err := in.Close(); err != nil {
 			return err
 		}
-	}
-
-	// shard-manifest.json (small, bytes)
-	if err := tw.WriteHeader(&tar.Header{
-		Name:    shardName + "/shard-manifest.json",
-		Mode:    0o644,
-		Size:    int64(len(shardManifestJSON)),
-		ModTime: now,
-	}); err != nil {
-		return err
-	}
-	if _, err := tw.Write(shardManifestJSON); err != nil {
-		return err
-	}
-
-	// path-manifest.json (small, bytes)
-	if err := tw.WriteHeader(&tar.Header{
-		Name:    shardName + "/path-manifest.json",
-		Mode:    0o644,
-		Size:    int64(len(pathManifestJSON)),
-		ModTime: now,
-	}); err != nil {
-		return err
-	}
-	if _, err := tw.Write(pathManifestJSON); err != nil {
-		return err
 	}
 	return nil
 }
@@ -2742,10 +2678,10 @@ func ServeShardFile(job *model.ConversationExportJob, shardIndex int) (string, e
 	if shardIndex <= 0 {
 		return "", fmt.Errorf("invalid shard index")
 	}
-	// Try the human-readable name first (current scheme), then fall back to
-	// the legacy "shard-%04d.tar.gz" so jobs created before the rename still
-	// download.
+	// Try the human-readable gzip name first, then fall back to legacy tar.gz
+	// names so jobs created before the delivery format change still download.
 	candidates := []string{
+		buildShardFilename(job.JobId, job.Mode, job.Trigger, job.CreatedAt, shardIndex) + ".jsonl.gz",
 		buildShardFilename(job.JobId, job.Mode, job.Trigger, job.CreatedAt, shardIndex) + ".tar.gz",
 		fmt.Sprintf("shard-%04d.tar.gz", shardIndex),
 	}
@@ -2755,21 +2691,23 @@ func ServeShardFile(job *model.ConversationExportJob, shardIndex int) (string, e
 			return full, nil
 		}
 	}
-	// Last-resort: scan the directory for any "*shard{NNNN}*.tar.gz" file. This
-	// catches future renames or operator-side renames without breaking downloads.
-	pattern := fmt.Sprintf("*shard%04d*.tar.gz", shardIndex)
-	matches, _ := filepath.Glob(filepath.Join(job.OutputDirectory, pattern))
-	if len(matches) > 0 {
-		return matches[0], nil
+	// Last-resort: scan the directory for any "*shard{NNNN}*.jsonl.gz" or
+	// legacy "*shard{NNNN}*.tar.gz" file. This catches operator-side renames.
+	for _, suffix := range []string{"jsonl.gz", "tar.gz"} {
+		pattern := fmt.Sprintf("*shard%04d*.%s", shardIndex, suffix)
+		matches, _ := filepath.Glob(filepath.Join(job.OutputDirectory, pattern))
+		if len(matches) > 0 {
+			return matches[0], nil
+		}
 	}
 	return "", fmt.Errorf("shard %d not found", shardIndex)
 }
 
-// buildShardFilename produces a human-readable, well-collated tar.gz base name.
+// buildShardFilename produces a human-readable, well-collated shard base name.
 //
 // Format: conversation-logs-{mode}-{trigger}-{yyyymmddTHHMMSS}-{shortJobID}-shard{NNNN}
 //
-// Example: conversation-logs-api-auto-20260525T091230-a1b2c3d4-shard0001.tar.gz
+// Example: conversation-logs-api-auto-20260525T091230-a1b2c3d4-shard0001.jsonl.gz
 //
 // `mode` is shortened (api / session) for brevity. `trigger` defaults to "manual"
 // when empty so the filename is unambiguous.
@@ -2892,4 +2830,4 @@ func chunkIntsForExport(ids []int, batchSize int) [][]int {
 	return chunks
 }
 
-var _ = io.EOF // ensure io is referenced (used by tar/gzip indirectly)
+var _ = io.EOF // ensure io is referenced by export helpers
