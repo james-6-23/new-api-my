@@ -158,6 +158,15 @@ type ConversationLogSetting struct {
 	// retain their originals so no debuggable/exportable data is lost.
 	RetainOriginalBodies bool `json:"retain_original_bodies"`
 
+	// RetentionDeleteUnexported controls whether RetentionDays time-based
+	// cleanup may delete records that have NOT been exported yet
+	// (exported_at = 0). Default false: time cleanup only removes
+	// already-exported records, so not-yet-trained data is never deleted by
+	// age (pair with auto-export so aged records get exported and become
+	// deletable). Set true for the legacy behaviour of deleting by age
+	// regardless of export status.
+	RetentionDeleteUnexported bool `json:"retention_delete_unexported"`
+
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
 	// packs them into gzip JSONL shards capped at AutoExportShardMaxBytes, then (if

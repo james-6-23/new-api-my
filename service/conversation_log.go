@@ -389,7 +389,15 @@ func cleanupConversationLogs(ctx context.Context) {
 	setting := conversation_log_setting.GetSetting()
 	if setting.RetentionDays > 0 {
 		cutoff := common.GetTimestamp() - int64(setting.RetentionDays)*24*3600
-		if deleted, err := model.DeleteConversationLogsOlderThan(ctx, cutoff, conversationLogCleanupBatchSize); err != nil {
+		// By default time-based cleanup only removes already-exported records so
+		// not-yet-trained data is never deleted by age; opt in to deleting
+		// unexported records via RetentionDeleteUnexported.
+		query := model.ConversationLogQuery{EndTime: cutoff}
+		if !setting.RetentionDeleteUnexported {
+			exported := true
+			query.Exported = &exported
+		}
+		if deleted, err := model.DeleteConversationLogsByQuery(ctx, query, conversationLogCleanupBatchSize); err != nil {
 			common.SysError("failed to cleanup old conversation logs: " + err.Error())
 		} else if deleted > 0 {
 			common.SysLog(fmt.Sprintf("cleaned %d expired conversation logs", deleted))
