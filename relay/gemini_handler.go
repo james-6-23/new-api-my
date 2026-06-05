@@ -55,6 +55,7 @@ func trimModelThinking(modelName string) string {
 func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	info.InitChannelMeta(c)
 	service.StartConversationCapture(c, info)
+	defer service.ReleaseConversationCapture(c)
 
 	geminiReq, ok := info.Request.(*dto.GeminiChatRequest)
 	if !ok {

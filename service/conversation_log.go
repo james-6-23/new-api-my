@@ -196,9 +196,20 @@ func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) 
 		return
 	}
 	capture := relaycommon.NewConversationCapture(setting.CaptureMaxBytesPerRequest)
+	relaycommon.SetGlobalCaptureMaxBytes(setting.CaptureGlobalMaxBytes)
 	capture.SetClientRequestBody(body)
 	relayInfo.ConversationCapture = capture
 	relaycommon.SetConversationCapture(c, capture)
+}
+
+// ReleaseConversationCapture returns the request's capture bytes to the global
+// in-flight budget and frees its buffers. Idempotent and nil-safe. Call via
+// defer right after StartConversationCapture so the budget is released on
+// every exit path (the snapshot is already taken during post-consume).
+func ReleaseConversationCapture(c *gin.Context) {
+	if capture := relaycommon.GetConversationCapture(c); capture != nil {
+		capture.Release()
+	}
 }
 
 func conversationCapturePausedByDisk(setting conversation_log_setting.ConversationLogSetting) bool {

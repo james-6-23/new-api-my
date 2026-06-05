@@ -85,6 +85,13 @@ const (
 	minCaptureMaxBytes     = int64(256) << 10 // 256 KiB
 	maxCaptureMaxBytes     = int64(1) << 30   // 1 GiB
 
+	// Process-wide in-flight capture budget across all concurrent requests.
+	// Per-request cap bounds one request; this bounds the sum so capture can't
+	// balloon memory under high concurrency. GOMEMLIMIT is the hard backstop.
+	defaultCaptureGlobalMaxBytes = int64(4) << 30  // 4 GiB
+	minCaptureGlobalMaxBytes     = int64(64) << 20 // 64 MiB
+	maxCaptureGlobalMaxBytes     = int64(64) << 30 // 64 GiB
+
 	// Periodic VACUUM FULL (PostgreSQL-only) to reclaim disk after deletes.
 	// DANGER: VACUUM FULL needs free disk ~= the table's live size (it writes a
 	// full new copy before dropping the old one). It is ONLY appropriate for
@@ -175,6 +182,10 @@ type ConversationLogSetting struct {
 	// captured request may retain in memory. See defaultCaptureMaxBytes.
 	CaptureMaxBytesPerRequest int64 `json:"capture_max_bytes_per_request"`
 
+	// CaptureGlobalMaxBytes bounds in-flight capture bytes across all concurrent
+	// requests (process-wide). See defaultCaptureGlobalMaxBytes.
+	CaptureGlobalMaxBytes int64 `json:"capture_global_max_bytes"`
+
 	// RetainOriginalBodies controls whether the raw per-stage capture fields
 	// (client/upstream request body, client response body, raw upstream SSE
 	// response) are persisted alongside the export-ready request_body and
@@ -258,6 +269,7 @@ var conversationLogSetting = ConversationLogSetting{
 	WriteBatchMaxBytes:         defaultWriteBatchBytes,
 	WriteFlushIntervalMs:       defaultWriteFlushIntervalMs,
 	CaptureMaxBytesPerRequest:  defaultCaptureMaxBytes,
+	CaptureGlobalMaxBytes:      defaultCaptureGlobalMaxBytes,
 
 	AutoVacuumFullEnabled:       defaultAutoVacuumFullEnabled,
 	AutoVacuumFullMinBloatRatio: defaultAutoVacuumFullMinBloatRatio,
@@ -322,6 +334,9 @@ func GetSetting() ConversationLogSetting {
 	setting.WriteBatchMaxBytes = clampWriteMemoryBytes(setting.WriteBatchMaxBytes, defaultWriteBatchBytes)
 	setting.WriteFlushIntervalMs = clampWriteFlushIntervalMs(setting.WriteFlushIntervalMs)
 	setting.CaptureMaxBytesPerRequest = clampCaptureMaxBytes(setting.CaptureMaxBytesPerRequest)
+	if setting.CaptureGlobalMaxBytes < minCaptureGlobalMaxBytes || setting.CaptureGlobalMaxBytes > maxCaptureGlobalMaxBytes {
+		setting.CaptureGlobalMaxBytes = defaultCaptureGlobalMaxBytes
+	}
 
 	if setting.AutoVacuumFullMinBloatRatio < minAutoVacuumFullMinBloatRatio || setting.AutoVacuumFullMinBloatRatio > maxAutoVacuumFullMinBloatRatio {
 		setting.AutoVacuumFullMinBloatRatio = defaultAutoVacuumFullMinBloatRatio

@@ -19,7 +19,7 @@ func TestConversationCaptureUnbounded(t *testing.T) {
 func TestConversationCaptureCapAcrossFields(t *testing.T) {
 	// Cap is the COMBINED budget across every captured field.
 	capture := NewConversationCapture(1000)
-	capture.SetClientRequestBody(make([]byte, 600))   // 600 retained, 400 budget left
+	capture.SetClientRequestBody(make([]byte, 600))       // 600 retained, 400 budget left
 	capture.AppendUpstreamResponseBody(make([]byte, 300)) // 300 retained, 100 budget left
 	capture.AppendUpstreamResponseBody(make([]byte, 300)) // only 100 retained, rest dropped
 
@@ -68,5 +68,45 @@ func TestConversationCaptureSetBytesReclaimsBudget(t *testing.T) {
 	}
 	if snap.Truncated {
 		t.Fatal("within reclaimed budget must not be flagged truncated")
+	}
+}
+
+func TestConversationCaptureGlobalBudget(t *testing.T) {
+	// Global budget bounds the sum across concurrent captures; release returns it.
+	t.Cleanup(func() { SetGlobalCaptureMaxBytes(0); globalCaptureBytes.Store(0) })
+	SetGlobalCaptureMaxBytes(0)
+	globalCaptureBytes.Store(0)
+	SetGlobalCaptureMaxBytes(1000)
+
+	// Two captures, each per-request cap 800, but global cap is 1000.
+	c1 := NewConversationCapture(800)
+	c2 := NewConversationCapture(800)
+	c1.SetClientRequestBody(make([]byte, 800)) // takes 800 of the 1000 global
+	c2.SetClientRequestBody(make([]byte, 800)) // only 200 left globally
+
+	s1, s2 := c1.Snapshot(), c2.Snapshot()
+	if len(s1.ClientRequestBody) != 800 {
+		t.Fatalf("c1 should retain 800, got %d", len(s1.ClientRequestBody))
+	}
+	if len(s2.ClientRequestBody) != 200 {
+		t.Fatalf("c2 should be globally capped at 200, got %d", len(s2.ClientRequestBody))
+	}
+	if !s2.Truncated {
+		t.Fatal("c2 hitting the global cap must be flagged truncated")
+	}
+	if got := globalCaptureBytes.Load(); got != 1000 {
+		t.Fatalf("global counter should be 1000, got %d", got)
+	}
+
+	// Releasing c1 frees its 800 back to the global budget.
+	c1.Release()
+	if got := globalCaptureBytes.Load(); got != 200 {
+		t.Fatalf("after releasing c1, global should be 200, got %d", got)
+	}
+	// A new capture can now retain again.
+	c3 := NewConversationCapture(800)
+	c3.AppendUpstreamResponseBody(make([]byte, 800)) // 800 free now (1000-200)
+	if got := globalCaptureBytes.Load(); got != 1000 {
+		t.Fatalf("c3 should reserve up to the global cap, got %d", got)
 	}
 }

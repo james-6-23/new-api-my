@@ -4,12 +4,59 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 const conversationCaptureContextKey = "conversation_capture"
+
+// Process-wide budget for in-flight capture bytes across ALL concurrent
+// ConversationCaptures. The per-request cap (maxTotalBytes) bounds one request;
+// this bounds the sum across high concurrency so capture alone can never
+// balloon memory. GOMEMLIMIT is the ultimate backstop; this sheds load
+// gracefully (truncates) before that. <= 0 disables the global cap.
+var (
+	globalCaptureBytes    atomic.Int64
+	globalCaptureMaxBytes atomic.Int64
+)
+
+// SetGlobalCaptureMaxBytes sets the process-wide in-flight capture budget.
+func SetGlobalCaptureMaxBytes(n int64) { globalCaptureMaxBytes.Store(n) }
+
+// reserveGlobalCaptureBytes atomically reserves up to n bytes from the global
+// budget and returns the amount actually granted (0 if exhausted).
+func reserveGlobalCaptureBytes(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	max := globalCaptureMaxBytes.Load()
+	if max <= 0 {
+		globalCaptureBytes.Add(n)
+		return n
+	}
+	for {
+		cur := globalCaptureBytes.Load()
+		remaining := max - cur
+		if remaining <= 0 {
+			return 0
+		}
+		grant := n
+		if grant > remaining {
+			grant = remaining
+		}
+		if globalCaptureBytes.CompareAndSwap(cur, cur+grant) {
+			return grant
+		}
+	}
+}
+
+func releaseGlobalCaptureBytes(n int64) {
+	if n > 0 {
+		globalCaptureBytes.Add(-n)
+	}
+}
 
 type ConversationCapture struct {
 	mu sync.Mutex
@@ -132,13 +179,23 @@ func (capture *ConversationCapture) setBytes(target *[]byte, data []byte) {
 	}
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
-	capture.totalBytes -= int64(len(*target))
-	allowed := capture.acceptable(len(data))
-	if allowed < len(data) {
+	// Replacing a field: return its old bytes to both budgets first.
+	oldLen := int64(len(*target))
+	capture.totalBytes -= oldLen
+	releaseGlobalCaptureBytes(oldLen)
+
+	allowed := capture.acceptable(len(data)) // per-request remaining
+	if allowed <= 0 {
+		capture.truncated = true
+		*target = nil
+		return
+	}
+	granted := reserveGlobalCaptureBytes(int64(allowed))
+	if granted < int64(allowed) || allowed < len(data) {
 		capture.truncated = true
 	}
-	*target = cloneBytes(data[:allowed])
-	capture.totalBytes += int64(allowed)
+	*target = cloneBytes(data[:int(granted)])
+	capture.totalBytes += granted
 }
 
 func (capture *ConversationCapture) appendBytes(target *[]byte, data []byte) {
@@ -147,15 +204,38 @@ func (capture *ConversationCapture) appendBytes(target *[]byte, data []byte) {
 	}
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
-	allowed := capture.acceptable(len(data))
-	if allowed < len(data) {
-		capture.truncated = true
-	}
+	allowed := capture.acceptable(len(data)) // per-request remaining
 	if allowed <= 0 {
+		capture.truncated = true
 		return
 	}
-	*target = append(*target, data[:allowed]...)
-	capture.totalBytes += int64(allowed)
+	granted := reserveGlobalCaptureBytes(int64(allowed))
+	if granted < int64(allowed) || allowed < len(data) {
+		capture.truncated = true
+	}
+	if granted <= 0 {
+		return
+	}
+	*target = append(*target, data[:int(granted)]...)
+	capture.totalBytes += granted
+}
+
+// Release returns this capture's retained bytes to the global capture budget
+// and frees its buffers. Idempotent and nil-safe; call when the request is done
+// (via defer after StartConversationCapture). The snapshot must already have
+// been taken — buffers are cleared here.
+func (capture *ConversationCapture) Release() {
+	if capture == nil {
+		return
+	}
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	releaseGlobalCaptureBytes(capture.totalBytes)
+	capture.totalBytes = 0
+	capture.clientRequestBody = nil
+	capture.upstreamRequestBody = nil
+	capture.upstreamResponseBodyRaw = nil
+	capture.clientResponseBody = nil
 }
 
 func (capture *ConversationCapture) setRequestTime(ts int64) {

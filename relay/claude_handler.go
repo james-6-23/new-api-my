@@ -25,6 +25,7 @@ func ClaudeHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 
 	info.InitChannelMeta(c)
 	service.StartConversationCapture(c, info)
+	defer service.ReleaseConversationCapture(c)
 
 	claudeReq, ok := info.Request.(*dto.ClaudeRequest)
 

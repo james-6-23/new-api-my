@@ -26,6 +26,7 @@ import (
 func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	info.InitChannelMeta(c)
 	service.StartConversationCapture(c, info)
+	defer service.ReleaseConversationCapture(c)
 
 	textReq, ok := info.Request.(*dto.GeneralOpenAIRequest)
 	if !ok {
