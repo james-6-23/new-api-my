@@ -426,14 +426,18 @@ func runConversationLogPartitionMaintenance(ctx context.Context) {
 	if _, err := model.CreateConversationLogFuturePartitions(common.GetTimestamp(), setting.PartitionAheadHours); err != nil {
 		common.SysError("conversation log partition pre-create failed: " + err.Error())
 	}
-	// 2. Drop partitions older than retention that are fully exported.
-	if setting.RetentionDays > 0 {
-		cutoff := common.GetTimestamp() - int64(setting.RetentionDays)*24*3600
-		if dropped, err := model.DropExportedConversationLogPartitions(ctx, cutoff, ConversationValidationValid); err != nil {
-			common.SysError("conversation log partition drop failed: " + err.Error())
-		} else if dropped > 0 {
-			common.SysLog(fmt.Sprintf("dropped %d fully-exported conversation log partition(s)", dropped))
-		}
+	// 2. Drop fully-exported partitions older than the partition retain horizon.
+	// This is HOURS, not retention_days: once exported to S3, PG is just a short
+	// buffer, so high-volume ingest must reclaim within hours or the disk fills.
+	retainHours := setting.PartitionRetainHours
+	if retainHours <= 0 {
+		retainHours = 4
+	}
+	cutoff := common.GetTimestamp() - int64(retainHours)*3600
+	if dropped, err := model.DropExportedConversationLogPartitions(ctx, cutoff, ConversationValidationValid); err != nil {
+		common.SysError("conversation log partition drop failed: " + err.Error())
+	} else if dropped > 0 {
+		common.SysLog(fmt.Sprintf("dropped %d fully-exported conversation log partition(s)", dropped))
 	}
 }
 

@@ -119,6 +119,7 @@ const defaultSettings = {
   retention_delete_unexported: false,
   capture_max_bytes_per_request: 16 * MiB,
   partition_ahead_hours: 6,
+  partition_retain_hours: 4,
 };
 
 const formInitValues = {
@@ -1870,6 +1871,25 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             partition_ahead_hours: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='partition_retain_hours'
+                        label={t('分区保留小时数')}
+                        min={1}
+                        max={720}
+                        step={1}
+                        suffix={t('小时')}
+                        extraText={t(
+                          '仅分区模式生效：已导出的分区保留多少小时后 DROP 释放磁盘。高吞吐时按小时回收(数据已在S3),设太大会爆盘',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            partition_retain_hours: Number(value || 0),
                           })
                         }
                       />

@@ -120,6 +120,15 @@ const (
 	minPartitionAheadHours       = 1
 	maxPartitionAheadHours       = 168 // 7 days
 	conversationLogPartitionSecs = int64(3600)
+
+	// Hours an already-exported partition is kept before DROP. This is the
+	// partition-mode cleanup horizon and is HOURS (not days): once a partition's
+	// data is in S3, PG is just a short buffer, so for high-volume ingest it must
+	// be dropped within hours or the disk fills. Decoupled from retention_days
+	// (which is too coarse here and drives only the non-partition DELETE path).
+	defaultPartitionRetainHours = 4
+	minPartitionRetainHours     = 1
+	maxPartitionRetainHours     = 720 // 30 days
 )
 
 type S3Setting struct {
@@ -228,6 +237,9 @@ type ConversationLogSetting struct {
 	// is enabled via the CONVERSATION_LOG_PARTITIONING env var (the enablement
 	// itself is a structural deployment decision, not a DB setting).
 	PartitionAheadHours int `json:"partition_ahead_hours"`
+	// PartitionRetainHours is how many hours an already-exported partition is
+	// kept before being dropped (partition-mode disk reclaim horizon, in HOURS).
+	PartitionRetainHours int `json:"partition_retain_hours"`
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
@@ -276,6 +288,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoVacuumFullIntervalHours: defaultAutoVacuumFullIntervalHours,
 	AutoVacuumFullMaxTableBytes: defaultAutoVacuumFullMaxTableBytes,
 	PartitionAheadHours:         defaultPartitionAheadHours,
+	PartitionRetainHours:        defaultPartitionRetainHours,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -349,6 +362,9 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.PartitionAheadHours < minPartitionAheadHours || setting.PartitionAheadHours > maxPartitionAheadHours {
 		setting.PartitionAheadHours = defaultPartitionAheadHours
+	}
+	if setting.PartitionRetainHours < minPartitionRetainHours || setting.PartitionRetainHours > maxPartitionRetainHours {
+		setting.PartitionRetainHours = defaultPartitionRetainHours
 	}
 
 	if setting.AutoExportThresholdBytes <= 0 {
