@@ -94,6 +94,10 @@ services:
       POSTGRES_USER: root
       POSTGRES_PASSWORD: 123456  # ⚠️ IMPORTANT: Change this password in production!
       POSTGRES_DB: conversation_log
+      # postgres:18 changed the default data dir to a version subdirectory and
+      # rejects a bare /var/lib/postgresql/data mount; pin PGDATA so it keeps
+      # using the mounted path (otherwise the container exits on startup).
+      PGDATA: /var/lib/postgresql/data
     volumes:
       - conversation_log_data:/var/lib/postgresql/data
     networks:
