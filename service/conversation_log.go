@@ -384,6 +384,46 @@ func StartConversationLogCleanupTask() {
 		}
 	}()
 	go conversationLogVacuumFullLoop()
+	go conversationLogPartitionMaintenanceLoop()
+}
+
+// conversationLogPartitionMaintenanceLoop keeps the hourly partition set
+// healthy when partitioning is enabled (PostgreSQL only): it pre-creates future
+// partitions so inserts never hit an unpartitioned range, and drops whole
+// partitions that are older than retention AND fully exported (instant disk
+// reclaim with no bloat). No-op when partitioning is disabled.
+func conversationLogPartitionMaintenanceLoop() {
+	if !common.ConversationLogPartitioningEnabled {
+		return
+	}
+	// Run more often than the partition width so a future partition always
+	// exists before writes need it.
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		runConversationLogPartitionMaintenance(context.Background())
+		<-ticker.C
+	}
+}
+
+func runConversationLogPartitionMaintenance(ctx context.Context) {
+	if !common.ConversationLogStoreConfigured {
+		return
+	}
+	setting := conversation_log_setting.GetSetting()
+	// 1. Pre-create upcoming partitions.
+	if _, err := model.CreateConversationLogFuturePartitions(common.GetTimestamp(), setting.PartitionAheadHours); err != nil {
+		common.SysError("conversation log partition pre-create failed: " + err.Error())
+	}
+	// 2. Drop partitions older than retention that are fully exported.
+	if setting.RetentionDays > 0 {
+		cutoff := common.GetTimestamp() - int64(setting.RetentionDays)*24*3600
+		if dropped, err := model.DropExportedConversationLogPartitions(ctx, cutoff, ConversationValidationValid); err != nil {
+			common.SysError("conversation log partition drop failed: " + err.Error())
+		} else if dropped > 0 {
+			common.SysLog(fmt.Sprintf("dropped %d fully-exported conversation log partition(s)", dropped))
+		}
+	}
 }
 
 // conversationLogVacuumFullLoop periodically reclaims disk space on the
@@ -415,6 +455,13 @@ func conversationLogVacuumFullLoop() {
 
 func cleanupConversationLogs(ctx context.Context) {
 	setting := conversation_log_setting.GetSetting()
+	// When partitioning is enabled, disk is reclaimed by dropping whole
+	// fully-exported partitions (conversationLogPartitionMaintenanceLoop), which
+	// is instant and bloat-free. Row-level DELETE cleanup is skipped entirely to
+	// avoid the dead-tuple churn that DROP PARTITION exists to eliminate.
+	if common.ConversationLogPartitioningEnabled {
+		return
+	}
 	if setting.RetentionDays > 0 {
 		cutoff := common.GetTimestamp() - int64(setting.RetentionDays)*24*3600
 		// By default time-based cleanup only removes already-exported records so

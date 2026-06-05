@@ -1,0 +1,213 @@
+package model
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
+
+	"gorm.io/gorm"
+)
+
+// This file implements PostgreSQL-only hourly range partitioning of the
+// conversation_logs table for high-volume deployments. The design (see
+// plan_high_volume_conversation_log.md):
+//
+//   - conversation_logs is created as PARTITION BY RANGE (created_at) with a
+//     composite primary key (created_at, id) — PostgreSQL requires the
+//     partition key to be part of every unique/primary key.
+//   - A maintenance task pre-creates future hourly partitions so inserts never
+//     hit an unpartitioned range (which would error).
+//   - Cleanup drops whole partitions once they are older than retention AND
+//     fully exported. DROP TABLE on a partition is instant, returns disk to the
+//     OS immediately, and produces no dead tuples / bloat — unlike row DELETE.
+//
+// Everything here is a no-op unless the log database is PostgreSQL and
+// partitioning is enabled in settings. SQLite/MySQL keep the normal table and
+// the existing DELETE-based cleanup paths.
+
+const conversationLogPartitionPrefix = "conversation_logs_p_"
+
+// conversationLogPartitioningActive reports whether hourly partitioning should
+// be used: PostgreSQL log DB + a dedicated store + the structural env-var
+// opt-in (CONVERSATION_LOG_PARTITIONING). The flag is env-driven, not a DB
+// setting, because the table must be created partitioned before DB settings
+// load.
+func conversationLogPartitioningActive() bool {
+	if common.LogSqlType != common.DatabaseTypePostgreSQL && !common.UsingPostgreSQL {
+		return false
+	}
+	if !common.ConversationLogStoreConfigured {
+		return false
+	}
+	return common.ConversationLogPartitioningEnabled
+}
+
+// partitionHourStart floors a Unix-second timestamp to its hourly partition
+// boundary.
+func partitionHourStart(ts int64) int64 {
+	secs := conversation_log_setting.PartitionIntervalSeconds()
+	if secs <= 0 {
+		secs = 3600
+	}
+	return (ts / secs) * secs
+}
+
+// partitionNameForStart builds the deterministic child partition table name for
+// an hour-start boundary. The boundary epoch is embedded so it can be parsed
+// back without consulting pg_get_expr (avoids timezone ambiguity).
+func partitionNameForStart(hourStart int64) string {
+	return conversationLogPartitionPrefix + strconv.FormatInt(hourStart, 10)
+}
+
+// partitionStartFromName parses the hour-start boundary back out of a partition
+// table name. Returns (start, true) on success.
+func partitionStartFromName(name string) (int64, bool) {
+	if !strings.HasPrefix(name, conversationLogPartitionPrefix) {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(strings.TrimPrefix(name, conversationLogPartitionPrefix), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// ensureConversationLogPartitionedParent creates conversation_logs as a
+// partitioned parent table (if it does not already exist) and then runs
+// AutoMigrate so GORM fills in every column and index from the struct. Creating
+// the parent with only the partition-key/PK columns up front keeps this in sync
+// with the model automatically: AutoMigrate ADDs the rest.
+//
+// IMPORTANT: this must run instead of a plain AutoMigrate(&ConversationLog{})
+// for the partitioned path; a normal table cannot be converted to partitioned
+// in place.
+func ensureConversationLogPartitionedParent(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
+	// Create the partitioned parent only when the table does not exist yet, so
+	// we never fight an existing (possibly non-partitioned) table.
+	if !db.Migrator().HasTable("conversation_logs") {
+		// Composite PK (created_at, id); id keeps its own sequence for uniqueness.
+		createSQL := `
+CREATE TABLE conversation_logs (
+	id BIGSERIAL NOT NULL,
+	created_at BIGINT NOT NULL,
+	PRIMARY KEY (created_at, id)
+) PARTITION BY RANGE (created_at)`
+		if err := db.Exec(createSQL).Error; err != nil {
+			return fmt.Errorf("create partitioned conversation_logs: %w", err)
+		}
+	}
+	// Let GORM add all remaining columns and the secondary indexes from the
+	// struct tags. On an existing partitioned parent this ALTERs (adds missing
+	// columns/indexes), which propagates to partitions.
+	if err := db.AutoMigrate(&ConversationLog{}); err != nil {
+		return fmt.Errorf("automigrate partitioned conversation_logs: %w", err)
+	}
+	return nil
+}
+
+// listConversationLogPartitions returns the child partition table names of
+// conversation_logs (PostgreSQL).
+func listConversationLogPartitions() ([]string, error) {
+	var names []string
+	err := LOG_DB.Raw(`
+		SELECT c.relname
+		FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'conversation_logs'::regclass
+	`).Scan(&names).Error
+	return names, err
+}
+
+// CreateConversationLogFuturePartitions pre-creates hourly partitions covering
+// [now-1h, now + aheadHours] so inserts always land in an existing partition.
+// Idempotent (CREATE ... IF NOT EXISTS). PostgreSQL + partitioning-enabled only.
+func CreateConversationLogFuturePartitions(nowTs int64, aheadHours int) (int, error) {
+	if !conversationLogPartitioningActive() {
+		return 0, nil
+	}
+	if aheadHours < 1 {
+		aheadHours = 1
+	}
+	secs := conversation_log_setting.PartitionIntervalSeconds()
+	created := 0
+	// Start one interval in the past to cover the current partial hour and any
+	// slight clock skew.
+	start := partitionHourStart(nowTs) - secs
+	end := partitionHourStart(nowTs) + int64(aheadHours)*secs
+	for hourStart := start; hourStart <= end; hourStart += secs {
+		name := partitionNameForStart(hourStart)
+		// %q is not valid for SQL identifiers; the name is fully derived from a
+		// fixed prefix + integer, so it is injection-safe by construction.
+		sql := fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s PARTITION OF conversation_logs FOR VALUES FROM (%d) TO (%d)",
+			name, hourStart, hourStart+secs,
+		)
+		if err := LOG_DB.Exec(sql).Error; err != nil {
+			return created, fmt.Errorf("create partition %s: %w", name, err)
+		}
+		created++
+	}
+	return created, nil
+}
+
+// DropExportedConversationLogPartitions drops every partition whose entire time
+// window is older than cutoffTs AND has no records that are still pending export
+// — i.e. no rows with validation_status = validStatus AND exported_at = 0.
+// Invalid/unexportable records (which never get exported) do NOT block the drop,
+// since they are un-trainable by definition; otherwise they would pin the
+// partition on disk forever. Valid-but-not-yet-exported rows DO block the drop,
+// so not-yet-trained data is never lost (export lag just delays reclaim).
+// Returns the number of partitions dropped. PostgreSQL + partitioning only.
+func DropExportedConversationLogPartitions(ctx context.Context, cutoffTs int64, validStatus string) (int, error) {
+	if !conversationLogPartitioningActive() {
+		return 0, nil
+	}
+	names, err := listConversationLogPartitions()
+	if err != nil {
+		return 0, err
+	}
+	secs := conversation_log_setting.PartitionIntervalSeconds()
+	dropped := 0
+	for _, name := range names {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return dropped, err
+			}
+		}
+		hourStart, ok := partitionStartFromName(name)
+		if !ok {
+			continue
+		}
+		// Only consider partitions whose whole window is older than the cutoff.
+		if hourStart+secs > cutoffTs {
+			continue
+		}
+		// Safety gate: never drop a partition that still holds valid records that
+		// have not been exported yet. Invalid records do not block the drop.
+		var pending int64
+		if err := LOG_DB.Raw(
+			fmt.Sprintf("SELECT count(*) FROM %s WHERE exported_at = 0 AND validation_status = ?", name),
+			validStatus,
+		).Scan(&pending).Error; err != nil {
+			return dropped, fmt.Errorf("count pending-export in %s: %w", name, err)
+		}
+		if pending > 0 {
+			continue
+		}
+		if err := LOG_DB.Exec("DROP TABLE IF EXISTS " + name).Error; err != nil {
+			return dropped, fmt.Errorf("drop partition %s: %w", name, err)
+		}
+		dropped++
+	}
+	if dropped > 0 {
+		InvalidateConversationLogStatsCache()
+	}
+	return dropped, nil
+}

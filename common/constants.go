@@ -73,6 +73,13 @@ var TaskEnabled = true
 // intentionally forbid so heavy log churn/cleanup never touches the primary
 // database. Set by model.InitLogDB at startup.
 var ConversationLogStoreConfigured = false
+
+// ConversationLogPartitioningEnabled turns on hourly time-partitioning of the
+// conversation_logs table (PostgreSQL only). This is a STRUCTURAL deployment
+// decision that must be known at table-creation time — before DB-stored
+// settings load — so it is driven by the CONVERSATION_LOG_PARTITIONING env var,
+// not a runtime setting. Set from os.Getenv at startup.
+var ConversationLogPartitioningEnabled = false
 var DataExportEnabled = true
 var DataExportInterval = 5         // unit: minute
 var DataExportDefaultTime = "hour" // unit: minute
