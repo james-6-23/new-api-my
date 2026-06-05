@@ -40,8 +40,11 @@ const (
 	defaultExportScanBatchSize   = 5000
 	defaultExportMarkBatchSize   = 2000
 	defaultExportDeleteBatchSize = 2000
+	defaultExportScanBatchBytes  = int64(64) << 20 // 64 MiB
 	minExportBatchSize           = 100
 	maxExportBatchSize           = 10000
+	minExportScanBatchBytes      = int64(1) << 20 // 1 MiB
+	maxExportScanBatchBytes      = int64(2) << 30 // 2 GiB
 
 	defaultExportCompressionWorkers   = 4
 	defaultExportCompressionQueueSize = 4
@@ -57,6 +60,8 @@ const (
 	defaultWriteQueueSize       = 4096
 	defaultWriteBatchSize       = 100
 	defaultWriteFlushIntervalMs = 1000
+	defaultWriteQueueBytes      = int64(128) << 20 // 128 MiB
+	defaultWriteBatchBytes      = int64(32) << 20  // 32 MiB
 	defaultCapturePauseDiskPath = "/"
 	minWriteQueueSize           = 1
 	maxWriteQueueSize           = 100000
@@ -64,6 +69,8 @@ const (
 	maxWriteBatchSize           = 5000
 	minWriteFlushIntervalMs     = 50
 	maxWriteFlushIntervalMs     = 30000
+	minWriteMemoryBytes         = int64(1) << 20 // 1 MiB
+	maxWriteMemoryBytes         = int64(4) << 30 // 4 GiB
 	minCapturePauseDiskUsedGB   = 0
 	maxCapturePauseDiskUsedGB   = 1048576
 )
@@ -110,16 +117,19 @@ type ConversationLogSetting struct {
 	ExportJobConcurrency       int   `json:"export_job_concurrency"`
 	ExportJobRetentionDays     int   `json:"export_job_retention_days"`
 	ExportScanBatchSize        int   `json:"export_scan_batch_size"`
+	ExportScanBatchMaxBytes    int64 `json:"export_scan_batch_max_bytes"`
 	ExportMarkBatchSize        int   `json:"export_mark_batch_size"`
 	ExportDeleteBatchSize      int   `json:"export_delete_batch_size"`
 	ExportCompressionWorkers   int   `json:"export_compression_workers"`
 	ExportCompressionQueueSize int   `json:"export_compression_queue_size"`
 	ExportCompressionLevel     int   `json:"export_compression_level"`
 
-	AsyncWriteEnabled    bool `json:"async_write_enabled"`
-	WriteQueueSize       int  `json:"write_queue_size"`
-	WriteBatchSize       int  `json:"write_batch_size"`
-	WriteFlushIntervalMs int  `json:"write_flush_interval_ms"`
+	AsyncWriteEnabled    bool  `json:"async_write_enabled"`
+	WriteQueueSize       int   `json:"write_queue_size"`
+	WriteQueueMaxBytes   int64 `json:"write_queue_max_bytes"`
+	WriteBatchSize       int   `json:"write_batch_size"`
+	WriteBatchMaxBytes   int64 `json:"write_batch_max_bytes"`
+	WriteFlushIntervalMs int   `json:"write_flush_interval_ms"`
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
@@ -148,6 +158,7 @@ var conversationLogSetting = ConversationLogSetting{
 	ExportJobConcurrency:       1,
 	ExportJobRetentionDays:     14,
 	ExportScanBatchSize:        defaultExportScanBatchSize,
+	ExportScanBatchMaxBytes:    defaultExportScanBatchBytes,
 	ExportMarkBatchSize:        defaultExportMarkBatchSize,
 	ExportDeleteBatchSize:      defaultExportDeleteBatchSize,
 	ExportCompressionWorkers:   defaultExportCompressionWorkers,
@@ -155,7 +166,9 @@ var conversationLogSetting = ConversationLogSetting{
 	ExportCompressionLevel:     defaultExportCompressionLevel,
 	AsyncWriteEnabled:          defaultAsyncWriteEnabled,
 	WriteQueueSize:             defaultWriteQueueSize,
+	WriteQueueMaxBytes:         defaultWriteQueueBytes,
 	WriteBatchSize:             defaultWriteBatchSize,
+	WriteBatchMaxBytes:         defaultWriteBatchBytes,
 	WriteFlushIntervalMs:       defaultWriteFlushIntervalMs,
 
 	AutoExportEnabled:              false,
@@ -203,13 +216,16 @@ func GetSetting() ConversationLogSetting {
 		setting.ExportJobRetentionDays = 0
 	}
 	setting.ExportScanBatchSize = clampExportBatchSize(setting.ExportScanBatchSize, defaultExportScanBatchSize)
+	setting.ExportScanBatchMaxBytes = clampExportScanBatchBytes(setting.ExportScanBatchMaxBytes)
 	setting.ExportMarkBatchSize = clampExportBatchSize(setting.ExportMarkBatchSize, defaultExportMarkBatchSize)
 	setting.ExportDeleteBatchSize = clampExportBatchSize(setting.ExportDeleteBatchSize, defaultExportDeleteBatchSize)
 	setting.ExportCompressionWorkers = clampExportCompressionWorkers(setting.ExportCompressionWorkers)
 	setting.ExportCompressionQueueSize = clampExportCompressionQueueSize(setting.ExportCompressionQueueSize)
 	setting.ExportCompressionLevel = clampExportCompressionLevel(setting.ExportCompressionLevel)
 	setting.WriteQueueSize = clampWriteQueueSize(setting.WriteQueueSize)
+	setting.WriteQueueMaxBytes = clampWriteMemoryBytes(setting.WriteQueueMaxBytes, defaultWriteQueueBytes)
 	setting.WriteBatchSize = clampWriteBatchSize(setting.WriteBatchSize)
+	setting.WriteBatchMaxBytes = clampWriteMemoryBytes(setting.WriteBatchMaxBytes, defaultWriteBatchBytes)
 	setting.WriteFlushIntervalMs = clampWriteFlushIntervalMs(setting.WriteFlushIntervalMs)
 
 	if setting.AutoExportThresholdBytes <= 0 {
@@ -267,6 +283,17 @@ func ExportBatchSizeBounds() (min, max int) {
 	return minExportBatchSize, maxExportBatchSize
 }
 
+func clampExportScanBatchBytes(value int64) int64 {
+	if value < minExportScanBatchBytes || value > maxExportScanBatchBytes {
+		return defaultExportScanBatchBytes
+	}
+	return value
+}
+
+func ExportScanBatchBytesBounds() (min, max int64) {
+	return minExportScanBatchBytes, maxExportScanBatchBytes
+}
+
 func clampExportCompressionWorkers(value int) int {
 	if value < minExportCompressionWorkers || value > maxExportCompressionWorkers {
 		return defaultExportCompressionWorkers
@@ -309,6 +336,17 @@ func clampWriteQueueSize(value int) int {
 
 func WriteQueueSizeBounds() (min, max int) {
 	return minWriteQueueSize, maxWriteQueueSize
+}
+
+func clampWriteMemoryBytes(value, fallback int64) int64 {
+	if value < minWriteMemoryBytes || value > maxWriteMemoryBytes {
+		return fallback
+	}
+	return value
+}
+
+func WriteMemoryBytesBounds() (min, max int64) {
+	return minWriteMemoryBytes, maxWriteMemoryBytes
 }
 
 func clampWriteBatchSize(value int) int {

@@ -30,11 +30,15 @@ var conversationExportLogSelectColumns = []string{
 }
 
 func forEachConversationExportLog(ctx context.Context, query model.ConversationLogQuery, fn func([]*model.ConversationLog) error) error {
-	return model.ForEachConversationLogSelected(ctx, query, conversationExportLogSelectColumns, exportScanBatchSize(), fn)
+	return model.ForEachConversationLogSelectedByStorageBudget(ctx, query, conversationExportLogSelectColumns, exportScanBatchSize(), exportScanBatchMaxBytes(), fn)
 }
 
 func exportScanBatchSize() int {
 	return conversation_log_setting.GetSetting().ExportScanBatchSize
+}
+
+func exportScanBatchMaxBytes() int64 {
+	return conversation_log_setting.GetSetting().ExportScanBatchMaxBytes
 }
 
 func exportMarkBatchSize() int {
@@ -99,7 +103,7 @@ func BuildConversationExportBatchRecommendation(summary model.ConversationLogSum
 		scan, mark, deleteSize = 3000, 2000, 2000
 		if averageBytes >= 512*1024 {
 			reason = "large_record_body"
-			scan = 1500
+			scan = recommendedScanRowsForBytes(averageBytes)
 		}
 	case records >= 1_000_000 || storageGiB >= 30 || averageBytes >= 256*1024:
 		level = "large"
@@ -107,7 +111,7 @@ func BuildConversationExportBatchRecommendation(summary model.ConversationLogSum
 		scan, mark, deleteSize = 5000, 3000, 3000
 		if averageBytes >= 256*1024 {
 			reason = "large_record_body"
-			scan = 2500
+			scan = recommendedScanRowsForBytes(averageBytes)
 		}
 	case records >= 100_000 || storageGiB >= 5 || averageBytes >= 64*1024:
 		level = "medium"
@@ -115,7 +119,7 @@ func BuildConversationExportBatchRecommendation(summary model.ConversationLogSum
 		scan, mark, deleteSize = 7000, 4000, 4000
 		if averageBytes >= 64*1024 {
 			reason = "large_record_body"
-			scan = 4000
+			scan = recommendedScanRowsForBytes(averageBytes)
 		}
 	}
 
@@ -161,6 +165,24 @@ func conversationLogDatabaseType() string {
 		return common.DatabaseTypeMySQL
 	}
 	return common.DatabaseTypeSQLite
+}
+
+func recommendedScanRowsForBytes(averageBytes int64) int {
+	if averageBytes <= 0 {
+		return 8000
+	}
+	targetBytes := conversation_log_setting.GetSetting().ExportScanBatchMaxBytes
+	if targetBytes <= 0 {
+		targetBytes = int64(64) << 20
+	}
+	rows := int(targetBytes / averageBytes)
+	if rows < 100 {
+		return 100
+	}
+	if rows > 8000 {
+		return 8000
+	}
+	return rows
 }
 
 func clampExportBatchRecommendation(value, minBatch, maxBatch int) int {

@@ -441,11 +441,28 @@ func validateAPIRecordParsed(log *model.ConversationLog, parsed conversationAPIR
 // common case of filtered queries used by the UI.
 const summaryInMemoryRecordCap = 50000
 
+// summaryInMemoryBytesCap also bounds the retained payload bytes for session
+// rich analysis. A small record count can still carry multi-GiB TOAST bodies.
+const summaryInMemoryBytesCap = int64(256) << 20
+
 // summaryTotalRecordsCap is the upper bound on rows the summary builder will
 // even *iterate*. Above this we don't trust ourselves to stream record
 // payloads (each row may carry a multi-MB response body) and switch to
 // pure DB-side counting.
 const summaryTotalRecordsCap = 200000
+
+func formatBytesForError(bytes int64) string {
+	if bytes >= 1<<30 {
+		return fmt.Sprintf("%.2f GiB", float64(bytes)/(1<<30))
+	}
+	if bytes >= 1<<20 {
+		return fmt.Sprintf("%.2f MiB", float64(bytes)/(1<<20))
+	}
+	if bytes >= 1<<10 {
+		return fmt.Sprintf("%.2f KiB", float64(bytes)/(1<<10))
+	}
+	return fmt.Sprintf("%d bytes", bytes)
+}
 
 func BuildConversationLogExportSummary(ctx context.Context, query model.ConversationLogQuery, mode string) (ConversationExportSummary, error) {
 	return buildConversationLogExportSummary(ctx, query, mode, false)
@@ -486,7 +503,9 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	}
 
 	validRecords := make([]*model.ConversationLog, 0)
+	validRecordBytes := int64(0)
 	overflowed := false
+	collectSessionRecords := mode == conversation_log_setting.ExportModeSessionJSONL
 
 	err := forEachConversationExportLog(ctx, query, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
@@ -495,12 +514,14 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 			validation := prepared.validation
 			if validation.Exportable && item.ValidationStatus == ConversationValidationValid {
 				summary.APIExportableRecords++
-				if !overflowed {
-					if int64(len(validRecords)) >= summaryInMemoryRecordCap {
+				if collectSessionRecords && !overflowed {
+					itemBytes := estimateConversationLogMemoryBytes(item)
+					if int64(len(validRecords)) >= summaryInMemoryRecordCap || validRecordBytes+itemBytes > summaryInMemoryBytesCap {
 						overflowed = true
 						validRecords = nil
 					} else {
 						validRecords = append(validRecords, item)
+						validRecordBytes += itemBytes
 					}
 				}
 			} else {
@@ -596,6 +617,7 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 	}
 
 	validRecords := make([]*model.ConversationLog, 0)
+	validRecordBytes := int64(0)
 	validQuery, ok := conversationExportValidQuery(query)
 	if !ok {
 		return exportedIDs, summary, nil
@@ -604,8 +626,13 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 		for _, item := range logs {
 			prepared := prepareConversationExportLog(item)
 			if prepared.validation.Exportable {
+				itemBytes := estimateConversationLogMemoryBytes(item)
+				if validRecordBytes+itemBytes > summaryInMemoryBytesCap {
+					return fmt.Errorf("session_jsonl direct export is limited to %s retained payload bytes; use sharded export jobs for large exports", formatBytesForError(summaryInMemoryBytesCap))
+				}
 				item.RequestBody = prepared.EffectiveRequestBody()
 				validRecords = append(validRecords, item)
+				validRecordBytes += itemBytes
 			}
 		}
 		return nil

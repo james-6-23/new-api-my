@@ -94,6 +94,7 @@ const (
 	conversationLogStatsCacheTTL                = 30 * time.Second
 	conversationLogCreateInvalidationInterval   = 30 * time.Second
 	conversationLogMutationInvalidationInterval = 5 * time.Second
+	conversationLogUnknownStorageBytes          = int64(4) << 20
 )
 
 var (
@@ -603,6 +604,85 @@ func ForEachConversationLogSelected(ctx context.Context, query ConversationLogQu
 			return err
 		}
 		lastID = logs[len(logs)-1].Id
+	}
+}
+
+func ForEachConversationLogSelectedByStorageBudget(ctx context.Context, query ConversationLogQuery, columns []string, batchSize int, maxBatchBytes int64, fn func([]*ConversationLog) error) error {
+	if maxBatchBytes <= 0 {
+		return ForEachConversationLogSelected(ctx, query, columns, batchSize, fn)
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	columns = ensureConversationLogIDSelected(columns)
+	lastID := 0
+	for {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		var refs []*ConversationLog
+		err := applyConversationLogQuery(conversationLogDBWithContext(ctx).Model(&ConversationLog{}), query).
+			Select("id, storage_bytes").
+			Where("id > ?", lastID).
+			Order("id asc").
+			Limit(batchSize).
+			Find(&refs).Error
+		if err != nil {
+			return err
+		}
+		if len(refs) == 0 {
+			return nil
+		}
+
+		for start := 0; start < len(refs); {
+			if ctx != nil {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			ids := make([]int, 0, len(refs)-start)
+			batchBytes := int64(0)
+			for start < len(refs) {
+				ref := refs[start]
+				if ref == nil {
+					start++
+					continue
+				}
+				rowBytes := ref.StorageBytes
+				if rowBytes <= 0 {
+					rowBytes = conversationLogUnknownStorageBytes
+				}
+				if len(ids) > 0 && batchBytes+rowBytes > maxBatchBytes {
+					break
+				}
+				ids = append(ids, ref.Id)
+				batchBytes += rowBytes
+				lastID = ref.Id
+				start++
+				if batchBytes >= maxBatchBytes {
+					break
+				}
+			}
+			if len(ids) == 0 {
+				continue
+			}
+			var logs []*ConversationLog
+			db := conversationLogDBWithContext(ctx).Model(&ConversationLog{}).Where("id IN ?", ids)
+			if len(columns) > 0 {
+				db = db.Select(columns)
+			}
+			if err := db.Order("id asc").Find(&logs).Error; err != nil {
+				return err
+			}
+			if len(logs) == 0 {
+				continue
+			}
+			if err := fn(logs); err != nil {
+				return err
+			}
+		}
 	}
 }
 

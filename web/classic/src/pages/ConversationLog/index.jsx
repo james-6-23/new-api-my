@@ -69,6 +69,8 @@ import S3UploadLogs from './S3UploadLogs';
 const { Text, Title } = Typography;
 
 const exportModes = ['api_hijack_jsonl'];
+const MiB = 1024 * 1024;
+const defaultExportScanBatchMaxBytes = 64 * MiB;
 
 const defaultSettings = {
   capture_enabled: true,
@@ -100,6 +102,7 @@ const defaultSettings = {
   auto_export_check_interval_seconds: 300,
   auto_export_delete_after: true,
   export_scan_batch_size: 5000,
+  export_scan_batch_max_bytes: defaultExportScanBatchMaxBytes,
   export_mark_batch_size: 2000,
   export_delete_batch_size: 2000,
   export_compression_workers: 4,
@@ -107,7 +110,9 @@ const defaultSettings = {
   export_compression_level: 1,
   async_write_enabled: true,
   write_queue_size: 4096,
+  write_queue_max_bytes: 128 * MiB,
   write_batch_size: 100,
+  write_batch_max_bytes: 32 * MiB,
   write_flush_interval_ms: 1000,
 };
 
@@ -125,6 +130,16 @@ const formInitValues = {
 };
 
 const defaultBatchSizeBounds = { min: 100, max: 10000 };
+
+function bytesToMiB(bytes) {
+  return Math.round(Number(bytes || 0) / MiB);
+}
+
+function mibToBytes(value, fallbackBytes) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return fallbackBytes;
+  return Math.round(number) * MiB;
+}
 
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
@@ -148,6 +163,12 @@ function clampBatchSize(value, bounds = defaultBatchSizeBounds) {
   const max = Number(bounds?.max || defaultBatchSizeBounds.max);
   if (!Number.isFinite(number)) return min;
   return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function recommendedScanRowsForBytes(avgBytes) {
+  if (!avgBytes || avgBytes <= 0) return 8000;
+  const rows = Math.floor(defaultExportScanBatchMaxBytes / avgBytes);
+  return Math.max(100, Math.min(8000, rows));
 }
 
 function normalizeBatchRecommendation(recommendation) {
@@ -180,7 +201,8 @@ function getExportBatchRecommendation(summary) {
     return {
       level: 'extra_large',
       reason: avgBytes >= 512 * 1024 ? 'large_record_body' : 'large_log_table',
-      scan: avgBytes >= 512 * 1024 ? 1500 : 3000,
+      scan:
+        avgBytes >= 512 * 1024 ? recommendedScanRowsForBytes(avgBytes) : 3000,
       mark: 2000,
       delete: 2000,
     };
@@ -189,7 +211,8 @@ function getExportBatchRecommendation(summary) {
     return {
       level: 'large',
       reason: avgBytes >= 256 * 1024 ? 'large_record_body' : 'large_log_table',
-      scan: avgBytes >= 256 * 1024 ? 2500 : 5000,
+      scan:
+        avgBytes >= 256 * 1024 ? recommendedScanRowsForBytes(avgBytes) : 5000,
       mark: 3000,
       delete: 3000,
     };
@@ -198,7 +221,8 @@ function getExportBatchRecommendation(summary) {
     return {
       level: 'medium',
       reason: avgBytes >= 64 * 1024 ? 'large_record_body' : 'medium_log_table',
-      scan: avgBytes >= 64 * 1024 ? 4000 : 7000,
+      scan:
+        avgBytes >= 64 * 1024 ? recommendedScanRowsForBytes(avgBytes) : 7000,
       mark: 4000,
       delete: 4000,
     };
@@ -464,18 +488,23 @@ const ConversationLog = () => {
           max: Number(bounds.max || defaultBatchSizeBounds.max),
         });
         setSettings(nextSettings);
-        // The two MB-typed fields aren't first-class properties of the
+        // MB-typed form fields aren't first-class properties of the
         // settings object (the API stores bytes), so Form's values={settings}
         // controlled mode can't populate them on its own. Inject the derived
         // MB values into the form state explicitly.
         const formValues = {
           ...nextSettings,
-          auto_export_threshold_mb: Math.round(
-            (nextSettings.auto_export_threshold_bytes || 0) / (1024 * 1024),
+          auto_export_threshold_mb: bytesToMiB(
+            nextSettings.auto_export_threshold_bytes,
           ),
-          auto_export_shard_max_mb: Math.round(
-            (nextSettings.auto_export_shard_max_bytes || 0) / (1024 * 1024),
+          auto_export_shard_max_mb: bytesToMiB(
+            nextSettings.auto_export_shard_max_bytes,
           ),
+          export_scan_batch_max_mb: bytesToMiB(
+            nextSettings.export_scan_batch_max_bytes,
+          ),
+          write_queue_max_mb: bytesToMiB(nextSettings.write_queue_max_bytes),
+          write_batch_max_mb: bytesToMiB(nextSettings.write_batch_max_bytes),
         };
         settingsFormRef.current?.setValues(formValues);
         void loadS3RotationStatus(false, nextSettings.s3);
@@ -581,12 +610,17 @@ const ConversationLog = () => {
       setSettings(nextSettings);
       const formValues = {
         ...nextSettings,
-        auto_export_threshold_mb: Math.round(
-          (nextSettings.auto_export_threshold_bytes || 0) / (1024 * 1024),
+        auto_export_threshold_mb: bytesToMiB(
+          nextSettings.auto_export_threshold_bytes,
         ),
-        auto_export_shard_max_mb: Math.round(
-          (nextSettings.auto_export_shard_max_bytes || 0) / (1024 * 1024),
+        auto_export_shard_max_mb: bytesToMiB(
+          nextSettings.auto_export_shard_max_bytes,
         ),
+        export_scan_batch_max_mb: bytesToMiB(
+          nextSettings.export_scan_batch_max_bytes,
+        ),
+        write_queue_max_mb: bytesToMiB(nextSettings.write_queue_max_bytes),
+        write_batch_max_mb: bytesToMiB(nextSettings.write_batch_max_bytes),
       };
       settingsFormRef.current?.setValues(formValues);
       showSuccess(t('保存成功'));
@@ -1916,6 +1950,28 @@ const ConversationLog = () => {
                   <Row gutter={16} className='mt-2'>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
+                        field='export_scan_batch_max_mb'
+                        label={t('扫描内存上限 (MB)')}
+                        min={1}
+                        max={2048}
+                        step={16}
+                        precision={0}
+                        extraText={t('单批读取完整会话正文的估算内存上限')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            export_scan_batch_max_bytes: mibToBytes(
+                              value,
+                              defaultSettings.export_scan_batch_max_bytes,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
                         field='export_compression_workers'
                         label={t('压缩 worker 数')}
                         min={1}
@@ -2034,6 +2090,48 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             write_flush_interval_ms: Number(value || 1000),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='write_queue_max_mb'
+                        label={t('写入队列内存上限 (MB)')}
+                        min={1}
+                        max={4096}
+                        step={16}
+                        precision={0}
+                        disabled={settings.async_write_enabled === false}
+                        extraText={t('队列正文估算内存达到上限时回退同步写入')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            write_queue_max_bytes: mibToBytes(
+                              value,
+                              defaultSettings.write_queue_max_bytes,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='write_batch_max_mb'
+                        label={t('写入批量内存上限 (MB)')}
+                        min={1}
+                        max={4096}
+                        step={16}
+                        precision={0}
+                        disabled={settings.async_write_enabled === false}
+                        extraText={t('后台批量入库达到估算内存后立即刷新')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            write_batch_max_bytes: mibToBytes(
+                              value,
+                              defaultSettings.write_batch_max_bytes,
+                            ),
                           })
                         }
                       />

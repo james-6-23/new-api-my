@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -628,6 +629,58 @@ func TestForEachConversationExportLogSelectsOnlyExportColumns(t *testing.T) {
 	require.Zero(t, got.StorageBytes)
 }
 
+func TestForEachConversationExportLogSplitsByStorageBudget(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	previous := conversation_log_setting.GetSetting()
+	t.Cleanup(func() {
+		updateConversationLogTestSettings(t, map[string]string{
+			"export_scan_batch_size":      strconv.Itoa(previous.ExportScanBatchSize),
+			"export_scan_batch_max_bytes": strconv.FormatInt(previous.ExportScanBatchMaxBytes, 10),
+		})
+	})
+	updateConversationLogTestSettings(t, map[string]string{
+		"export_scan_batch_size":      "10",
+		"export_scan_batch_max_bytes": strconv.FormatInt(1<<20, 10),
+	})
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, model.CreateConversationLog(&model.ConversationLog{
+			CreatedAt:        int64(1710000000 + i),
+			SessionId:        "sess_budget",
+			Provider:         "openai",
+			RequestBody:      `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+			ResponseBody:     `{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"total_tokens":1}}`,
+			RequestTime:      int64(1710000000000 + i),
+			ResponseTime:     int64(1710000000100 + i),
+			ValidationStatus: ConversationValidationValid,
+			StorageBytes:     700 << 10,
+		}))
+	}
+
+	var batchSizes []int
+	require.NoError(t, forEachConversationExportLog(context.Background(), model.ConversationLogQuery{}, func(logs []*model.ConversationLog) error {
+		batchSizes = append(batchSizes, len(logs))
+		return nil
+	}))
+
+	require.Equal(t, []int{1, 1, 1}, batchSizes)
+}
+
+func TestConversationLogAsyncWriterRejectsQueueOverMemoryBudget(t *testing.T) {
+	writer := &conversationLogAsyncWriter{
+		queue: make(chan queuedConversationLog, 2),
+	}
+	writer.maxQueueBytes.Store(1024)
+	writer.maxBatchBytes.Store(1024)
+
+	require.True(t, writer.submit(&model.ConversationLog{StorageBytes: 900}))
+	require.False(t, writer.submit(&model.ConversationLog{StorageBytes: 200}))
+
+	item := <-writer.queue
+	writer.releaseBytes(item.bytes)
+	require.True(t, writer.submit(&model.ConversationLog{StorageBytes: 200}))
+}
+
 func TestBuildConversationExportBatchRecommendationSQLiteLimitsMarkDelete(t *testing.T) {
 	restoreDBFlags := setConversationExportRecommendationDBFlags(true, false, false)
 	defer restoreDBFlags()
@@ -660,7 +713,7 @@ func TestBuildConversationExportBatchRecommendationLargeRecordBody(t *testing.T)
 	require.Equal(t, "large", recommendation.Level)
 	require.Equal(t, "large_record_body", recommendation.Reason)
 	require.False(t, recommendation.SQLiteLimited)
-	require.Equal(t, 2500, recommendation.ScanBatchSize)
+	require.Equal(t, 218, recommendation.ScanBatchSize)
 	require.Equal(t, 3000, recommendation.MarkBatchSize)
 	require.Equal(t, 3000, recommendation.DeleteBatchSize)
 }

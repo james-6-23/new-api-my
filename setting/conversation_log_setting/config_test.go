@@ -54,9 +54,12 @@ func TestGetSettingDefaultsExportCompressionAndAsyncWrite(t *testing.T) {
 	require.Equal(t, 4, setting.ExportCompressionWorkers)
 	require.Equal(t, 4, setting.ExportCompressionQueueSize)
 	require.Equal(t, 1, setting.ExportCompressionLevel)
+	require.EqualValues(t, 64<<20, setting.ExportScanBatchMaxBytes)
 	require.True(t, setting.AsyncWriteEnabled)
 	require.Equal(t, 4096, setting.WriteQueueSize)
+	require.EqualValues(t, 128<<20, setting.WriteQueueMaxBytes)
 	require.Equal(t, 100, setting.WriteBatchSize)
+	require.EqualValues(t, 32<<20, setting.WriteBatchMaxBytes)
 	require.Equal(t, 1000, setting.WriteFlushIntervalMs)
 	require.Equal(t, 0, setting.CapturePauseDiskUsedGB)
 	require.Equal(t, "/", setting.CapturePauseDiskPath)
@@ -71,8 +74,11 @@ func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 	conversationLogSetting.ExportCompressionWorkers = 33
 	conversationLogSetting.ExportCompressionQueueSize = 65
 	conversationLogSetting.ExportCompressionLevel = 10
+	conversationLogSetting.ExportScanBatchMaxBytes = 0
 	conversationLogSetting.WriteQueueSize = 0
+	conversationLogSetting.WriteQueueMaxBytes = 0
 	conversationLogSetting.WriteBatchSize = 0
+	conversationLogSetting.WriteBatchMaxBytes = 0
 	conversationLogSetting.WriteFlushIntervalMs = 31_000
 	conversationLogSetting.CapturePauseDiskUsedGB = -1
 	conversationLogSetting.CapturePauseDiskPath = ""
@@ -81,8 +87,11 @@ func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 	require.Equal(t, 4, setting.ExportCompressionWorkers)
 	require.Equal(t, 4, setting.ExportCompressionQueueSize)
 	require.Equal(t, 1, setting.ExportCompressionLevel)
+	require.EqualValues(t, 64<<20, setting.ExportScanBatchMaxBytes)
 	require.Equal(t, 4096, setting.WriteQueueSize)
+	require.EqualValues(t, 128<<20, setting.WriteQueueMaxBytes)
 	require.Equal(t, 100, setting.WriteBatchSize)
+	require.EqualValues(t, 32<<20, setting.WriteBatchMaxBytes)
 	require.Equal(t, 1000, setting.WriteFlushIntervalMs)
 	require.Equal(t, 0, setting.CapturePauseDiskUsedGB)
 	require.Equal(t, "/", setting.CapturePauseDiskPath)
@@ -96,4 +105,10 @@ func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 	minPauseGB, maxPauseGB := CapturePauseDiskUsedGBBounds()
 	require.Equal(t, 0, minPauseGB)
 	require.Equal(t, 1048576, maxPauseGB)
+	minScanBytes, maxScanBytes := ExportScanBatchBytesBounds()
+	require.EqualValues(t, 1<<20, minScanBytes)
+	require.EqualValues(t, 2<<30, maxScanBytes)
+	minWriteBytes, maxWriteBytes := WriteMemoryBytesBounds()
+	require.EqualValues(t, 1<<20, minWriteBytes)
+	require.EqualValues(t, 4<<30, maxWriteBytes)
 }

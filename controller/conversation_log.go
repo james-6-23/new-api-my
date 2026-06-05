@@ -143,16 +143,19 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		DefaultExportMode      *string                             `json:"default_export_mode"`
 		S3                     *conversation_log_setting.S3Setting `json:"s3"`
 
-		ExportScanBatchSize        *int  `json:"export_scan_batch_size"`
-		ExportMarkBatchSize        *int  `json:"export_mark_batch_size"`
-		ExportDeleteBatchSize      *int  `json:"export_delete_batch_size"`
-		ExportCompressionWorkers   *int  `json:"export_compression_workers"`
-		ExportCompressionQueueSize *int  `json:"export_compression_queue_size"`
-		ExportCompressionLevel     *int  `json:"export_compression_level"`
-		AsyncWriteEnabled          *bool `json:"async_write_enabled"`
-		WriteQueueSize             *int  `json:"write_queue_size"`
-		WriteBatchSize             *int  `json:"write_batch_size"`
-		WriteFlushIntervalMs       *int  `json:"write_flush_interval_ms"`
+		ExportScanBatchSize        *int   `json:"export_scan_batch_size"`
+		ExportScanBatchMaxBytes    *int64 `json:"export_scan_batch_max_bytes"`
+		ExportMarkBatchSize        *int   `json:"export_mark_batch_size"`
+		ExportDeleteBatchSize      *int   `json:"export_delete_batch_size"`
+		ExportCompressionWorkers   *int   `json:"export_compression_workers"`
+		ExportCompressionQueueSize *int   `json:"export_compression_queue_size"`
+		ExportCompressionLevel     *int   `json:"export_compression_level"`
+		AsyncWriteEnabled          *bool  `json:"async_write_enabled"`
+		WriteQueueSize             *int   `json:"write_queue_size"`
+		WriteQueueMaxBytes         *int64 `json:"write_queue_max_bytes"`
+		WriteBatchSize             *int   `json:"write_batch_size"`
+		WriteBatchMaxBytes         *int64 `json:"write_batch_max_bytes"`
+		WriteFlushIntervalMs       *int   `json:"write_flush_interval_ms"`
 
 		AutoExportEnabled              *bool   `json:"auto_export_enabled"`
 		AutoExportThresholdBytes       *int64  `json:"auto_export_threshold_bytes"`
@@ -258,6 +261,13 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 	}
+	if req.ExportScanBatchMaxBytes != nil {
+		min, max := conversation_log_setting.ExportScanBatchBytesBounds()
+		if err := updateConversationLogInt64Setting("export_scan_batch_max_bytes", *req.ExportScanBatchMaxBytes, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
 	if req.ExportMarkBatchSize != nil {
 		if err := updateConversationExportBatchSize("export_mark_batch_size", *req.ExportMarkBatchSize); err != nil {
 			common.ApiErrorMsg(c, err.Error())
@@ -304,9 +314,23 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 	}
+	if req.WriteQueueMaxBytes != nil {
+		min, max := conversation_log_setting.WriteMemoryBytesBounds()
+		if err := updateConversationLogInt64Setting("write_queue_max_bytes", *req.WriteQueueMaxBytes, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
 	if req.WriteBatchSize != nil {
 		min, max := conversation_log_setting.WriteBatchSizeBounds()
 		if err := updateConversationLogIntSetting("write_batch_size", *req.WriteBatchSize, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.WriteBatchMaxBytes != nil {
+		min, max := conversation_log_setting.WriteMemoryBytesBounds()
+		if err := updateConversationLogInt64Setting("write_batch_max_bytes", *req.WriteBatchMaxBytes, min, max); err != nil {
 			common.ApiErrorMsg(c, err.Error())
 			return
 		}
@@ -387,6 +411,13 @@ func updateConversationLogIntSetting(key string, value int, minValue int, maxVal
 		return fmt.Errorf("%s must be in [%d, %d]", key, minValue, maxValue)
 	}
 	return model.UpdateOption("conversation_log_setting."+key, strconv.Itoa(value))
+}
+
+func updateConversationLogInt64Setting(key string, value int64, minValue int64, maxValue int64) error {
+	if value < minValue || value > maxValue {
+		return fmt.Errorf("%s must be in [%d, %d]", key, minValue, maxValue)
+	}
+	return model.UpdateOption("conversation_log_setting."+key, strconv.FormatInt(value, 10))
 }
 
 func TestConversationLogS3Connection(c *gin.Context) {
