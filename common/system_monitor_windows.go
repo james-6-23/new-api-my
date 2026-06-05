@@ -14,7 +14,14 @@ func GetDiskSpaceInfo() DiskSpaceInfo {
 	if cachePath == "" {
 		cachePath = os.TempDir()
 	}
+	return GetDiskSpaceInfoForPath(cachePath)
+}
 
+// GetDiskSpaceInfoForPath 获取指定路径所在磁盘的空间信息 (Windows)
+func GetDiskSpaceInfoForPath(path string) DiskSpaceInfo {
+	if path == "" || path == "/" {
+		path = os.TempDir()
+	}
 	info := DiskSpaceInfo{}
 
 	kernel32 := syscall.NewLazyDLL("kernel32.dll")
@@ -22,7 +29,7 @@ func GetDiskSpaceInfo() DiskSpaceInfo {
 
 	var freeBytesAvailable, totalBytes, totalFreeBytes uint64
 
-	pathPtr, err := syscall.UTF16PtrFromString(cachePath)
+	pathPtr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return info
 	}

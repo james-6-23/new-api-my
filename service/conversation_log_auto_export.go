@@ -88,7 +88,7 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		ShardMaxBytes:      shardMax,
 		DeleteAfterExport:  settings.AutoExportDeleteAfter,
 		S3Upload:           settings.S3.Enabled,
-		LocalExportEnabled: common.GetPointer(settings.LocalExportEnabled),
+		LocalExportEnabled: common.GetPointer(autoExportLocalExportEnabled(settings)),
 		Trigger:            "auto",
 		OutputRoot:         settings.AutoExportDirectory,
 	}
@@ -101,4 +101,14 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		return
 	}
 	common.SysLog("auto export: triggered job " + job.JobId + " (storage_bytes >= threshold)")
+}
+
+func autoExportLocalExportEnabled(settings conversation_log_setting.ConversationLogSetting) bool {
+	if !settings.LocalExportEnabled {
+		return false
+	}
+	if settings.S3.Enabled && settings.S3.DeleteLocalAfterUpload {
+		return false
+	}
+	return true
 }

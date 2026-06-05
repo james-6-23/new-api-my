@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -123,8 +124,9 @@ type sessionH4Info struct {
 }
 
 var (
-	systemReminderPattern = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
-	whitespacePattern     = regexp.MustCompile(`\s+`)
+	systemReminderPattern               = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+	whitespacePattern                   = regexp.MustCompile(`\s+`)
+	conversationCaptureDiskPauseLastLog atomic.Int64
 )
 
 func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
@@ -133,6 +135,9 @@ func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) 
 	}
 	setting := conversation_log_setting.GetSetting()
 	if !setting.CaptureEnabled || !relayInfo.ChannelOtherSettings.ConversationLogEnabled || !isConversationLogRelayFormat(relayInfo.RelayFormat) {
+		return
+	}
+	if conversationCapturePausedByDisk(setting) {
 		return
 	}
 	storage, err := common.GetBodyStorage(c)
@@ -149,6 +154,32 @@ func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) 
 	capture.SetClientRequestBody(body)
 	relayInfo.ConversationCapture = capture
 	relaycommon.SetConversationCapture(c, capture)
+}
+
+func conversationCapturePausedByDisk(setting conversation_log_setting.ConversationLogSetting) bool {
+	if setting.CapturePauseDiskUsedGB <= 0 {
+		return false
+	}
+	info := common.GetDiskSpaceInfoForPath(setting.CapturePauseDiskPath)
+	if info.Total == 0 {
+		return false
+	}
+	thresholdBytes := uint64(setting.CapturePauseDiskUsedGB) << 30
+	if info.Used <= thresholdBytes {
+		return false
+	}
+
+	now := time.Now().Unix()
+	last := conversationCaptureDiskPauseLastLog.Load()
+	if now-last >= 60 && conversationCaptureDiskPauseLastLog.CompareAndSwap(last, now) {
+		common.SysLog(fmt.Sprintf(
+			"conversation capture paused: disk used %.2f GiB exceeds threshold %d GiB on %s",
+			float64(info.Used)/(1<<30),
+			setting.CapturePauseDiskUsedGB,
+			setting.CapturePauseDiskPath,
+		))
+	}
+	return true
 }
 
 func isConversationLogRelayFormat(format types.RelayFormat) bool {
@@ -265,9 +296,7 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		len(log.UsageJSON) +
 		len(log.InvalidReason))
 
-	if err := model.CreateConversationLog(log); err != nil {
-		logger.LogError(ctx, "failed to record conversation log: "+err.Error())
-	}
+	recordConversationLog(ctx, log)
 }
 
 func StartConversationLogCleanupTask() {

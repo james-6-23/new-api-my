@@ -42,6 +42,30 @@ const (
 	defaultExportDeleteBatchSize = 2000
 	minExportBatchSize           = 100
 	maxExportBatchSize           = 10000
+
+	defaultExportCompressionWorkers   = 4
+	defaultExportCompressionQueueSize = 4
+	defaultExportCompressionLevel     = 1 // gzip.BestSpeed
+	minExportCompressionWorkers       = 1
+	maxExportCompressionWorkers       = 32
+	minExportCompressionQueueSize     = 0
+	maxExportCompressionQueueSize     = 64
+	minExportCompressionLevel         = -2 // gzip.HuffmanOnly
+	maxExportCompressionLevel         = 9  // gzip.BestCompression
+
+	defaultAsyncWriteEnabled    = true
+	defaultWriteQueueSize       = 4096
+	defaultWriteBatchSize       = 100
+	defaultWriteFlushIntervalMs = 1000
+	defaultCapturePauseDiskPath = "/"
+	minWriteQueueSize           = 1
+	maxWriteQueueSize           = 100000
+	minWriteBatchSize           = 1
+	maxWriteBatchSize           = 5000
+	minWriteFlushIntervalMs     = 50
+	maxWriteFlushIntervalMs     = 30000
+	minCapturePauseDiskUsedGB   = 0
+	maxCapturePauseDiskUsedGB   = 1048576
 )
 
 type S3Setting struct {
@@ -65,24 +89,37 @@ type S3Setting struct {
 	RotationMaxObjects int `json:"rotation_max_objects"`
 	// UploadConcurrency is the max number of shard objects uploaded to S3 at once.
 	UploadConcurrency int `json:"upload_concurrency"`
+	// DeleteLocalAfterUpload removes local shard artifacts after all selected
+	// shards have been uploaded successfully. Keep this enabled on small disks.
+	DeleteLocalAfterUpload bool `json:"delete_local_after_upload"`
 }
 
 type ConversationLogSetting struct {
-	CaptureEnabled     bool      `json:"capture_enabled"`
-	RetentionDays      int       `json:"retention_days"`
-	MaxStorageGB       int       `json:"max_storage_gb"`
-	LocalExportEnabled bool      `json:"local_export_enabled"`
-	ExportDirectory    string    `json:"export_directory"`
-	DefaultExportMode  string    `json:"default_export_mode"`
-	S3                 S3Setting `json:"s3"`
+	CaptureEnabled         bool      `json:"capture_enabled"`
+	RetentionDays          int       `json:"retention_days"`
+	MaxStorageGB           int       `json:"max_storage_gb"`
+	CapturePauseDiskUsedGB int       `json:"capture_pause_disk_used_gb"`
+	CapturePauseDiskPath   string    `json:"capture_pause_disk_path"`
+	LocalExportEnabled     bool      `json:"local_export_enabled"`
+	ExportDirectory        string    `json:"export_directory"`
+	DefaultExportMode      string    `json:"default_export_mode"`
+	S3                     S3Setting `json:"s3"`
 
-	DefaultShardTargetBytes int64 `json:"default_shard_target_bytes"`
-	DefaultShardMaxBytes    int64 `json:"default_shard_max_bytes"`
-	ExportJobConcurrency    int   `json:"export_job_concurrency"`
-	ExportJobRetentionDays  int   `json:"export_job_retention_days"`
-	ExportScanBatchSize     int   `json:"export_scan_batch_size"`
-	ExportMarkBatchSize     int   `json:"export_mark_batch_size"`
-	ExportDeleteBatchSize   int   `json:"export_delete_batch_size"`
+	DefaultShardTargetBytes    int64 `json:"default_shard_target_bytes"`
+	DefaultShardMaxBytes       int64 `json:"default_shard_max_bytes"`
+	ExportJobConcurrency       int   `json:"export_job_concurrency"`
+	ExportJobRetentionDays     int   `json:"export_job_retention_days"`
+	ExportScanBatchSize        int   `json:"export_scan_batch_size"`
+	ExportMarkBatchSize        int   `json:"export_mark_batch_size"`
+	ExportDeleteBatchSize      int   `json:"export_delete_batch_size"`
+	ExportCompressionWorkers   int   `json:"export_compression_workers"`
+	ExportCompressionQueueSize int   `json:"export_compression_queue_size"`
+	ExportCompressionLevel     int   `json:"export_compression_level"`
+
+	AsyncWriteEnabled    bool `json:"async_write_enabled"`
+	WriteQueueSize       int  `json:"write_queue_size"`
+	WriteBatchSize       int  `json:"write_batch_size"`
+	WriteFlushIntervalMs int  `json:"write_flush_interval_ms"`
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
@@ -98,19 +135,28 @@ type ConversationLogSetting struct {
 }
 
 var conversationLogSetting = ConversationLogSetting{
-	CaptureEnabled:          true,
-	RetentionDays:           30,
-	MaxStorageGB:            50,
-	LocalExportEnabled:      true,
-	ExportDirectory:         filepath.Join("data", "conversation_exports"),
-	DefaultExportMode:       ExportModeAPIHijackJSONL,
-	DefaultShardTargetBytes: defaultShardTargetBytes,
-	DefaultShardMaxBytes:    defaultShardMaxBytes,
-	ExportJobConcurrency:    1,
-	ExportJobRetentionDays:  14,
-	ExportScanBatchSize:     defaultExportScanBatchSize,
-	ExportMarkBatchSize:     defaultExportMarkBatchSize,
-	ExportDeleteBatchSize:   defaultExportDeleteBatchSize,
+	CaptureEnabled:             true,
+	RetentionDays:              30,
+	MaxStorageGB:               50,
+	CapturePauseDiskUsedGB:     0,
+	CapturePauseDiskPath:       defaultCapturePauseDiskPath,
+	LocalExportEnabled:         true,
+	ExportDirectory:            filepath.Join("data", "conversation_exports"),
+	DefaultExportMode:          ExportModeAPIHijackJSONL,
+	DefaultShardTargetBytes:    defaultShardTargetBytes,
+	DefaultShardMaxBytes:       defaultShardMaxBytes,
+	ExportJobConcurrency:       1,
+	ExportJobRetentionDays:     14,
+	ExportScanBatchSize:        defaultExportScanBatchSize,
+	ExportMarkBatchSize:        defaultExportMarkBatchSize,
+	ExportDeleteBatchSize:      defaultExportDeleteBatchSize,
+	ExportCompressionWorkers:   defaultExportCompressionWorkers,
+	ExportCompressionQueueSize: defaultExportCompressionQueueSize,
+	ExportCompressionLevel:     defaultExportCompressionLevel,
+	AsyncWriteEnabled:          defaultAsyncWriteEnabled,
+	WriteQueueSize:             defaultWriteQueueSize,
+	WriteBatchSize:             defaultWriteBatchSize,
+	WriteFlushIntervalMs:       defaultWriteFlushIntervalMs,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -119,6 +165,11 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoExportDirectory:            filepath.Join("data", "conversation_exports", "auto"),
 	AutoExportCheckIntervalSeconds: defaultAutoExportCheckInterval,
 	AutoExportDeleteAfter:          true,
+	S3: S3Setting{
+		RotationMaxObjects:     defaultS3RotationMaxObjects,
+		UploadConcurrency:      defaultS3UploadConcurrency,
+		DeleteLocalAfterUpload: true,
+	},
 }
 
 func init() {
@@ -132,6 +183,10 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.MaxStorageGB < 0 {
 		setting.MaxStorageGB = 0
+	}
+	setting.CapturePauseDiskUsedGB = clampCapturePauseDiskUsedGB(setting.CapturePauseDiskUsedGB)
+	if strings.TrimSpace(setting.CapturePauseDiskPath) == "" {
+		setting.CapturePauseDiskPath = defaultCapturePauseDiskPath
 	}
 	if setting.ExportDirectory == "" {
 		setting.ExportDirectory = filepath.Join("data", "conversation_exports")
@@ -150,6 +205,12 @@ func GetSetting() ConversationLogSetting {
 	setting.ExportScanBatchSize = clampExportBatchSize(setting.ExportScanBatchSize, defaultExportScanBatchSize)
 	setting.ExportMarkBatchSize = clampExportBatchSize(setting.ExportMarkBatchSize, defaultExportMarkBatchSize)
 	setting.ExportDeleteBatchSize = clampExportBatchSize(setting.ExportDeleteBatchSize, defaultExportDeleteBatchSize)
+	setting.ExportCompressionWorkers = clampExportCompressionWorkers(setting.ExportCompressionWorkers)
+	setting.ExportCompressionQueueSize = clampExportCompressionQueueSize(setting.ExportCompressionQueueSize)
+	setting.ExportCompressionLevel = clampExportCompressionLevel(setting.ExportCompressionLevel)
+	setting.WriteQueueSize = clampWriteQueueSize(setting.WriteQueueSize)
+	setting.WriteBatchSize = clampWriteBatchSize(setting.WriteBatchSize)
+	setting.WriteFlushIntervalMs = clampWriteFlushIntervalMs(setting.WriteFlushIntervalMs)
 
 	if setting.AutoExportThresholdBytes <= 0 {
 		setting.AutoExportThresholdBytes = defaultAutoExportThresholdBytes
@@ -204,6 +265,83 @@ func clampExportBatchSize(value, fallback int) int {
 
 func ExportBatchSizeBounds() (min, max int) {
 	return minExportBatchSize, maxExportBatchSize
+}
+
+func clampExportCompressionWorkers(value int) int {
+	if value < minExportCompressionWorkers || value > maxExportCompressionWorkers {
+		return defaultExportCompressionWorkers
+	}
+	return value
+}
+
+func ExportCompressionWorkersBounds() (min, max int) {
+	return minExportCompressionWorkers, maxExportCompressionWorkers
+}
+
+func clampExportCompressionQueueSize(value int) int {
+	if value < minExportCompressionQueueSize || value > maxExportCompressionQueueSize {
+		return defaultExportCompressionQueueSize
+	}
+	return value
+}
+
+func ExportCompressionQueueSizeBounds() (min, max int) {
+	return minExportCompressionQueueSize, maxExportCompressionQueueSize
+}
+
+func clampExportCompressionLevel(value int) int {
+	if value < minExportCompressionLevel || value > maxExportCompressionLevel {
+		return defaultExportCompressionLevel
+	}
+	return value
+}
+
+func ExportCompressionLevelBounds() (min, max int) {
+	return minExportCompressionLevel, maxExportCompressionLevel
+}
+
+func clampWriteQueueSize(value int) int {
+	if value < minWriteQueueSize || value > maxWriteQueueSize {
+		return defaultWriteQueueSize
+	}
+	return value
+}
+
+func WriteQueueSizeBounds() (min, max int) {
+	return minWriteQueueSize, maxWriteQueueSize
+}
+
+func clampWriteBatchSize(value int) int {
+	if value < minWriteBatchSize || value > maxWriteBatchSize {
+		return defaultWriteBatchSize
+	}
+	return value
+}
+
+func WriteBatchSizeBounds() (min, max int) {
+	return minWriteBatchSize, maxWriteBatchSize
+}
+
+func clampWriteFlushIntervalMs(value int) int {
+	if value < minWriteFlushIntervalMs || value > maxWriteFlushIntervalMs {
+		return defaultWriteFlushIntervalMs
+	}
+	return value
+}
+
+func WriteFlushIntervalMsBounds() (min, max int) {
+	return minWriteFlushIntervalMs, maxWriteFlushIntervalMs
+}
+
+func clampCapturePauseDiskUsedGB(value int) int {
+	if value < minCapturePauseDiskUsedGB || value > maxCapturePauseDiskUsedGB {
+		return minCapturePauseDiskUsedGB
+	}
+	return value
+}
+
+func CapturePauseDiskUsedGBBounds() (min, max int) {
+	return minCapturePauseDiskUsedGB, maxCapturePauseDiskUsedGB
 }
 
 // RotationBaseFromPrefix derives the rotation base directory from the S3 object

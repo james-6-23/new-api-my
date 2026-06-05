@@ -45,6 +45,18 @@ func exportDeleteBatchSize() int {
 	return capSQLiteBatchSize(conversation_log_setting.GetSetting().ExportDeleteBatchSize)
 }
 
+func exportCompressionWorkers() int {
+	return conversation_log_setting.GetSetting().ExportCompressionWorkers
+}
+
+func exportCompressionQueueSize() int {
+	return conversation_log_setting.GetSetting().ExportCompressionQueueSize
+}
+
+func exportCompressionLevel() int {
+	return conversation_log_setting.GetSetting().ExportCompressionLevel
+}
+
 func capSQLiteBatchSize(size int) int {
 	if conversationLogDatabaseType() == common.DatabaseTypeSQLite && size > 900 {
 		return 900

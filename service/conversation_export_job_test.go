@@ -43,9 +43,87 @@ func TestStreamShardJSONLGzWritesRawJSONL(t *testing.T) {
 	require.NoError(t, streamShardJSONLGz(gzPath, []shardDataFilePayload{{
 		ShardDataFile: dataFile,
 		SourcePath:    jsonlPath,
-	}}))
+	}}, gzip.BestSpeed))
 
 	require.Equal(t, data, readGzipBytes(t, gzPath))
+}
+
+func TestExportJobLocalExportDefaultsToCleanupAfterS3Upload(t *testing.T) {
+	settings := conversation_log_setting.ConversationLogSetting{
+		LocalExportEnabled: true,
+		S3: conversation_log_setting.S3Setting{
+			DeleteLocalAfterUpload: true,
+		},
+	}
+
+	require.False(t, exportJobLocalExportEnabled(ExportJobCreateRequest{S3Upload: true}, settings))
+
+	keepLocal := true
+	require.True(t, exportJobLocalExportEnabled(ExportJobCreateRequest{
+		S3Upload:           true,
+		LocalExportEnabled: &keepLocal,
+	}, settings))
+
+	settings.S3.DeleteLocalAfterUpload = false
+	require.True(t, exportJobLocalExportEnabled(ExportJobCreateRequest{S3Upload: true}, settings))
+
+	settings.LocalExportEnabled = false
+	require.False(t, exportJobLocalExportEnabled(ExportJobCreateRequest{
+		S3Upload:           true,
+		LocalExportEnabled: &keepLocal,
+	}, settings))
+}
+
+func TestAutoExportLocalExportDisabledAfterS3Upload(t *testing.T) {
+	settings := conversation_log_setting.ConversationLogSetting{
+		LocalExportEnabled: true,
+		S3: conversation_log_setting.S3Setting{
+			Enabled:                true,
+			DeleteLocalAfterUpload: true,
+		},
+	}
+	require.False(t, autoExportLocalExportEnabled(settings))
+
+	settings.S3.DeleteLocalAfterUpload = false
+	require.True(t, autoExportLocalExportEnabled(settings))
+
+	settings.LocalExportEnabled = false
+	require.False(t, autoExportLocalExportEnabled(settings))
+}
+
+func TestFlushConversationLogBatchPersistsRows(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+
+	flushConversationLogBatch([]*model.ConversationLog{
+		{
+			CreatedAt:        100,
+			RequestId:        "req-1",
+			SessionId:        "sess-1",
+			Provider:         "openai",
+			RequestBody:      `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+			ResponseBody:     `{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"total_tokens":1}}`,
+			RequestTime:      1000,
+			ResponseTime:     1100,
+			ValidationStatus: ConversationValidationValid,
+		},
+		{
+			CreatedAt:        101,
+			RequestId:        "req-2",
+			SessionId:        "sess-2",
+			Provider:         "openai",
+			RequestBody:      `{"model":"gpt-5","messages":[{"role":"user","content":"bye"}]}`,
+			ResponseBody:     `{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"total_tokens":1}}`,
+			RequestTime:      1200,
+			ResponseTime:     1300,
+			ValidationStatus: ConversationValidationValid,
+		},
+	})
+
+	var logs []*model.ConversationLog
+	require.NoError(t, model.LOG_DB.Order("id asc").Find(&logs).Error)
+	require.Len(t, logs, 2)
+	require.Equal(t, "req-1", logs[0].RequestId)
+	require.Contains(t, logs[1].ResponseBody, "done")
 }
 
 func TestShardWriterStateWritesSingleJSONLGz(t *testing.T) {

@@ -131,17 +131,26 @@ func DeleteConversationLogs(c *gin.Context) {
 
 func UpdateConversationLogSettings(c *gin.Context) {
 	var req struct {
-		CaptureEnabled     *bool                               `json:"capture_enabled"`
-		RetentionDays      *int                                `json:"retention_days"`
-		MaxStorageGB       *int                                `json:"max_storage_gb"`
-		LocalExportEnabled *bool                               `json:"local_export_enabled"`
-		ExportDirectory    *string                             `json:"export_directory"`
-		DefaultExportMode  *string                             `json:"default_export_mode"`
-		S3                 *conversation_log_setting.S3Setting `json:"s3"`
+		CaptureEnabled         *bool                               `json:"capture_enabled"`
+		RetentionDays          *int                                `json:"retention_days"`
+		MaxStorageGB           *int                                `json:"max_storage_gb"`
+		CapturePauseDiskUsedGB *int                                `json:"capture_pause_disk_used_gb"`
+		CapturePauseDiskPath   *string                             `json:"capture_pause_disk_path"`
+		LocalExportEnabled     *bool                               `json:"local_export_enabled"`
+		ExportDirectory        *string                             `json:"export_directory"`
+		DefaultExportMode      *string                             `json:"default_export_mode"`
+		S3                     *conversation_log_setting.S3Setting `json:"s3"`
 
-		ExportScanBatchSize   *int `json:"export_scan_batch_size"`
-		ExportMarkBatchSize   *int `json:"export_mark_batch_size"`
-		ExportDeleteBatchSize *int `json:"export_delete_batch_size"`
+		ExportScanBatchSize        *int  `json:"export_scan_batch_size"`
+		ExportMarkBatchSize        *int  `json:"export_mark_batch_size"`
+		ExportDeleteBatchSize      *int  `json:"export_delete_batch_size"`
+		ExportCompressionWorkers   *int  `json:"export_compression_workers"`
+		ExportCompressionQueueSize *int  `json:"export_compression_queue_size"`
+		ExportCompressionLevel     *int  `json:"export_compression_level"`
+		AsyncWriteEnabled          *bool `json:"async_write_enabled"`
+		WriteQueueSize             *int  `json:"write_queue_size"`
+		WriteBatchSize             *int  `json:"write_batch_size"`
+		WriteFlushIntervalMs       *int  `json:"write_flush_interval_ms"`
 
 		AutoExportEnabled              *bool   `json:"auto_export_enabled"`
 		AutoExportThresholdBytes       *int64  `json:"auto_export_threshold_bytes"`
@@ -177,6 +186,19 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 		if err := model.UpdateOption("conversation_log_setting.max_storage_gb", strconv.Itoa(*req.MaxStorageGB)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.CapturePauseDiskUsedGB != nil {
+		min, max := conversation_log_setting.CapturePauseDiskUsedGBBounds()
+		if err := updateConversationLogIntSetting("capture_pause_disk_used_gb", *req.CapturePauseDiskUsedGB, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.CapturePauseDiskPath != nil {
+		if err := model.UpdateOption("conversation_log_setting.capture_pause_disk_path", strings.TrimSpace(*req.CapturePauseDiskPath)); err != nil {
 			common.ApiError(c, err)
 			return
 		}
@@ -246,6 +268,54 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 	}
+	if req.ExportCompressionWorkers != nil {
+		min, max := conversation_log_setting.ExportCompressionWorkersBounds()
+		if err := updateConversationLogIntSetting("export_compression_workers", *req.ExportCompressionWorkers, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.ExportCompressionQueueSize != nil {
+		min, max := conversation_log_setting.ExportCompressionQueueSizeBounds()
+		if err := updateConversationLogIntSetting("export_compression_queue_size", *req.ExportCompressionQueueSize, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.ExportCompressionLevel != nil {
+		min, max := conversation_log_setting.ExportCompressionLevelBounds()
+		if err := updateConversationLogIntSetting("export_compression_level", *req.ExportCompressionLevel, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.AsyncWriteEnabled != nil {
+		if err := model.UpdateOption("conversation_log_setting.async_write_enabled", strconv.FormatBool(*req.AsyncWriteEnabled)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.WriteQueueSize != nil {
+		min, max := conversation_log_setting.WriteQueueSizeBounds()
+		if err := updateConversationLogIntSetting("write_queue_size", *req.WriteQueueSize, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.WriteBatchSize != nil {
+		min, max := conversation_log_setting.WriteBatchSizeBounds()
+		if err := updateConversationLogIntSetting("write_batch_size", *req.WriteBatchSize, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
+	if req.WriteFlushIntervalMs != nil {
+		min, max := conversation_log_setting.WriteFlushIntervalMsBounds()
+		if err := updateConversationLogIntSetting("write_flush_interval_ms", *req.WriteFlushIntervalMs, min, max); err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+	}
 	if req.AutoExportEnabled != nil {
 		if err := model.UpdateOption("conversation_log_setting.auto_export_enabled", strconv.FormatBool(*req.AutoExportEnabled)); err != nil {
 			common.ApiError(c, err)
@@ -307,8 +377,12 @@ func UpdateConversationLogSettings(c *gin.Context) {
 
 func updateConversationExportBatchSize(key string, value int) error {
 	minBatch, maxBatch := conversation_log_setting.ExportBatchSizeBounds()
-	if value < minBatch || value > maxBatch {
-		return fmt.Errorf("%s must be in [%d, %d]", key, minBatch, maxBatch)
+	return updateConversationLogIntSetting(key, value, minBatch, maxBatch)
+}
+
+func updateConversationLogIntSetting(key string, value int, minValue int, maxValue int) error {
+	if value < minValue || value > maxValue {
+		return fmt.Errorf("%s must be in [%d, %d]", key, minValue, maxValue)
 	}
 	return model.UpdateOption("conversation_log_setting."+key, strconv.Itoa(value))
 }

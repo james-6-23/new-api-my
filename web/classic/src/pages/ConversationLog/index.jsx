@@ -73,6 +73,8 @@ const defaultSettings = {
   capture_enabled: true,
   retention_days: 30,
   max_storage_gb: 50,
+  capture_pause_disk_used_gb: 0,
+  capture_pause_disk_path: '/',
   local_export_enabled: true,
   export_directory: 'data/conversation_exports',
   default_export_mode: 'api_hijack_jsonl',
@@ -87,6 +89,7 @@ const defaultSettings = {
     rotation_enabled: false,
     rotation_max_objects: 200,
     upload_concurrency: 4,
+    delete_local_after_upload: true,
   },
   auto_export_enabled: false,
   auto_export_threshold_bytes: 10 * 1024 * 1024 * 1024,
@@ -98,6 +101,13 @@ const defaultSettings = {
   export_scan_batch_size: 5000,
   export_mark_batch_size: 2000,
   export_delete_batch_size: 2000,
+  export_compression_workers: 4,
+  export_compression_queue_size: 4,
+  export_compression_level: 1,
+  async_write_enabled: true,
+  write_queue_size: 4096,
+  write_batch_size: 100,
+  write_flush_interval_ms: 1000,
 };
 
 const formInitValues = {
@@ -291,6 +301,7 @@ const ConversationLog = () => {
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [tableLoading, setTableLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [captureSaving, setCaptureSaving] = useState(false);
   const [s3Testing, setS3Testing] = useState(false);
   const [s3RotationStatusLoading, setS3RotationStatusLoading] = useState(false);
   const [s3RotationStatus, setS3RotationStatus] = useState(null);
@@ -543,6 +554,45 @@ const ConversationLog = () => {
       showError(error.message || t('保存失败，请重试'));
     } finally {
       setSettingsSaving(false);
+    }
+  };
+
+  const setCaptureEnabledFormValue = (value) => {
+    settingsFormRef.current?.setValues({
+      ...(settingsFormRef.current?.getValues?.() || {}),
+      capture_enabled: value,
+    });
+  };
+
+  const updateCaptureEnabled = async (value) => {
+    const previousValue = settings.capture_enabled;
+    setCaptureSaving(true);
+    setSettings((prev) => ({ ...prev, capture_enabled: value }));
+    setCaptureEnabledFormValue(value);
+    try {
+      const res = await API.put('/api/conversation_logs/settings', {
+        capture_enabled: value,
+      });
+      const { success, message, data } = res.data;
+      if (!success) {
+        showError(message);
+        setSettings((prev) => ({ ...prev, capture_enabled: previousValue }));
+        setCaptureEnabledFormValue(previousValue);
+        return;
+      }
+      const savedValue =
+        typeof data?.capture_enabled === 'boolean'
+          ? data.capture_enabled
+          : value;
+      setSettings((prev) => ({ ...prev, capture_enabled: savedValue }));
+      setCaptureEnabledFormValue(savedValue);
+      showSuccess(t('保存成功'));
+    } catch (error) {
+      showError(error.message || t('保存失败，请重试'));
+      setSettings((prev) => ({ ...prev, capture_enabled: previousValue }));
+      setCaptureEnabledFormValue(previousValue);
+    } finally {
+      setCaptureSaving(false);
     }
   };
 
@@ -1510,9 +1560,11 @@ const ConversationLog = () => {
                         label={t('启用会话日志采集')}
                         checkedText={t('开')}
                         uncheckedText={t('关')}
-                        onChange={(value) =>
-                          setSettings({ ...settings, capture_enabled: value })
-                        }
+                        disabled={captureSaving}
+                        extraText={t(
+                          '切换后立即保存；已开始的请求结束前也会再次检查开关',
+                        )}
+                        onChange={updateCaptureEnabled}
                       />
                     </Col>
                     <Col xs={24} sm={12} lg={8}>
@@ -1541,6 +1593,42 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             max_storage_gb: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='capture_pause_disk_used_gb'
+                        label={t('磁盘采集暂停阈值')}
+                        min={0}
+                        max={1048576}
+                        step={1}
+                        suffix='GB'
+                        extraText={t(
+                          '检测路径所在磁盘已用空间超过该值时暂停采集，0 表示关闭',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            capture_pause_disk_used_gb: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Input
+                        field='capture_pause_disk_path'
+                        label={t('磁盘采集检测路径')}
+                        extraText={t(
+                          '只暂停新会话采集，导出和 S3 上传继续执行',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            capture_pause_disk_path: value,
                           })
                         }
                       />
@@ -1708,6 +1796,132 @@ const ConversationLog = () => {
                               value,
                               batchSizeBounds,
                             ),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='export_compression_workers'
+                        label={t('压缩 worker 数')}
+                        min={1}
+                        max={32}
+                        step={1}
+                        precision={0}
+                        extraText={t('同时压缩 gzip 分片的后台 worker 数')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            export_compression_workers: Number(value || 4),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='export_compression_queue_size'
+                        label={t('压缩队列大小')}
+                        min={0}
+                        max={64}
+                        step={1}
+                        precision={0}
+                        extraText={t('等待压缩的 gzip 分片队列长度')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            export_compression_queue_size: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='export_compression_level'
+                        label={t('gzip 压缩级别')}
+                        min={-2}
+                        max={9}
+                        step={1}
+                        precision={0}
+                        extraText={t('1 为最快，-1 为默认，9 为最高压缩率')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            export_compression_level: Number(value ?? 1),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='async_write_enabled'
+                        label={t('异步批量写入')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t('请求结束后先入队，再后台批量写入数据库')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            async_write_enabled: value,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='write_queue_size'
+                        label={t('写入队列大小')}
+                        min={1}
+                        max={100000}
+                        step={100}
+                        precision={0}
+                        disabled={settings.async_write_enabled === false}
+                        extraText={t('队列满时自动回退为同步写入')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            write_queue_size: Number(value || 4096),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='write_batch_size'
+                        label={t('写入批量大小')}
+                        min={1}
+                        max={5000}
+                        step={10}
+                        precision={0}
+                        disabled={settings.async_write_enabled === false}
+                        extraText={t('后台单次批量插入的日志数量')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            write_batch_size: Number(value || 100),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='write_flush_interval_ms'
+                        label={t('写入刷新间隔 (ms)')}
+                        min={50}
+                        max={30000}
+                        step={50}
+                        precision={0}
+                        disabled={settings.async_write_enabled === false}
+                        extraText={t('未达到批量大小时的最长等待时间')}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            write_flush_interval_ms: Number(value || 1000),
                           })
                         }
                       />
@@ -1937,6 +2151,21 @@ const ConversationLog = () => {
                         disabled={!settings.s3?.enabled}
                         onChange={(value) =>
                           updateS3('upload_concurrency', value)
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='s3.delete_local_after_upload'
+                        label={t('上传后删除本地文件')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          'S3 上传成功后删除服务器本地导出分片，及时释放磁盘空间',
+                        )}
+                        disabled={!settings.s3?.enabled}
+                        onChange={(value) =>
+                          updateS3('delete_local_after_upload', value)
                         }
                       />
                     </Col>

@@ -335,6 +335,22 @@ func CreateConversationLog(log *ConversationLog) error {
 	return err
 }
 
+func CreateConversationLogs(logs []*ConversationLog, batchSize int) error {
+	if len(logs) == 0 {
+		return nil
+	}
+	if batchSize <= 0 {
+		batchSize = len(logs)
+	}
+	err := LOG_DB.Transaction(func(tx *gorm.DB) error {
+		return tx.CreateInBatches(logs, batchSize).Error
+	})
+	if err == nil {
+		invalidateConversationLogStatsCacheThrottled(conversationLogCreateInvalidationInterval)
+	}
+	return err
+}
+
 func GetConversationLogByID(id int) (*ConversationLog, error) {
 	var log ConversationLog
 	if err := LOG_DB.First(&log, id).Error; err != nil {

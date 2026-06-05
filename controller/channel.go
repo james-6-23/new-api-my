@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/ollama"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -67,6 +68,23 @@ func clearChannelInfo(channel *model.Channel) {
 		channel.ChannelInfo.MultiKeyDisabledReason = nil
 		channel.ChannelInfo.MultiKeyDisabledTime = nil
 	}
+}
+
+func normalizeChannelConversationLogSetting(c *gin.Context, channel *model.Channel, originChannel *model.Channel) {
+	if channel == nil {
+		return
+	}
+	otherSettings := channel.GetOtherSettings()
+	if c == nil || c.GetInt("role") < common.RoleRootUser {
+		otherSettings.ConversationLogEnabled = false
+		if originChannel != nil {
+			otherSettings.ConversationLogEnabled = originChannel.GetOtherSettings().ConversationLogEnabled
+		}
+	}
+	if !conversation_log_setting.GetSetting().CaptureEnabled {
+		otherSettings.ConversationLogEnabled = false
+	}
+	channel.SetOtherSettings(otherSettings)
 }
 
 func applyChannelStatusFilter(query *gorm.DB, statusFilter int) *gorm.DB {
@@ -600,11 +618,7 @@ func AddChannel(c *gin.Context) {
 		})
 		return
 	}
-	if c.GetInt("role") < common.RoleRootUser {
-		otherSettings := addChannelRequest.Channel.GetOtherSettings()
-		otherSettings.ConversationLogEnabled = false
-		addChannelRequest.Channel.SetOtherSettings(otherSettings)
-	}
+	normalizeChannelConversationLogSetting(c, addChannelRequest.Channel, nil)
 
 	addChannelRequest.Channel.CreatedTime = common.GetTimestamp()
 	keys := make([]string, 0)
@@ -893,12 +907,7 @@ func UpdateChannel(c *gin.Context) {
 
 	// Always copy the original ChannelInfo so that fields like IsMultiKey and MultiKeySize are retained.
 	channel.ChannelInfo = originChannel.ChannelInfo
-	if c.GetInt("role") < common.RoleRootUser {
-		otherSettings := channel.GetOtherSettings()
-		originOtherSettings := originChannel.GetOtherSettings()
-		otherSettings.ConversationLogEnabled = originOtherSettings.ConversationLogEnabled
-		channel.SetOtherSettings(otherSettings)
-	}
+	normalizeChannelConversationLogSetting(c, &channel.Channel, originChannel)
 
 	// If the request explicitly specifies a new MultiKeyMode, apply it on top of the original info.
 	if channel.MultiKeyMode != nil && *channel.MultiKeyMode != "" {

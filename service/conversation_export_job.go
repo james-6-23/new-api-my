@@ -27,9 +27,6 @@ import (
 )
 
 const (
-	conversationExportCompressionWorkers   = 2
-	conversationExportCompressionQueueSize = 2
-
 	sessionBucketCount   = 4096
 	sessionBucketMaxOpen = 128
 
@@ -506,6 +503,8 @@ func exportJobLocalExportEnabled(req ExportJobCreateRequest, settings conversati
 	localExportEnabled := settings.LocalExportEnabled
 	if req.LocalExportEnabled != nil {
 		localExportEnabled = *req.LocalExportEnabled
+	} else if req.S3Upload && settings.S3.DeleteLocalAfterUpload {
+		localExportEnabled = false
 	}
 	if !settings.LocalExportEnabled {
 		localExportEnabled = false
@@ -950,6 +949,7 @@ type shardCompressionJob struct {
 	DataPayloads []shardDataFilePayload
 	IDsPath      string
 	IDCount      int64
+	GzipLevel    int
 	Shard        TopManifestShard
 }
 
@@ -1126,7 +1126,7 @@ func compressShardJob(ctx context.Context, job shardCompressionJob) (shardCompre
 			return shardCompressionResult{}, err
 		}
 	}
-	if err := streamShardJSONLGz(job.TmpPath, job.DataPayloads); err != nil {
+	if err := streamShardJSONLGz(job.TmpPath, job.DataPayloads, job.GzipLevel); err != nil {
 		return shardCompressionResult{}, err
 	}
 	compressedInfo, err := os.Stat(job.TmpPath)
@@ -1401,6 +1401,7 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 		DataPayloads: dataPayloads,
 		IDsPath:      idsPath,
 		IDCount:      s.currentIDCount,
+		GzipLevel:    exportCompressionLevel(),
 		Shard: TopManifestShard{
 			Index:             s.currentIndex,
 			File:              filepath.Base(outputPath),
@@ -1450,7 +1451,7 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 
 func (s *shardWriterState) ensureCompressor(ctx context.Context) *shardCompressorPool {
 	if s.compressor == nil {
-		s.compressor = newShardCompressorPool(ctx, conversationExportCompressionWorkers, conversationExportCompressionQueueSize)
+		s.compressor = newShardCompressorPool(ctx, exportCompressionWorkers(), exportCompressionQueueSize())
 		if s.s3Uploader != nil {
 			s.compressor.onResult = func(result shardCompressionResult) error {
 				return s.handleShardCompressionResult(ctx, result, true)
@@ -1826,14 +1827,17 @@ func buildShardPathManifest(shardName string, dataFiles []ShardDataFile) ShardPa
 
 // streamShardJSONLGz writes a gzip-compressed JSONL payload. Source JSONL files
 // are streamed directly so large shards are never held in memory.
-func streamShardJSONLGz(gzPath string, dataFiles []shardDataFilePayload) error {
+func streamShardJSONLGz(gzPath string, dataFiles []shardDataFilePayload, gzipLevel int) error {
 	out, err := os.Create(gzPath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	gz := gzip.NewWriter(out)
+	gz, err := gzip.NewWriterLevel(out, gzipLevel)
+	if err != nil {
+		return err
+	}
 	defer gz.Close()
 
 	buf := make([]byte, 1<<20) // 1 MiB copy buffer

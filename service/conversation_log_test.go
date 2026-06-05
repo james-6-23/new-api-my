@@ -3,17 +3,38 @@ package service
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/stretchr/testify/require"
 )
+
+func updateConversationLogTestSettings(t *testing.T, values map[string]string) {
+	t.Helper()
+	cfg := config.GlobalConfig.Get("conversation_log_setting")
+	require.NotNil(t, cfg)
+	require.NoError(t, config.UpdateConfigFromMap(cfg, values))
+}
+
+func restoreConversationLogTestSettings(t *testing.T) {
+	t.Helper()
+	previous := conversation_log_setting.GetSetting()
+	t.Cleanup(func() {
+		updateConversationLogTestSettings(t, map[string]string{
+			"capture_enabled":     strconv.FormatBool(previous.CaptureEnabled),
+			"async_write_enabled": strconv.FormatBool(previous.AsyncWriteEnabled),
+		})
+	})
+}
 
 func TestStrictAPIRecordContainsOnlyPDFFields(t *testing.T) {
 	record := StrictAPIRecord{
@@ -51,6 +72,31 @@ func TestValidateAPIRecordRejectsRawSSE(t *testing.T) {
 	validation := ValidateAPIRecord(log)
 	require.False(t, validation.Exportable)
 	require.Contains(t, validation.Reasons, "raw_sse_response")
+}
+
+func TestRecordConversationLogSkipsWhenCaptureDisabled(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	restoreConversationLogTestSettings(t)
+	updateConversationLogTestSettings(t, map[string]string{
+		"capture_enabled":     "false",
+		"async_write_enabled": "false",
+	})
+
+	recordConversationLog(nil, &model.ConversationLog{
+		CreatedAt:        1710000000,
+		RequestId:        "req-disabled",
+		SessionId:        "sess-disabled",
+		Provider:         "openai",
+		RequestBody:      `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+		ResponseBody:     `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		RequestTime:      1710000000000,
+		ResponseTime:     1710000000100,
+		ValidationStatus: ConversationValidationValid,
+	})
+
+	var count int64
+	require.NoError(t, model.LOG_DB.Model(&model.ConversationLog{}).Count(&count).Error)
+	require.Zero(t, count)
 }
 
 func TestValidateAPIRecordRejectsInvalidJSONAndMissingModel(t *testing.T) {

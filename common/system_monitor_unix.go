@@ -14,11 +14,18 @@ func GetDiskSpaceInfo() DiskSpaceInfo {
 	if cachePath == "" {
 		cachePath = os.TempDir()
 	}
+	return GetDiskSpaceInfoForPath(cachePath)
+}
 
+// GetDiskSpaceInfoForPath 获取指定路径所在磁盘的空间信息 (Unix/Linux/macOS)
+func GetDiskSpaceInfoForPath(path string) DiskSpaceInfo {
+	if path == "" {
+		path = os.TempDir()
+	}
 	info := DiskSpaceInfo{}
 
 	var stat unix.Statfs_t
-	err := unix.Statfs(cachePath, &stat)
+	err := unix.Statfs(path, &stat)
 	if err != nil {
 		return info
 	}
