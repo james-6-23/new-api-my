@@ -383,6 +383,34 @@ func StartConversationLogCleanupTask() {
 			<-ticker.C
 		}
 	}()
+	go conversationLogVacuumFullLoop()
+}
+
+// conversationLogVacuumFullLoop periodically reclaims disk space on the
+// conversation log table via VACUUM FULL (PostgreSQL only). It runs on its own
+// low-frequency schedule because the rewrite takes a table lock; this is safe
+// only because conversation logs live in a dedicated database. No-op on
+// non-PostgreSQL or when disabled.
+func conversationLogVacuumFullLoop() {
+	for {
+		setting := conversation_log_setting.GetSetting()
+		interval := time.Duration(setting.AutoVacuumFullIntervalHours) * time.Hour
+		if interval <= 0 {
+			interval = 24 * time.Hour
+		}
+		time.Sleep(interval)
+
+		setting = conversation_log_setting.GetSetting()
+		if !setting.AutoVacuumFullEnabled || !common.ConversationLogStoreConfigured {
+			continue
+		}
+		ran, err := model.VacuumFullConversationLogsIfBloated(setting.AutoVacuumFullMinBloatRatio)
+		if err != nil {
+			common.SysError("conversation log VACUUM FULL failed: " + err.Error())
+		} else if ran {
+			common.SysLog("conversation log VACUUM FULL reclaimed disk space")
+		}
+	}
 }
 
 func cleanupConversationLogs(ctx context.Context) {

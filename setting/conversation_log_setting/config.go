@@ -84,6 +84,15 @@ const (
 	defaultCaptureMaxBytes = int64(16) << 20  // 16 MiB
 	minCaptureMaxBytes     = int64(256) << 10 // 256 KiB
 	maxCaptureMaxBytes     = int64(1) << 30   // 1 GiB
+
+	// Periodic VACUUM FULL (PostgreSQL-only) to reclaim disk after deletes.
+	defaultAutoVacuumFullEnabled       = true
+	defaultAutoVacuumFullMinBloatRatio = 2.0 // dead >= 2x live before rewriting
+	defaultAutoVacuumFullIntervalHours = 24
+	minAutoVacuumFullMinBloatRatio     = 0.5
+	maxAutoVacuumFullMinBloatRatio     = 100.0
+	minAutoVacuumFullIntervalHours     = 1
+	maxAutoVacuumFullIntervalHours     = 720 // 30 days
 )
 
 type S3Setting struct {
@@ -167,6 +176,18 @@ type ConversationLogSetting struct {
 	// regardless of export status.
 	RetentionDeleteUnexported bool `json:"retention_delete_unexported"`
 
+	// AutoVacuumFullEnabled enables a periodic VACUUM FULL on the conversation
+	// log table (PostgreSQL only) to physically reclaim disk space after
+	// deletes. Safe to run because logs live in a dedicated database isolated
+	// from the primary DB. No-op on SQLite/MySQL.
+	AutoVacuumFullEnabled bool `json:"auto_vacuum_full_enabled"`
+	// AutoVacuumFullMinBloatRatio is the dead/live tuple ratio above which the
+	// periodic VACUUM FULL actually runs; below it the (table-locking) rewrite
+	// is skipped as not worth the cost.
+	AutoVacuumFullMinBloatRatio float64 `json:"auto_vacuum_full_min_bloat_ratio"`
+	// AutoVacuumFullIntervalHours is how often the bloat check runs.
+	AutoVacuumFullIntervalHours int `json:"auto_vacuum_full_interval_hours"`
+
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
 	// packs them into gzip JSONL shards capped at AutoExportShardMaxBytes, then (if
@@ -207,6 +228,10 @@ var conversationLogSetting = ConversationLogSetting{
 	WriteBatchMaxBytes:         defaultWriteBatchBytes,
 	WriteFlushIntervalMs:       defaultWriteFlushIntervalMs,
 	CaptureMaxBytesPerRequest:  defaultCaptureMaxBytes,
+
+	AutoVacuumFullEnabled:       defaultAutoVacuumFullEnabled,
+	AutoVacuumFullMinBloatRatio: defaultAutoVacuumFullMinBloatRatio,
+	AutoVacuumFullIntervalHours: defaultAutoVacuumFullIntervalHours,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -265,6 +290,13 @@ func GetSetting() ConversationLogSetting {
 	setting.WriteBatchMaxBytes = clampWriteMemoryBytes(setting.WriteBatchMaxBytes, defaultWriteBatchBytes)
 	setting.WriteFlushIntervalMs = clampWriteFlushIntervalMs(setting.WriteFlushIntervalMs)
 	setting.CaptureMaxBytesPerRequest = clampCaptureMaxBytes(setting.CaptureMaxBytesPerRequest)
+
+	if setting.AutoVacuumFullMinBloatRatio < minAutoVacuumFullMinBloatRatio || setting.AutoVacuumFullMinBloatRatio > maxAutoVacuumFullMinBloatRatio {
+		setting.AutoVacuumFullMinBloatRatio = defaultAutoVacuumFullMinBloatRatio
+	}
+	if setting.AutoVacuumFullIntervalHours < minAutoVacuumFullIntervalHours || setting.AutoVacuumFullIntervalHours > maxAutoVacuumFullIntervalHours {
+		setting.AutoVacuumFullIntervalHours = defaultAutoVacuumFullIntervalHours
+	}
 
 	if setting.AutoExportThresholdBytes <= 0 {
 		setting.AutoExportThresholdBytes = defaultAutoExportThresholdBytes

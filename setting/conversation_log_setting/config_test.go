@@ -65,6 +65,39 @@ func TestGetSettingDefaultsExportCompressionAndAsyncWrite(t *testing.T) {
 	require.Equal(t, "/", setting.CapturePauseDiskPath)
 }
 
+func TestGetSettingDefaultsAndClampsAutoVacuumFull(t *testing.T) {
+	previous := conversationLogSetting
+	t.Cleanup(func() {
+		conversationLogSetting = previous
+	})
+
+	// Defaults.
+	setting := GetSetting()
+	require.True(t, setting.AutoVacuumFullEnabled)
+	require.Equal(t, 2.0, setting.AutoVacuumFullMinBloatRatio)
+	require.Equal(t, 24, setting.AutoVacuumFullIntervalHours)
+
+	// Out-of-range values fall back to defaults.
+	conversationLogSetting.AutoVacuumFullMinBloatRatio = 0.1
+	conversationLogSetting.AutoVacuumFullIntervalHours = 0
+	setting = GetSetting()
+	require.Equal(t, 2.0, setting.AutoVacuumFullMinBloatRatio)
+	require.Equal(t, 24, setting.AutoVacuumFullIntervalHours)
+
+	conversationLogSetting.AutoVacuumFullMinBloatRatio = 1000
+	conversationLogSetting.AutoVacuumFullIntervalHours = 10000
+	setting = GetSetting()
+	require.Equal(t, 2.0, setting.AutoVacuumFullMinBloatRatio)
+	require.Equal(t, 24, setting.AutoVacuumFullIntervalHours)
+
+	// In-range values are preserved.
+	conversationLogSetting.AutoVacuumFullMinBloatRatio = 5
+	conversationLogSetting.AutoVacuumFullIntervalHours = 6
+	setting = GetSetting()
+	require.Equal(t, 5.0, setting.AutoVacuumFullMinBloatRatio)
+	require.Equal(t, 6, setting.AutoVacuumFullIntervalHours)
+}
+
 func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 	previous := conversationLogSetting
 	t.Cleanup(func() {
