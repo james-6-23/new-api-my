@@ -46,6 +46,13 @@ func conversationLogPartitioningActive() bool {
 	return common.ConversationLogPartitioningEnabled
 }
 
+// ConversationLogPartitioningActive exposes the effective partitioning state to
+// other packages. Callers must use this instead of the raw env flag so MySQL,
+// SQLite, and non-dedicated-log deployments keep the normal row-delete paths.
+func ConversationLogPartitioningActive() bool {
+	return conversationLogPartitioningActive()
+}
+
 // partitionHourStart floors a Unix-second timestamp to its hourly partition
 // boundary.
 func partitionHourStart(ts int64) int64 {
@@ -90,8 +97,18 @@ func ensureConversationLogPartitionedParent(db *gorm.DB) error {
 		return nil
 	}
 	// Create the partitioned parent only when the table does not exist yet, so
-	// we never fight an existing (possibly non-partitioned) table.
-	if !db.Migrator().HasTable("conversation_logs") {
+	// we never fight an existing table. If a normal table already exists, fail
+	// fast: PostgreSQL cannot convert it to a partitioned parent in place, and
+	// silently continuing would make cleanup/export semantics unsafe.
+	if db.Migrator().HasTable("conversation_logs") {
+		isPartitioned, err := conversationLogsTableIsPartitioned(db)
+		if err != nil {
+			return fmt.Errorf("check conversation_logs partitioned parent: %w", err)
+		}
+		if !isPartitioned {
+			return fmt.Errorf("conversation log partitioning is enabled but existing conversation_logs is not a partitioned table; enable CONVERSATION_LOG_PARTITIONING only on a fresh dedicated PostgreSQL log database or migrate the table manually")
+		}
+	} else {
 		// Composite PK (created_at, id); id keeps its own sequence for uniqueness.
 		createSQL := `
 CREATE TABLE conversation_logs (
@@ -110,6 +127,33 @@ CREATE TABLE conversation_logs (
 		return fmt.Errorf("automigrate partitioned conversation_logs: %w", err)
 	}
 	return nil
+}
+
+// conversationLogsTableIsPartitioned reports whether conversation_logs is a
+// PostgreSQL partitioned parent table. The to_regclass form avoids an error if
+// the table name does not resolve, though callers usually check HasTable first.
+func conversationLogsTableIsPartitioned(db *gorm.DB) (bool, error) {
+	var isPartitioned bool
+	err := db.Raw(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_partitioned_table
+			WHERE partrelid = to_regclass('conversation_logs')
+		)
+	`).Scan(&isPartitioned).Error
+	return isPartitioned, err
+}
+
+func ensureConversationLogStartupPartitions(nowTs int64) (int, error) {
+	if !conversationLogPartitioningActive() {
+		return 0, nil
+	}
+	setting := conversation_log_setting.GetSetting()
+	created, err := CreateConversationLogFuturePartitions(nowTs, setting.PartitionAheadHours)
+	if err != nil {
+		return created, fmt.Errorf("pre-create conversation log partitions at startup: %w", err)
+	}
+	return created, nil
 }
 
 // listConversationLogPartitions returns the child partition table names of

@@ -835,7 +835,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	// partitions, not by row DELETE. Records are still marked exported above
 	// (line ~818) so the partition maintenance can detect when a partition is
 	// fully exported; we just skip the per-record DELETE here.
-	if job.DeleteAfterExport && deleteExpected > 0 && !common.ConversationLogPartitioningEnabled {
+	if job.DeleteAfterExport && deleteExpected > 0 && !model.ConversationLogPartitioningActive() {
 		deleteProgressLabel := "deleting processed source records"
 		updateJobDeleteProgress(job.JobId, deleteProgressLabel, 0, deleteExpected)
 		deleted, err := model.DeleteConversationLogsByExportBatchIDWithProgress(ctx, job.JobId, exportDeleteBatchSize(), func(deleted int64) {
@@ -853,7 +853,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	// Skip invalid-record DELETE under partitioning; invalid rows are dropped
 	// with their partition (they never block the drop, see
 	// DropExportedConversationLogPartitions).
-	if job.DeleteAfterExport && strings.TrimSpace(job.Trigger) == "auto" && !common.ConversationLogPartitioningEnabled {
+	if job.DeleteAfterExport && strings.TrimSpace(job.Trigger) == "auto" && !model.ConversationLogPartitioningActive() {
 		updateJobProgress(job.JobId, map[string]interface{}{
 			"progress": "deleting invalid source records",
 		})

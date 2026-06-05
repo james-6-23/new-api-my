@@ -1,6 +1,49 @@
 package model
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+)
+
+func TestConversationLogPartitioningActiveRequiresPostgresDedicatedStoreAndFlag(t *testing.T) {
+	previousLogType := common.LogSqlType
+	previousUsingPostgreSQL := common.UsingPostgreSQL
+	previousStoreConfigured := common.ConversationLogStoreConfigured
+	previousPartitioningEnabled := common.ConversationLogPartitioningEnabled
+	t.Cleanup(func() {
+		common.LogSqlType = previousLogType
+		common.UsingPostgreSQL = previousUsingPostgreSQL
+		common.ConversationLogStoreConfigured = previousStoreConfigured
+		common.ConversationLogPartitioningEnabled = previousPartitioningEnabled
+	})
+
+	common.LogSqlType = common.DatabaseTypePostgreSQL
+	common.UsingPostgreSQL = false
+	common.ConversationLogStoreConfigured = true
+	common.ConversationLogPartitioningEnabled = true
+	if !ConversationLogPartitioningActive() {
+		t.Fatal("expected partitioning active for dedicated PostgreSQL log DB with env flag")
+	}
+
+	common.ConversationLogStoreConfigured = false
+	if ConversationLogPartitioningActive() {
+		t.Fatal("partitioning must not activate without a dedicated log store")
+	}
+
+	common.ConversationLogStoreConfigured = true
+	common.ConversationLogPartitioningEnabled = false
+	if ConversationLogPartitioningActive() {
+		t.Fatal("partitioning must not activate without CONVERSATION_LOG_PARTITIONING")
+	}
+
+	common.ConversationLogPartitioningEnabled = true
+	common.LogSqlType = common.DatabaseTypeSQLite
+	common.UsingPostgreSQL = false
+	if ConversationLogPartitioningActive() {
+		t.Fatal("raw env flag must not skip row-delete paths on non-PostgreSQL log DBs")
+	}
+}
 
 func TestPartitionHourStart(t *testing.T) {
 	cases := []struct {

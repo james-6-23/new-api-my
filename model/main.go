@@ -417,6 +417,9 @@ func migrateLOGDB() error {
 	if err = migrateConversationLogBodyColumns(LOG_DB); err != nil {
 		return err
 	}
+	if _, err = ensureConversationLogStartupPartitions(common.GetTimestamp()); err != nil {
+		return err
+	}
 	return nil
 }
 

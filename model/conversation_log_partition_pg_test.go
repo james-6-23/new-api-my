@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,19 @@ func TestPartitionIntegration(t *testing.T) {
 	// Clean slate.
 	db.Exec("DROP TABLE IF EXISTS conversation_logs CASCADE")
 
+	// Existing normal tables must be rejected. Partitioning is a structural
+	// deployment choice and cannot be safely enabled on top of a pre-existing
+	// non-partitioned conversation_logs table.
+	mustExec(t, db, "CREATE TABLE conversation_logs (id BIGSERIAL PRIMARY KEY, created_at BIGINT NOT NULL)")
+	err = ensureConversationLogPartitionedParent(db)
+	if err == nil {
+		t.Fatal("expected existing non-partitioned conversation_logs table to be rejected")
+	}
+	if !strings.Contains(err.Error(), "not a partitioned table") {
+		t.Fatalf("unexpected non-partitioned table error: %v", err)
+	}
+	db.Exec("DROP TABLE IF EXISTS conversation_logs CASCADE")
+
 	// 1) Create partitioned parent + AutoMigrate fills columns/indexes.
 	if err := ensureConversationLogPartitionedParent(db); err != nil {
 		t.Fatalf("ensureConversationLogPartitionedParent: %v", err)
@@ -69,9 +83,9 @@ func TestPartitionIntegration(t *testing.T) {
 
 	// 2) Pre-create partitions around "now".
 	now := time.Now().Unix()
-	created, err := CreateConversationLogFuturePartitions(now, 6)
+	created, err := ensureConversationLogStartupPartitions(now)
 	if err != nil {
-		t.Fatalf("CreateConversationLogFuturePartitions: %v", err)
+		t.Fatalf("ensureConversationLogStartupPartitions: %v", err)
 	}
 	if created == 0 {
 		t.Fatal("no partitions created")

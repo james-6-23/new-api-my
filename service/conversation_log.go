@@ -393,7 +393,7 @@ func StartConversationLogCleanupTask() {
 // partitions that are older than retention AND fully exported (instant disk
 // reclaim with no bloat). No-op when partitioning is disabled.
 func conversationLogPartitionMaintenanceLoop() {
-	if !common.ConversationLogPartitioningEnabled {
+	if !model.ConversationLogPartitioningActive() {
 		return
 	}
 	// Run more often than the partition width so a future partition always
@@ -407,7 +407,7 @@ func conversationLogPartitionMaintenanceLoop() {
 }
 
 func runConversationLogPartitionMaintenance(ctx context.Context) {
-	if !common.ConversationLogStoreConfigured {
+	if !model.ConversationLogPartitioningActive() {
 		return
 	}
 	setting := conversation_log_setting.GetSetting()
@@ -459,7 +459,7 @@ func cleanupConversationLogs(ctx context.Context) {
 	// fully-exported partitions (conversationLogPartitionMaintenanceLoop), which
 	// is instant and bloat-free. Row-level DELETE cleanup is skipped entirely to
 	// avoid the dead-tuple churn that DROP PARTITION exists to eliminate.
-	if common.ConversationLogPartitioningEnabled {
+	if model.ConversationLogPartitioningActive() {
 		return
 	}
 	if setting.RetentionDays > 0 {
