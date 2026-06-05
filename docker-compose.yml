@@ -87,7 +87,7 @@ services:
   # 因此清理/删除/重建会话日志数据不会影响主程序。
   # 不需要会话日志功能时，删除本服务并移除上面的 LOG_SQL_DSN 即可。
   conversation-log-db:
-    image: postgres:15
+    image: postgres:18-alpine
     container_name: conversation-log-db
     restart: always
     environment:
