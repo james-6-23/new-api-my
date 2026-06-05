@@ -968,19 +968,38 @@ func conversationLogTableBloatRatio() (float64, bool) {
 }
 
 // VacuumFullConversationLogsIfBloated runs VACUUM FULL on conversation_logs when
-// the dead/live tuple ratio exceeds minBloatRatio. This is a PostgreSQL-only
-// maintenance step that physically rewrites the table and returns disk space to
-// the OS (plain VACUUM/DELETE only marks space reusable). It takes an exclusive
-// lock for the duration, which is acceptable here because conversation logs live
-// in a dedicated database (LOG_SQL_DSN) isolated from the primary DB. No-op on
+// the dead/live tuple ratio exceeds minBloatRatio AND the table total size is
+// within maxTableBytes. This is a PostgreSQL-only maintenance step that
+// physically rewrites the table and returns disk space to the OS (plain
+// VACUUM/DELETE only marks space reusable). It takes an exclusive lock for the
+// duration, which is acceptable here because conversation logs live in a
+// dedicated database (LOG_SQL_DSN) isolated from the primary DB.
+//
+// DANGER: VACUUM FULL needs free disk ~= the table's live size. The
+// maxTableBytes guard refuses to run on large tables to avoid filling the disk;
+// high-volume deployments must use partition + DROP PARTITION instead. No-op on
 // SQLite/MySQL. Returns (ran, error).
-func VacuumFullConversationLogsIfBloated(minBloatRatio float64) (bool, error) {
+func VacuumFullConversationLogsIfBloated(minBloatRatio float64, maxTableBytes int64) (bool, error) {
 	if !common.UsingPostgreSQL && common.LogSqlType != common.DatabaseTypePostgreSQL {
 		return false, nil
 	}
 	ratio, ok := conversationLogTableBloatRatio()
 	if !ok || ratio < minBloatRatio {
 		return false, nil
+	}
+	// Safety guard: never rewrite a table larger than maxTableBytes, since
+	// VACUUM FULL needs roughly that much free disk to build the new copy.
+	if maxTableBytes > 0 {
+		var totalBytes int64
+		if err := LOG_DB.Raw("SELECT pg_total_relation_size('conversation_logs')").Scan(&totalBytes).Error; err != nil {
+			return false, err
+		}
+		if totalBytes > maxTableBytes {
+			common.SysError(fmt.Sprintf(
+				"conversation log VACUUM FULL skipped: table is %d bytes, exceeds safety cap %d bytes; use partition + DROP PARTITION at this scale",
+				totalBytes, maxTableBytes))
+			return false, nil
+		}
 	}
 	// VACUUM cannot run inside a transaction block; LOG_DB.Exec issues it
 	// directly. Quote-safe: fixed table name, no user input.

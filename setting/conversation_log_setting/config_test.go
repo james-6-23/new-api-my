@@ -73,9 +73,10 @@ func TestGetSettingDefaultsAndClampsAutoVacuumFull(t *testing.T) {
 
 	// Defaults.
 	setting := GetSetting()
-	require.True(t, setting.AutoVacuumFullEnabled)
+	require.False(t, setting.AutoVacuumFullEnabled)
 	require.Equal(t, 2.0, setting.AutoVacuumFullMinBloatRatio)
 	require.Equal(t, 24, setting.AutoVacuumFullIntervalHours)
+	require.EqualValues(t, 50<<30, setting.AutoVacuumFullMaxTableBytes)
 
 	// Out-of-range values fall back to defaults.
 	conversationLogSetting.AutoVacuumFullMinBloatRatio = 0.1

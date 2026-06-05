@@ -86,13 +86,22 @@ const (
 	maxCaptureMaxBytes     = int64(1) << 30   // 1 GiB
 
 	// Periodic VACUUM FULL (PostgreSQL-only) to reclaim disk after deletes.
-	defaultAutoVacuumFullEnabled       = true
+	// DANGER: VACUUM FULL needs free disk ~= the table's live size (it writes a
+	// full new copy before dropping the old one). It is ONLY appropriate for
+	// SMALL single-disk deployments. For high-volume ingest where the table can
+	// approach or exceed free disk, this WILL fill the disk and crash PG — use
+	// partition + DROP PARTITION instead. Hence it is OFF by default and capped
+	// by a max-table-size safety guard.
+	defaultAutoVacuumFullEnabled       = false
 	defaultAutoVacuumFullMinBloatRatio = 2.0 // dead >= 2x live before rewriting
 	defaultAutoVacuumFullIntervalHours = 24
+	defaultAutoVacuumFullMaxTableBytes = int64(50) << 30 // 50 GiB hard safety cap
 	minAutoVacuumFullMinBloatRatio     = 0.5
 	maxAutoVacuumFullMinBloatRatio     = 100.0
 	minAutoVacuumFullIntervalHours     = 1
-	maxAutoVacuumFullIntervalHours     = 720 // 30 days
+	maxAutoVacuumFullIntervalHours     = 720              // 30 days
+	minAutoVacuumFullMaxTableBytes     = int64(1) << 30   // 1 GiB
+	maxAutoVacuumFullMaxTableBytes     = int64(512) << 30 // 512 GiB
 )
 
 type S3Setting struct {
@@ -187,6 +196,10 @@ type ConversationLogSetting struct {
 	AutoVacuumFullMinBloatRatio float64 `json:"auto_vacuum_full_min_bloat_ratio"`
 	// AutoVacuumFullIntervalHours is how often the bloat check runs.
 	AutoVacuumFullIntervalHours int `json:"auto_vacuum_full_interval_hours"`
+	// AutoVacuumFullMaxTableBytes is a hard safety cap: VACUUM FULL is skipped
+	// when the table's total size exceeds this, because the rewrite needs that
+	// much free disk. Prevents filling the disk on large tables.
+	AutoVacuumFullMaxTableBytes int64 `json:"auto_vacuum_full_max_table_bytes"`
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
@@ -232,6 +245,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoVacuumFullEnabled:       defaultAutoVacuumFullEnabled,
 	AutoVacuumFullMinBloatRatio: defaultAutoVacuumFullMinBloatRatio,
 	AutoVacuumFullIntervalHours: defaultAutoVacuumFullIntervalHours,
+	AutoVacuumFullMaxTableBytes: defaultAutoVacuumFullMaxTableBytes,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -296,6 +310,9 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.AutoVacuumFullIntervalHours < minAutoVacuumFullIntervalHours || setting.AutoVacuumFullIntervalHours > maxAutoVacuumFullIntervalHours {
 		setting.AutoVacuumFullIntervalHours = defaultAutoVacuumFullIntervalHours
+	}
+	if setting.AutoVacuumFullMaxTableBytes < minAutoVacuumFullMaxTableBytes || setting.AutoVacuumFullMaxTableBytes > maxAutoVacuumFullMaxTableBytes {
+		setting.AutoVacuumFullMaxTableBytes = defaultAutoVacuumFullMaxTableBytes
 	}
 
 	if setting.AutoExportThresholdBytes <= 0 {

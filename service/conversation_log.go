@@ -404,7 +404,7 @@ func conversationLogVacuumFullLoop() {
 		if !setting.AutoVacuumFullEnabled || !common.ConversationLogStoreConfigured {
 			continue
 		}
-		ran, err := model.VacuumFullConversationLogsIfBloated(setting.AutoVacuumFullMinBloatRatio)
+		ran, err := model.VacuumFullConversationLogsIfBloated(setting.AutoVacuumFullMinBloatRatio, setting.AutoVacuumFullMaxTableBytes)
 		if err != nil {
 			common.SysError("conversation log VACUUM FULL failed: " + err.Error())
 		} else if ran {
