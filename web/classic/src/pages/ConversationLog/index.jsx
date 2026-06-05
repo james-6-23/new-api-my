@@ -65,6 +65,7 @@ import {
 } from '../../helpers';
 import ExportJobs from './ExportJobs';
 import S3UploadLogs from './S3UploadLogs';
+import MonitorPanel from './MonitorPanel';
 
 const { Text, Title } = Typography;
 
@@ -1578,6 +1579,9 @@ const ConversationLog = () => {
               </Spin>
             </Modal>
           </div>
+        </Tabs.TabPane>
+        <Tabs.TabPane tab={t('运行监控')} itemKey='monitoring'>
+          <MonitorPanel />
         </Tabs.TabPane>
         <Tabs.TabPane tab={t('S3 上传记录')} itemKey='s3_uploads'>
           <S3UploadLogs />
