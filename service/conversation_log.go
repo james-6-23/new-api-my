@@ -439,6 +439,18 @@ func runConversationLogPartitionMaintenance(ctx context.Context) {
 	} else if dropped > 0 {
 		common.SysLog(fmt.Sprintf("dropped %d fully-exported conversation log partition(s)", dropped))
 	}
+	// 3. High-watermark safety valve: if the table exceeds MaxStorageGB (e.g.
+	// during a traffic spike that outpaces the time-based retain), drop the
+	// oldest fully-exported partitions until back under the limit. Same safety
+	// gate — un-exported data is never dropped.
+	if setting.MaxStorageGB > 0 {
+		maxBytes := int64(setting.MaxStorageGB) << 30
+		if dropped, err := model.DropOldestExportedPartitionsToFitStorage(ctx, maxBytes, ConversationValidationValid); err != nil {
+			common.SysError("conversation log partition watermark drop failed: " + err.Error())
+		} else if dropped > 0 {
+			common.SysLog(fmt.Sprintf("watermark: dropped %d oldest exported partition(s) to fit %dGB", dropped, setting.MaxStorageGB))
+		}
+	}
 }
 
 // conversationLogVacuumFullLoop periodically reclaims disk space on the

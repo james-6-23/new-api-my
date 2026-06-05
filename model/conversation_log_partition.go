@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -248,6 +249,85 @@ func DropExportedConversationLogPartitions(ctx context.Context, cutoffTs int64, 
 		if err := LOG_DB.Exec("DROP TABLE IF EXISTS " + name).Error; err != nil {
 			return dropped, fmt.Errorf("drop partition %s: %w", name, err)
 		}
+		dropped++
+	}
+	if dropped > 0 {
+		InvalidateConversationLogStatsCache()
+	}
+	return dropped, nil
+}
+
+// DropOldestExportedPartitionsToFitStorage is the high-watermark safety valve:
+// when the table's total size exceeds maxBytes, it drops the OLDEST fully-
+// exported partitions first (ignoring partition_retain_hours) until the table
+// is back under maxBytes or no more droppable partitions remain. This bounds
+// disk during traffic spikes that outpace the time-based retain. The same
+// safety gate applies — partitions with valid+unexported rows are skipped, so
+// un-trained data is never deleted (export lag just means the watermark may not
+// be reachable, which is correct: better to keep growing + alert than lose
+// data). PostgreSQL + partitioning only. Returns the number dropped.
+func DropOldestExportedPartitionsToFitStorage(ctx context.Context, maxBytes int64, validStatus string) (int, error) {
+	if !conversationLogPartitioningActive() || maxBytes <= 0 {
+		return 0, nil
+	}
+	var total int64
+	// On a partitioned table the parent relation holds no data; sum the child
+	// partitions' sizes for the real on-disk footprint.
+	if err := LOG_DB.Raw(`
+		SELECT COALESCE(SUM(pg_total_relation_size(inhrelid)), 0)
+		FROM pg_inherits WHERE inhparent = 'conversation_logs'::regclass
+	`).Scan(&total).Error; err != nil {
+		return 0, err
+	}
+	if total <= maxBytes {
+		return 0, nil
+	}
+	names, err := listConversationLogPartitions()
+	if err != nil {
+		return 0, err
+	}
+	// Oldest first.
+	type part struct {
+		name  string
+		start int64
+	}
+	parts := make([]part, 0, len(names))
+	for _, n := range names {
+		if start, ok := partitionStartFromName(n); ok {
+			parts = append(parts, part{name: n, start: start})
+		}
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].start < parts[j].start })
+
+	dropped := 0
+	for _, p := range parts {
+		if total <= maxBytes {
+			break
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return dropped, err
+			}
+		}
+		// Safety gate: never drop a partition with valid+unexported rows.
+		var pending int64
+		if err := LOG_DB.Raw(
+			fmt.Sprintf("SELECT count(*) FROM %s WHERE exported_at = 0 AND validation_status = ?", p.name),
+			validStatus,
+		).Scan(&pending).Error; err != nil {
+			return dropped, fmt.Errorf("count pending-export in %s: %w", p.name, err)
+		}
+		if pending > 0 {
+			continue // protected; try the next partition
+		}
+		var sz int64
+		if err := LOG_DB.Raw(fmt.Sprintf("SELECT pg_total_relation_size('%s')", p.name)).Scan(&sz).Error; err != nil {
+			return dropped, err
+		}
+		if err := LOG_DB.Exec("DROP TABLE IF EXISTS " + p.name).Error; err != nil {
+			return dropped, fmt.Errorf("drop partition %s: %w", p.name, err)
+		}
+		total -= sz
 		dropped++
 	}
 	if dropped > 0 {

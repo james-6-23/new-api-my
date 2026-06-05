@@ -250,6 +250,31 @@ func TestPartitionIntegration(t *testing.T) {
 		t.Fatal("after its rows were exported, the old partition should now be dropped")
 	}
 	t.Log("closed loop OK: protected while unexported, dropped only after export")
+
+	// 12) Watermark valve: create several old, fully-exported partitions, then
+	//     ask to fit a tiny byte budget — oldest exported partitions must be
+	//     dropped until under budget (peak-spike protection, ignores retain).
+	for h := int64(300); h <= 305; h++ {
+		hs := partitionHourStart(now) - h*3600
+		mustExec(t, db, sprintfPartition(hs))
+		if err := db.Create(&ConversationLog{CreatedAt: hs + 1, RequestBody: "{}", ValidationStatus: "valid", ExportedAt: now}).Error; err != nil {
+			t.Fatalf("insert exported into %d: %v", hs, err)
+		}
+	}
+	before, _ := listConversationLogPartitions()
+	// maxBytes = 1 forces dropping every droppable (fully-exported) partition.
+	wdropped, err := DropOldestExportedPartitionsToFitStorage(context.Background(), 1, "valid")
+	if err != nil {
+		t.Fatalf("DropOldestExportedPartitionsToFitStorage: %v", err)
+	}
+	if wdropped == 0 {
+		t.Fatal("watermark should have dropped at least one exported partition")
+	}
+	after, _ := listConversationLogPartitions()
+	if len(after) >= len(before) {
+		t.Fatalf("watermark drop did not reduce partitions: before=%d after=%d", len(before), len(after))
+	}
+	t.Logf("watermark OK: dropped %d, partitions %d→%d", wdropped, len(before), len(after))
 }
 
 func mustExec(t *testing.T, db *gorm.DB, sql string) {
