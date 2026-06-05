@@ -115,6 +115,10 @@ const defaultSettings = {
   write_batch_size: 100,
   write_batch_max_bytes: 32 * MiB,
   write_flush_interval_ms: 1000,
+  retain_original_bodies: false,
+  retention_delete_unexported: false,
+  capture_max_bytes_per_request: 16 * MiB,
+  partition_ahead_hours: 6,
 };
 
 const formInitValues = {
@@ -506,6 +510,9 @@ const ConversationLog = () => {
           ),
           write_queue_max_mb: bytesToMiB(nextSettings.write_queue_max_bytes),
           write_batch_max_mb: bytesToMiB(nextSettings.write_batch_max_bytes),
+          capture_max_mb: bytesToMiB(
+            nextSettings.capture_max_bytes_per_request,
+          ),
         };
         settingsFormRef.current?.setValues(formValues);
         void loadS3RotationStatus(false, nextSettings.s3);
@@ -622,6 +629,7 @@ const ConversationLog = () => {
         ),
         write_queue_max_mb: bytesToMiB(nextSettings.write_queue_max_bytes),
         write_batch_max_mb: bytesToMiB(nextSettings.write_batch_max_bytes),
+        capture_max_mb: bytesToMiB(nextSettings.capture_max_bytes_per_request),
       };
       settingsFormRef.current?.setValues(formValues);
       showSuccess(t('保存成功'));
@@ -1784,6 +1792,90 @@ const ConversationLog = () => {
                       </div>
                     </Col>
                   </Row>
+
+                  <div
+                    className='text-sm font-semibold mt-4 mb-3'
+                    style={{ color: 'var(--semi-color-text-0)' }}
+                  >
+                    {t('数据治理与高吞吐')}
+                  </div>
+                  <Row gutter={16}>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='retention_delete_unexported'
+                        label={t('时间清理删除未导出数据')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          '默认关：到期清理只删已导出记录，避免误删未训练数据。开启则按时间删除（含未导出）',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            retention_delete_unexported: value === true,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='retain_original_bodies'
+                        label={t('保留原始多份请求/响应体')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          '默认关：去冗余只存导出所需正文，省约 65-70% 存储。开启保留客户端/上游原始多份（便于审计，更占空间）',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            retain_original_bodies: value === true,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='capture_max_mb'
+                        label={t('单请求捕获内存上限')}
+                        min={1}
+                        step={1}
+                        suffix='MB'
+                        extraText={t(
+                          '单个请求所有捕获正文合计的内存上限，超出截断；防止大请求撑高内存',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            capture_max_bytes_per_request: mibToBytes(
+                              value,
+                              settings.capture_max_bytes_per_request,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='partition_ahead_hours'
+                        label={t('分区预建小时数')}
+                        min={1}
+                        max={168}
+                        step={1}
+                        suffix={t('小时')}
+                        extraText={t(
+                          '仅在启用分区(环境变量 CONVERSATION_LOG_PARTITIONING)时生效：提前创建多少小时的未来分区，防止写入落空',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            partition_ahead_hours: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+
                   <Row gutter={16} className='mt-2'>
                     <Col xs={24} md={8}>
                       <Form.Select

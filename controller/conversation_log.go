@@ -181,6 +181,12 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		AutoExportDirectory            *string `json:"auto_export_directory"`
 		AutoExportCheckIntervalSeconds *int    `json:"auto_export_check_interval_seconds"`
 		AutoExportDeleteAfter          *bool   `json:"auto_export_delete_after"`
+
+		// High-volume / data-quality knobs added for the partitioned pipeline.
+		RetainOriginalBodies      *bool  `json:"retain_original_bodies"`
+		RetentionDeleteUnexported *bool  `json:"retention_delete_unexported"`
+		CaptureMaxBytesPerRequest *int64 `json:"capture_max_bytes_per_request"`
+		PartitionAheadHours       *int   `json:"partition_ahead_hours"`
 	}
 	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
 		common.ApiError(c, err)
@@ -411,6 +417,40 @@ func UpdateConversationLogSettings(c *gin.Context) {
 	}
 	if req.AutoExportDeleteAfter != nil {
 		if err := model.UpdateOption("conversation_log_setting.auto_export_delete_after", strconv.FormatBool(*req.AutoExportDeleteAfter)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.RetainOriginalBodies != nil {
+		if err := model.UpdateOption("conversation_log_setting.retain_original_bodies", strconv.FormatBool(*req.RetainOriginalBodies)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.RetentionDeleteUnexported != nil {
+		if err := model.UpdateOption("conversation_log_setting.retention_delete_unexported", strconv.FormatBool(*req.RetentionDeleteUnexported)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.CaptureMaxBytesPerRequest != nil {
+		// Out-of-range values are clamped in GetSetting; reject only obviously
+		// invalid (<= 0) input here for clear feedback.
+		if *req.CaptureMaxBytesPerRequest <= 0 {
+			common.ApiErrorMsg(c, "capture_max_bytes_per_request must be > 0")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.capture_max_bytes_per_request", strconv.FormatInt(*req.CaptureMaxBytesPerRequest, 10)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.PartitionAheadHours != nil {
+		if *req.PartitionAheadHours <= 0 {
+			common.ApiErrorMsg(c, "partition_ahead_hours must be > 0")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.partition_ahead_hours", strconv.Itoa(*req.PartitionAheadHours)); err != nil {
 			common.ApiError(c, err)
 			return
 		}
