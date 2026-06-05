@@ -394,8 +394,16 @@ func migrateLOGDB() error {
 	if err = LOG_DB.AutoMigrate(&Log{}); err != nil {
 		return err
 	}
-	if err = LOG_DB.AutoMigrate(&ConversationLog{}); err != nil {
-		return err
+	if conversationLogPartitioningActive() {
+		// High-volume path: create conversation_logs as an hourly partitioned
+		// parent (PostgreSQL only) instead of a plain table.
+		if err = ensureConversationLogPartitionedParent(LOG_DB); err != nil {
+			return err
+		}
+	} else {
+		if err = LOG_DB.AutoMigrate(&ConversationLog{}); err != nil {
+			return err
+		}
 	}
 	if err = LOG_DB.AutoMigrate(&ConversationExportJob{}); err != nil {
 		return err

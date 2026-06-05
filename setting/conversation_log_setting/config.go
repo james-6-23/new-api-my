@@ -102,6 +102,17 @@ const (
 	maxAutoVacuumFullIntervalHours     = 720              // 30 days
 	minAutoVacuumFullMaxTableBytes     = int64(1) << 30   // 1 GiB
 	maxAutoVacuumFullMaxTableBytes     = int64(512) << 30 // 512 GiB
+
+	// Time-based partitioning (PostgreSQL-only, opt-in via the
+	// CONVERSATION_LOG_PARTITIONING env var). For high-volume ingest the
+	// conversation_logs table is range-partitioned by created_at (hourly);
+	// cleanup drops whole partitions (instant, zero extra disk, no bloat)
+	// instead of row DELETE. Off by default so existing deployments are
+	// unaffected; only enable on a fresh dedicated PG store.
+	defaultPartitionAheadHours   = 6
+	minPartitionAheadHours       = 1
+	maxPartitionAheadHours       = 168 // 7 days
+	conversationLogPartitionSecs = int64(3600)
 )
 
 type S3Setting struct {
@@ -201,6 +212,12 @@ type ConversationLogSetting struct {
 	// much free disk. Prevents filling the disk on large tables.
 	AutoVacuumFullMaxTableBytes int64 `json:"auto_vacuum_full_max_table_bytes"`
 
+	// PartitionAheadHours is how many future hourly partitions to pre-create so
+	// inserts never land in an unpartitioned range. Only used when partitioning
+	// is enabled via the CONVERSATION_LOG_PARTITIONING env var (the enablement
+	// itself is a structural deployment decision, not a DB setting).
+	PartitionAheadHours int `json:"partition_ahead_hours"`
+
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
 	// packs them into gzip JSONL shards capped at AutoExportShardMaxBytes, then (if
@@ -246,6 +263,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoVacuumFullMinBloatRatio: defaultAutoVacuumFullMinBloatRatio,
 	AutoVacuumFullIntervalHours: defaultAutoVacuumFullIntervalHours,
 	AutoVacuumFullMaxTableBytes: defaultAutoVacuumFullMaxTableBytes,
+	PartitionAheadHours:         defaultPartitionAheadHours,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -313,6 +331,9 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.AutoVacuumFullMaxTableBytes < minAutoVacuumFullMaxTableBytes || setting.AutoVacuumFullMaxTableBytes > maxAutoVacuumFullMaxTableBytes {
 		setting.AutoVacuumFullMaxTableBytes = defaultAutoVacuumFullMaxTableBytes
+	}
+	if setting.PartitionAheadHours < minPartitionAheadHours || setting.PartitionAheadHours > maxPartitionAheadHours {
+		setting.PartitionAheadHours = defaultPartitionAheadHours
 	}
 
 	if setting.AutoExportThresholdBytes <= 0 {
@@ -467,6 +488,12 @@ func clampCaptureMaxBytes(value int64) int64 {
 
 func CaptureMaxBytesBounds() (min, max int64) {
 	return minCaptureMaxBytes, maxCaptureMaxBytes
+}
+
+// PartitionIntervalSeconds is the width of each conversation_logs time
+// partition (hourly).
+func PartitionIntervalSeconds() int64 {
+	return conversationLogPartitionSecs
 }
 
 func clampCapturePauseDiskUsedGB(value int) int {

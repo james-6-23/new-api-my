@@ -75,12 +75,31 @@ VACUUM FULL 重写表时需要 **≈ 表活数据大小的额外空闲磁盘**�
 
 ## 7. 分阶段实施计划（建议）
 
-1. **阶段 A**（低风险，可先上）：确保 auto-export + S3 rotation 在你的环境跑通、导出能跟上写入。这是分区生效的前提。
-2. **阶段 B**（schema 改造，需真实 PG 验证）：独立空库上建小时分区表 + GORM AutoMigrate 共存改造 + 复合主键。
-3. **阶段 C**：分区维护任务（建未来分区 + DROP 已导出过期分区）。
-4. **阶段 D**：把 auto-export 的"删源"在 PG 下切换为 DROP PARTITION。
+1. **阶段 A**（低风险，可先上）：确保 auto-export + S3 rotation 在你的环境跑通、导出能跟上写入。这是分区生效的前提。✅ 已具备
+2. **阶段 B**（schema 改造，需真实 PG 验证）：独立空库上建小时分区表 + GORM AutoMigrate 共存改造 + 复合主键。✅ 代码已实现（`model/conversation_log_partition.go`），**待测试环境验证 GORM 复合主键 CRUD**
+3. **阶段 C**：分区维护任务（建未来分区 + DROP 已导出过期分区）。✅ 已实现（`service.conversationLogPartitionMaintenanceLoop`）
+4. **阶段 D**：把 auto-export 的"删源"在 PG 分区下切换为 DROP PARTITION。✅ 已实现（导出仍标记 exported_at，跳过行 DELETE，由分区维护整体 DROP）
 
-每阶段需在你的真实 PG（postgres:18）上验证后再进下一步。
+### 启用方式（结构性决策，用环境变量）
+分区是建表时就要确定的结构决策，发生在 DB 设置加载之前，因此用**环境变量**而非 DB 设置开启：
+```
+CONVERSATION_LOG_PARTITIONING=true   # 仅 PG + 已配 LOG_SQL_DSN 时生效
+```
+- `partition_ahead_hours`（DB 设置，默认 6）：提前创建多少小时的未来分区。
+- 关闭时（默认）：行为完全不变，仍走普通表 + DELETE 清理。
+
+### DROP 安全门（防误删训练数据）
+分区维护只 DROP 满足以下全部条件的分区：
+1. 整个时间窗 < `now - RetentionDays`；
+2. 该分区无"有效且未导出"的记录（`validation_status='valid' AND exported_at=0`）。
+
+无效记录（不可训练）不阻止 DROP，随分区一起删除，避免它们永久占盘。有效但未导出的记录会阻止 DROP，导出滞后只会延迟回收、绝不丢数据。
+
+### ⚠️ 上线前必须在测试环境验证（本地无法验证）
+- GORM 对复合主键 `(created_at, id)` 的 Create/Updates/Delete 行为，尤其 `MarkConversationLogsExported`（`WHERE id IN`）、`DeleteConversationLogsByIDs`。
+- `ensureConversationLogPartitionedParent`：先建分区父表再 AutoMigrate 补列，确认列/索引齐全且无 PK 冲突。
+- 压测确认 `partition_ahead_hours` 足够，写入永不落到无分区区间。
+- 24h 连续跑，确认磁盘稳定在"未导出分区"水位。
 
 ## 8. 仍需你确认/提供的信息
 
