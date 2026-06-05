@@ -73,6 +73,17 @@ const (
 	maxWriteMemoryBytes         = int64(4) << 30 // 4 GiB
 	minCapturePauseDiskUsedGB   = 0
 	maxCapturePauseDiskUsedGB   = 1048576
+
+	// Per-request capture memory cap. Bounds the combined in-flight bytes a
+	// single ConversationCapture may retain across all captured fields
+	// (client/upstream request + raw streamed response). Without this, a long
+	// streamed response or a huge request body is accumulated unbounded in
+	// memory for the full lifetime of the request, and under concurrency the
+	// process RSS balloons. Once the cap is hit, further bytes are dropped and
+	// the record is flagged truncated.
+	defaultCaptureMaxBytes = int64(16) << 20  // 16 MiB
+	minCaptureMaxBytes     = int64(256) << 10 // 256 KiB
+	maxCaptureMaxBytes     = int64(1) << 30   // 1 GiB
 )
 
 type S3Setting struct {
@@ -131,6 +142,10 @@ type ConversationLogSetting struct {
 	WriteBatchMaxBytes   int64 `json:"write_batch_max_bytes"`
 	WriteFlushIntervalMs int   `json:"write_flush_interval_ms"`
 
+	// CaptureMaxBytesPerRequest bounds the combined in-flight bytes a single
+	// captured request may retain in memory. See defaultCaptureMaxBytes.
+	CaptureMaxBytesPerRequest int64 `json:"capture_max_bytes_per_request"`
+
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
 	// packs them into gzip JSONL shards capped at AutoExportShardMaxBytes, then (if
@@ -170,6 +185,7 @@ var conversationLogSetting = ConversationLogSetting{
 	WriteBatchSize:             defaultWriteBatchSize,
 	WriteBatchMaxBytes:         defaultWriteBatchBytes,
 	WriteFlushIntervalMs:       defaultWriteFlushIntervalMs,
+	CaptureMaxBytesPerRequest:  defaultCaptureMaxBytes,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -227,6 +243,7 @@ func GetSetting() ConversationLogSetting {
 	setting.WriteBatchSize = clampWriteBatchSize(setting.WriteBatchSize)
 	setting.WriteBatchMaxBytes = clampWriteMemoryBytes(setting.WriteBatchMaxBytes, defaultWriteBatchBytes)
 	setting.WriteFlushIntervalMs = clampWriteFlushIntervalMs(setting.WriteFlushIntervalMs)
+	setting.CaptureMaxBytesPerRequest = clampCaptureMaxBytes(setting.CaptureMaxBytesPerRequest)
 
 	if setting.AutoExportThresholdBytes <= 0 {
 		setting.AutoExportThresholdBytes = defaultAutoExportThresholdBytes
@@ -369,6 +386,17 @@ func clampWriteFlushIntervalMs(value int) int {
 
 func WriteFlushIntervalMsBounds() (min, max int) {
 	return minWriteFlushIntervalMs, maxWriteFlushIntervalMs
+}
+
+func clampCaptureMaxBytes(value int64) int64 {
+	if value < minCaptureMaxBytes || value > maxCaptureMaxBytes {
+		return defaultCaptureMaxBytes
+	}
+	return value
+}
+
+func CaptureMaxBytesBounds() (min, max int64) {
+	return minCaptureMaxBytes, maxCaptureMaxBytes
 }
 
 func clampCapturePauseDiskUsedGB(value int) int {

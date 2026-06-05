@@ -14,6 +14,13 @@ const conversationCaptureContextKey = "conversation_capture"
 type ConversationCapture struct {
 	mu sync.Mutex
 
+	// maxTotalBytes bounds the combined retained bytes across all captured
+	// fields below. <= 0 means unbounded. Once exceeded, further bytes are
+	// dropped and truncated is set so the record can be flagged.
+	maxTotalBytes int64
+	totalBytes    int64
+	truncated     bool
+
 	clientRequestBody       []byte
 	upstreamRequestBody     []byte
 	upstreamResponseBodyRaw []byte
@@ -29,12 +36,15 @@ type ConversationCaptureSnapshot struct {
 	UpstreamResponseBodyRaw []byte
 	ClientResponseBody      []byte
 	StreamChunksPath        string
+	Truncated               bool
 	RequestTime             int64
 	ResponseTime            int64
 }
 
-func NewConversationCapture() *ConversationCapture {
-	return &ConversationCapture{}
+// NewConversationCapture creates a capture that retains at most maxTotalBytes
+// across all captured fields combined. Pass <= 0 to disable the cap.
+func NewConversationCapture(maxTotalBytes int64) *ConversationCapture {
+	return &ConversationCapture{maxTotalBytes: maxTotalBytes}
 }
 
 func SetConversationCapture(c *gin.Context, capture *ConversationCapture) {
@@ -94,9 +104,26 @@ func (capture *ConversationCapture) Snapshot() ConversationCaptureSnapshot {
 		UpstreamResponseBodyRaw: cloneBytes(capture.upstreamResponseBodyRaw),
 		ClientResponseBody:      cloneBytes(capture.clientResponseBody),
 		StreamChunksPath:        capture.streamChunksPath,
+		Truncated:               capture.truncated,
 		RequestTime:             capture.requestTime,
 		ResponseTime:            capture.responseTime,
 	}
+}
+
+// acceptable returns how many of n incoming bytes may be retained without
+// exceeding maxTotalBytes. Caller must hold capture.mu.
+func (capture *ConversationCapture) acceptable(n int) int {
+	if capture.maxTotalBytes <= 0 {
+		return n
+	}
+	remaining := capture.maxTotalBytes - capture.totalBytes
+	if remaining <= 0 {
+		return 0
+	}
+	if int64(n) > remaining {
+		return int(remaining)
+	}
+	return n
 }
 
 func (capture *ConversationCapture) setBytes(target *[]byte, data []byte) {
@@ -105,7 +132,13 @@ func (capture *ConversationCapture) setBytes(target *[]byte, data []byte) {
 	}
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
-	*target = cloneBytes(data)
+	capture.totalBytes -= int64(len(*target))
+	allowed := capture.acceptable(len(data))
+	if allowed < len(data) {
+		capture.truncated = true
+	}
+	*target = cloneBytes(data[:allowed])
+	capture.totalBytes += int64(allowed)
 }
 
 func (capture *ConversationCapture) appendBytes(target *[]byte, data []byte) {
@@ -114,7 +147,15 @@ func (capture *ConversationCapture) appendBytes(target *[]byte, data []byte) {
 	}
 	capture.mu.Lock()
 	defer capture.mu.Unlock()
-	*target = append(*target, data...)
+	allowed := capture.acceptable(len(data))
+	if allowed < len(data) {
+		capture.truncated = true
+	}
+	if allowed <= 0 {
+		return
+	}
+	*target = append(*target, data[:allowed]...)
+	capture.totalBytes += int64(allowed)
 }
 
 func (capture *ConversationCapture) setRequestTime(ts int64) {
