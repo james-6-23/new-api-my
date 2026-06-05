@@ -146,6 +146,18 @@ type ConversationLogSetting struct {
 	// captured request may retain in memory. See defaultCaptureMaxBytes.
 	CaptureMaxBytesPerRequest int64 `json:"capture_max_bytes_per_request"`
 
+	// RetainOriginalBodies controls whether the raw per-stage capture fields
+	// (client/upstream request body, client response body, raw upstream SSE
+	// response) are persisted alongside the export-ready request_body and
+	// response_body. Default false drops them to save storage, because the
+	// export pipeline only reads request_body + response_body and the tool
+	// definitions they carry are already merged into request_body at write
+	// time. Set true to keep full per-stage copies (legacy behaviour, useful
+	// for auditing client-vs-upstream payloads). Regardless of this flag,
+	// records whose request completion or response reconstruction failed always
+	// retain their originals so no debuggable/exportable data is lost.
+	RetainOriginalBodies bool `json:"retain_original_bodies"`
+
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
 	// packs them into gzip JSONL shards capped at AutoExportShardMaxBytes, then (if

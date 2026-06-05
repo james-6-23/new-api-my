@@ -283,6 +283,32 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		"node_name":                common.NodeName,
 	})
 
+	// Decide which raw per-stage capture fields to persist. By default we drop
+	// them: the export pipeline reads only request_body/response_body, and the
+	// tool definitions the originals carry are already merged into request_body
+	// at write time (completeConversationRequestBody above), so dropping them is
+	// lossless for export. Records whose request completion or response
+	// reconstruction failed always keep their originals so nothing
+	// exportable/debuggable is lost.
+	setting := conversation_log_setting.GetSetting()
+	requestCompletionFailed := strings.TrimSpace(requestBodyText) == ""
+	responseReconstructionFailed := strings.TrimSpace(responseBody) == "" || len(reconstructionReasons) > 0
+	retainRequestOriginals := setting.RetainOriginalBodies || requestCompletionFailed
+	retainResponseOriginals := setting.RetainOriginalBodies || responseReconstructionFailed
+
+	clientRequestBody := ""
+	upstreamRequestBody := ""
+	if retainRequestOriginals {
+		clientRequestBody = string(snapshot.ClientRequestBody)
+		upstreamRequestBody = string(snapshot.UpstreamRequestBody)
+	}
+	clientResponseBody := ""
+	upstreamResponseBodyRaw := ""
+	if retainResponseOriginals {
+		clientResponseBody = string(snapshot.ClientResponseBody)
+		upstreamResponseBodyRaw = string(snapshot.UpstreamResponseBodyRaw)
+	}
+
 	log := &model.ConversationLog{
 		CreatedAt:               common.GetTimestamp(),
 		RequestId:               ctx.GetString(common.RequestIdKey),
@@ -305,10 +331,10 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		ResponseBody:            responseBody,
 		RequestTime:             requestTime,
 		ResponseTime:            responseTime,
-		ClientRequestBody:       string(snapshot.ClientRequestBody),
-		ClientResponseBody:      string(snapshot.ClientResponseBody),
-		UpstreamRequestBody:     string(snapshot.UpstreamRequestBody),
-		UpstreamResponseBodyRaw: string(snapshot.UpstreamResponseBodyRaw),
+		ClientRequestBody:       clientRequestBody,
+		ClientResponseBody:      clientResponseBody,
+		UpstreamRequestBody:     upstreamRequestBody,
+		UpstreamResponseBodyRaw: upstreamResponseBodyRaw,
 		StreamChunksPath:        snapshot.StreamChunksPath,
 		IsStream:                relayInfo.IsStream,
 		StatusCode:              200,
