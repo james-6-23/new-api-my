@@ -192,7 +192,7 @@ func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) 
 		logger.LogError(c, "failed to snapshot conversation capture request body: "+err.Error())
 		return
 	}
-	capture := relaycommon.NewConversationCapture()
+	capture := relaycommon.NewConversationCapture(setting.CaptureMaxBytesPerRequest)
 	capture.SetClientRequestBody(body)
 	relayInfo.ConversationCapture = capture
 	relaycommon.SetConversationCapture(c, capture)
@@ -317,8 +317,11 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 
 	validation := ValidateAPIRecord(log)
 	validation.Reasons = append(validation.Reasons, reconstructionReasons...)
+	if snapshot.Truncated {
+		validation.Reasons = append(validation.Reasons, "capture_truncated")
+	}
 	validation.Reasons = uniqueStrings(validation.Reasons)
-	if validation.Exportable && len(reconstructionReasons) == 0 {
+	if validation.Exportable && len(reconstructionReasons) == 0 && !snapshot.Truncated {
 		log.ValidationStatus = ConversationValidationValid
 	} else {
 		log.ValidationStatus = ConversationValidationInvalid
