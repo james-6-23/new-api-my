@@ -53,6 +53,23 @@ func GetConversationLogSummary(c *gin.Context) {
 	})
 }
 
+// GetConversationLogMonitorStats exposes high-volume operational metrics:
+// partition inventory, export backlog (valid records not yet exported, which
+// pins disk), and recent ingest-vs-export throughput so operators can tell
+// whether export is keeping up with writes.
+func GetConversationLogMonitorStats(c *gin.Context) {
+	window := int64(300)
+	if v, err := strconv.ParseInt(strings.TrimSpace(c.Query("window_seconds")), 10, 64); err == nil && v > 0 {
+		window = v
+	}
+	stats, err := model.GetConversationLogMonitorStats(service.ConversationValidationValid, window)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, stats)
+}
+
 func GetConversationLogExportSummary(c *gin.Context) {
 	mode := conversationLogMode(c.Query("mode"))
 	exportSummary, err := service.BuildConversationLogExportSummaryCached(c.Request.Context(), parseConversationLogQuery(c), mode)

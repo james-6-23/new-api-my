@@ -157,6 +157,31 @@ func TestPartitionIntegration(t *testing.T) {
 		t.Fatalf("GetConversationLogSummary on partitioned table: %v", err)
 	}
 	t.Logf("summary on partitioned table OK: total=%d exported=%d", summary.RecordCount, summary.ExportedCount)
+
+	// 9) Monitor stats must run on the partitioned table and report sane values.
+	stats, err := GetConversationLogMonitorStats("valid", 300)
+	if err != nil {
+		t.Fatalf("GetConversationLogMonitorStats: %v", err)
+	}
+	if !stats.PartitioningEnabled {
+		t.Fatal("monitor stats: partitioning should be reported enabled")
+	}
+	if stats.PartitionCount == 0 {
+		t.Fatal("monitor stats: partition count should be > 0")
+	}
+	if stats.FuturePartitionCount == 0 {
+		t.Fatal("monitor stats: should have future partitions pre-created")
+	}
+	// old2 partition holds one valid+unexported row → backlog of exactly 1.
+	if stats.PendingExportRecords != 1 {
+		t.Fatalf("monitor stats: pending export records = %d, want 1", stats.PendingExportRecords)
+	}
+	if stats.OldestPendingAgeSeconds <= 0 {
+		t.Fatal("monitor stats: oldest pending age should be positive")
+	}
+	t.Logf("monitor OK: partitions=%d future=%d pending=%d oldestAge=%ds ingest=%.3f/s export=%.3f/s keepingUp=%v",
+		stats.PartitionCount, stats.FuturePartitionCount, stats.PendingExportRecords,
+		stats.OldestPendingAgeSeconds, stats.IngestRatePerSec, stats.ExportRatePerSec, stats.ExportKeepingUp)
 }
 
 func mustExec(t *testing.T, db *gorm.DB, sql string) {
