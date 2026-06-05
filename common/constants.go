@@ -65,6 +65,14 @@ var DisplayInCurrencyEnabled = true
 var DisplayTokenStatEnabled = true
 var DrawingEnabled = true
 var TaskEnabled = true
+
+// ConversationLogStoreConfigured reports whether a dedicated conversation-log
+// database is configured (LOG_SQL_DSN is set to a non-empty DSN). The
+// conversation-log feature (capture + APIs + UI entry) is only available when
+// this is true; otherwise LOG_DB falls back to the main DB, which we
+// intentionally forbid so heavy log churn/cleanup never touches the primary
+// database. Set by model.InitLogDB at startup.
+var ConversationLogStoreConfigured = false
 var DataExportEnabled = true
 var DataExportInterval = 5         // unit: minute
 var DataExportDefaultTime = "hour" // unit: minute

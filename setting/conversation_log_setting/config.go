@@ -84,6 +84,24 @@ const (
 	defaultCaptureMaxBytes = int64(16) << 20  // 16 MiB
 	minCaptureMaxBytes     = int64(256) << 10 // 256 KiB
 	maxCaptureMaxBytes     = int64(1) << 30   // 1 GiB
+
+	// Periodic VACUUM FULL (PostgreSQL-only) to reclaim disk after deletes.
+	// DANGER: VACUUM FULL needs free disk ~= the table's live size (it writes a
+	// full new copy before dropping the old one). It is ONLY appropriate for
+	// SMALL single-disk deployments. For high-volume ingest where the table can
+	// approach or exceed free disk, this WILL fill the disk and crash PG — use
+	// partition + DROP PARTITION instead. Hence it is OFF by default and capped
+	// by a max-table-size safety guard.
+	defaultAutoVacuumFullEnabled       = false
+	defaultAutoVacuumFullMinBloatRatio = 2.0 // dead >= 2x live before rewriting
+	defaultAutoVacuumFullIntervalHours = 24
+	defaultAutoVacuumFullMaxTableBytes = int64(50) << 30 // 50 GiB hard safety cap
+	minAutoVacuumFullMinBloatRatio     = 0.5
+	maxAutoVacuumFullMinBloatRatio     = 100.0
+	minAutoVacuumFullIntervalHours     = 1
+	maxAutoVacuumFullIntervalHours     = 720              // 30 days
+	minAutoVacuumFullMaxTableBytes     = int64(1) << 30   // 1 GiB
+	maxAutoVacuumFullMaxTableBytes     = int64(512) << 30 // 512 GiB
 )
 
 type S3Setting struct {
@@ -158,6 +176,31 @@ type ConversationLogSetting struct {
 	// retain their originals so no debuggable/exportable data is lost.
 	RetainOriginalBodies bool `json:"retain_original_bodies"`
 
+	// RetentionDeleteUnexported controls whether RetentionDays time-based
+	// cleanup may delete records that have NOT been exported yet
+	// (exported_at = 0). Default false: time cleanup only removes
+	// already-exported records, so not-yet-trained data is never deleted by
+	// age (pair with auto-export so aged records get exported and become
+	// deletable). Set true for the legacy behaviour of deleting by age
+	// regardless of export status.
+	RetentionDeleteUnexported bool `json:"retention_delete_unexported"`
+
+	// AutoVacuumFullEnabled enables a periodic VACUUM FULL on the conversation
+	// log table (PostgreSQL only) to physically reclaim disk space after
+	// deletes. Safe to run because logs live in a dedicated database isolated
+	// from the primary DB. No-op on SQLite/MySQL.
+	AutoVacuumFullEnabled bool `json:"auto_vacuum_full_enabled"`
+	// AutoVacuumFullMinBloatRatio is the dead/live tuple ratio above which the
+	// periodic VACUUM FULL actually runs; below it the (table-locking) rewrite
+	// is skipped as not worth the cost.
+	AutoVacuumFullMinBloatRatio float64 `json:"auto_vacuum_full_min_bloat_ratio"`
+	// AutoVacuumFullIntervalHours is how often the bloat check runs.
+	AutoVacuumFullIntervalHours int `json:"auto_vacuum_full_interval_hours"`
+	// AutoVacuumFullMaxTableBytes is a hard safety cap: VACUUM FULL is skipped
+	// when the table's total size exceeds this, because the rewrite needs that
+	// much free disk. Prevents filling the disk on large tables.
+	AutoVacuumFullMaxTableBytes int64 `json:"auto_vacuum_full_max_table_bytes"`
+
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
 	// packs them into gzip JSONL shards capped at AutoExportShardMaxBytes, then (if
@@ -198,6 +241,11 @@ var conversationLogSetting = ConversationLogSetting{
 	WriteBatchMaxBytes:         defaultWriteBatchBytes,
 	WriteFlushIntervalMs:       defaultWriteFlushIntervalMs,
 	CaptureMaxBytesPerRequest:  defaultCaptureMaxBytes,
+
+	AutoVacuumFullEnabled:       defaultAutoVacuumFullEnabled,
+	AutoVacuumFullMinBloatRatio: defaultAutoVacuumFullMinBloatRatio,
+	AutoVacuumFullIntervalHours: defaultAutoVacuumFullIntervalHours,
+	AutoVacuumFullMaxTableBytes: defaultAutoVacuumFullMaxTableBytes,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -256,6 +304,16 @@ func GetSetting() ConversationLogSetting {
 	setting.WriteBatchMaxBytes = clampWriteMemoryBytes(setting.WriteBatchMaxBytes, defaultWriteBatchBytes)
 	setting.WriteFlushIntervalMs = clampWriteFlushIntervalMs(setting.WriteFlushIntervalMs)
 	setting.CaptureMaxBytesPerRequest = clampCaptureMaxBytes(setting.CaptureMaxBytesPerRequest)
+
+	if setting.AutoVacuumFullMinBloatRatio < minAutoVacuumFullMinBloatRatio || setting.AutoVacuumFullMinBloatRatio > maxAutoVacuumFullMinBloatRatio {
+		setting.AutoVacuumFullMinBloatRatio = defaultAutoVacuumFullMinBloatRatio
+	}
+	if setting.AutoVacuumFullIntervalHours < minAutoVacuumFullIntervalHours || setting.AutoVacuumFullIntervalHours > maxAutoVacuumFullIntervalHours {
+		setting.AutoVacuumFullIntervalHours = defaultAutoVacuumFullIntervalHours
+	}
+	if setting.AutoVacuumFullMaxTableBytes < minAutoVacuumFullMaxTableBytes || setting.AutoVacuumFullMaxTableBytes > maxAutoVacuumFullMaxTableBytes {
+		setting.AutoVacuumFullMaxTableBytes = defaultAutoVacuumFullMaxTableBytes
+	}
 
 	if setting.AutoExportThresholdBytes <= 0 {
 		setting.AutoExportThresholdBytes = defaultAutoExportThresholdBytes

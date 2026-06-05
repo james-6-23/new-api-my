@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useContext, useEffect, useMemo, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { getLucideIcon } from '../../helpers/render';
@@ -27,8 +27,9 @@ import { useSidebar } from '../../hooks/common/useSidebar';
 import { useMinimumLoadingTime } from '../../hooks/common/useMinimumLoadingTime';
 import { isAdmin, isRoot, showError } from '../../helpers';
 import SkeletonWrapper from './components/SkeletonWrapper';
+import { StatusContext } from '../../context/Status';
 
-import { Nav, Divider, Button } from '@douyinfe/semi-ui';
+import { Nav, Divider, Button, Tooltip } from '@douyinfe/semi-ui';
 
 const routerMap = {
   home: '/',
@@ -60,6 +61,12 @@ const SiderBar = ({ onNavigate = () => {} }) => {
     hasSectionVisibleModules,
     loading: sidebarLoading,
   } = useSidebar();
+
+  const [statusState] = useContext(StatusContext);
+  // 仅当后端配置了独立会话日志数据库 (LOG_SQL_DSN) 时该功能可用；
+  // 老后端无此字段时按可用处理，只有明确为 false 才置灰。
+  const conversationLogEnabled =
+    statusState?.status?.conversation_log_enabled !== false;
 
   const showSkeleton = useMinimumLoadingTime(sidebarLoading, 200);
 
@@ -189,6 +196,10 @@ const SiderBar = ({ onNavigate = () => {} }) => {
         itemKey: 'conversation_logs',
         to: '/conversation-logs',
         className: isRoot() ? '' : 'tableHiddle',
+        disabled: !conversationLogEnabled,
+        disabledTip: t(
+          '会话日志功能未启用：请在部署中配置独立的会话日志数据库（LOG_SQL_DSN）',
+        ),
       },
       {
         text: t('系统设置'),
@@ -205,7 +216,13 @@ const SiderBar = ({ onNavigate = () => {} }) => {
     });
 
     return filteredItems;
-  }, [isAdmin(), isRoot(), t, isModuleVisible]);
+  }, [isAdmin(), isRoot(), t, isModuleVisible, conversationLogEnabled]);
+
+  // 被置灰（不可点击）的菜单项 key 集合，用于 renderWrapper 跳过 Link 包裹
+  const disabledItemKeys = useMemo(
+    () => adminItems.filter((item) => item.disabled).map((item) => item.itemKey),
+    [adminItems],
+  );
 
   const chatMenuItems = useMemo(() => {
     const items = [
@@ -325,17 +342,28 @@ const SiderBar = ({ onNavigate = () => {} }) => {
     const isSelected = selectedKeys.includes(item.itemKey);
     const textColor = isSelected ? SELECTED_COLOR : 'inherit';
 
+    const textNode = (
+      <span
+        className='truncate font-medium text-sm'
+        style={{ color: textColor }}
+      >
+        {item.text}
+      </span>
+    );
+
     return (
       <Nav.Item
         key={item.itemKey}
         itemKey={item.itemKey}
+        disabled={!!item.disabled}
         text={
-          <span
-            className='truncate font-medium text-sm'
-            style={{ color: textColor }}
-          >
-            {item.text}
-          </span>
+          item.disabled && item.disabledTip ? (
+            <Tooltip content={item.disabledTip} position='right'>
+              {textNode}
+            </Tooltip>
+          ) : (
+            textNode
+          )
         }
         icon={
           <div className='sidebar-icon-container flex-shrink-0'>
@@ -424,8 +452,9 @@ const SiderBar = ({ onNavigate = () => {} }) => {
             const to =
               routerMapState[props.itemKey] || routerMap[props.itemKey];
 
-            // 如果没有路由，直接返回元素
-            if (!to) return itemElement;
+            // 没有路由或该项被置灰时，不包裹 Link（不可导航）
+            if (!to || disabledItemKeys.includes(props.itemKey))
+              return itemElement;
 
             return (
               <Link

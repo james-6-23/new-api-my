@@ -221,6 +221,10 @@ func InitLogDB() (err error) {
 			db = db.Debug()
 		}
 		LOG_DB = db
+		// A dedicated conversation-log database is now in use; enable the
+		// conversation-log feature (capture + APIs + UI). Without LOG_SQL_DSN the
+		// function above returns early with LOG_DB = DB and this stays false.
+		common.ConversationLogStoreConfigured = true
 		// If log DB is MySQL, also ensure Chinese-capable charset
 		if common.LogSqlType == common.DatabaseTypeMySQL {
 			if err := checkMySQLChineseSupport(LOG_DB); err != nil {
