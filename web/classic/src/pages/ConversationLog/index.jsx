@@ -303,6 +303,7 @@ const ConversationLog = () => {
   const [tableLoading, setTableLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [captureSaving, setCaptureSaving] = useState(false);
+  const [diskSpaceRefreshing, setDiskSpaceRefreshing] = useState(false);
   const [s3Testing, setS3Testing] = useState(false);
   const [s3RotationStatusLoading, setS3RotationStatusLoading] = useState(false);
   const [s3RotationStatus, setS3RotationStatus] = useState(null);
@@ -485,6 +486,33 @@ const ConversationLog = () => {
       showError(error.message || t('刷新失败'));
     } finally {
       setSummaryLoading(false);
+    }
+  };
+
+  const refreshDiskSpace = async () => {
+    setDiskSpaceRefreshing(true);
+    try {
+      const summaryRes = await API.get('/api/conversation_logs/summary', {
+        disableDuplicate: true,
+      });
+      if (summaryRes.data.success) {
+        const payload = summaryRes.data.data || {};
+        const bounds = payload.export_batch_size_bounds || {};
+        setSummary(payload.summary);
+        setDiskSpace(payload.disk_space || null);
+        setBatchRecommendationHint(payload.export_batch_recommendation || null);
+        setBatchSizeBounds({
+          min: Number(bounds.min || defaultBatchSizeBounds.min),
+          max: Number(bounds.max || defaultBatchSizeBounds.max),
+        });
+        showSuccess(t('刷新成功'));
+      } else {
+        showError(summaryRes.data.message);
+      }
+    } catch (error) {
+      showError(error.message || t('刷新失败'));
+    } finally {
+      setDiskSpaceRefreshing(false);
     }
   };
 
@@ -1650,21 +1678,31 @@ const ConversationLog = () => {
                       <div className='h-full pt-1'>
                         <div className='mb-2 flex items-center justify-between gap-2'>
                           <Text strong>{t('磁盘占用情况')}</Text>
-                          <Tag
-                            color={
-                              diskCapturePaused
-                                ? 'red'
+                          <Space spacing={4}>
+                            <Tag
+                              color={
+                                diskCapturePaused
+                                  ? 'red'
+                                  : diskPauseEnabled
+                                    ? 'green'
+                                    : 'grey'
+                              }
+                            >
+                              {diskCapturePaused
+                                ? t('暂停采集')
                                 : diskPauseEnabled
-                                  ? 'green'
-                                  : 'grey'
-                            }
-                          >
-                            {diskCapturePaused
-                              ? t('暂停采集')
-                              : diskPauseEnabled
-                                ? t('正常')
-                                : t('未启用')}
-                          </Tag>
+                                  ? t('正常')
+                                  : t('未启用')}
+                            </Tag>
+                            <Button
+                              size='small'
+                              icon={<IconRefresh />}
+                              loading={diskSpaceRefreshing}
+                              onClick={refreshDiskSpace}
+                            >
+                              {t('刷新')}
+                            </Button>
+                          </Space>
                         </div>
                         {diskSpaceAvailable ? (
                           <>

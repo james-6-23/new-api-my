@@ -599,6 +599,36 @@ func updateJobProgress(jobID string, fields map[string]interface{}) {
 	}
 }
 
+func updateJobDeleteProgress(jobID, label string, deleted, total int64) {
+	if total < 0 {
+		total = 0
+	}
+	if deleted < 0 {
+		deleted = 0
+	}
+	if total > 0 && deleted > total {
+		deleted = total
+	}
+	progress := strings.TrimSpace(label)
+	if progress == "" {
+		progress = "deleting source records"
+	}
+	if total > 0 {
+		percent := float64(deleted) / float64(total) * 100
+		if percent > 100 {
+			percent = 100
+		}
+		progress = fmt.Sprintf("%s: %d/%d (%.1f%%)", progress, deleted, total, percent)
+	} else {
+		progress = fmt.Sprintf("%s: %d deleted", progress, deleted)
+	}
+	updateJobProgress(jobID, map[string]interface{}{
+		"deleted_records":      deleted,
+		"delete_total_records": total,
+		"progress":             progress,
+	})
+}
+
 func conversationExportValidQuery(query model.ConversationLogQuery) (model.ConversationLogQuery, bool) {
 	if query.ValidationStatus != "" && query.ValidationStatus != ConversationValidationValid {
 		return query, false
@@ -802,10 +832,11 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	}
 
 	if job.DeleteAfterExport && deleteExpected > 0 {
-		updateJobProgress(job.JobId, map[string]interface{}{
-			"progress": "deleting processed source records",
+		deleteProgressLabel := "deleting processed source records"
+		updateJobDeleteProgress(job.JobId, deleteProgressLabel, 0, deleteExpected)
+		deleted, err := model.DeleteConversationLogsByExportBatchIDWithProgress(ctx, job.JobId, exportDeleteBatchSize(), func(deleted int64) {
+			updateJobDeleteProgress(job.JobId, deleteProgressLabel, deleted, deleteExpected)
 		})
-		deleted, err := model.DeleteConversationLogsByExportBatchID(ctx, job.JobId, exportDeleteBatchSize())
 		if err != nil {
 			return fmt.Errorf("delete exported conversation logs after manifest: %w", err)
 		}

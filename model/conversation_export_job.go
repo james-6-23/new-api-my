@@ -36,17 +36,19 @@ type ConversationExportJob struct {
 	Progress     string `json:"progress" gorm:"type:varchar(255);default:''"`
 	ErrorMessage string `json:"error_message,omitempty" gorm:"type:text"`
 
-	TotalRecords      int64  `json:"total_records" gorm:"bigint;default:0"`
-	ExportedRecords   int64  `json:"exported_records" gorm:"bigint;default:0"`
-	TotalSessions     int64  `json:"total_sessions" gorm:"bigint;default:0"`
-	ExportedSessions  int64  `json:"exported_sessions" gorm:"bigint;default:0"`
-	SnapshotMaxID     int    `json:"snapshot_max_id" gorm:"default:0"`
-	ScanPositionID    int    `json:"scan_position_id" gorm:"default:0"`
-	ScannedRecords    int64  `json:"scanned_records" gorm:"bigint;default:0"`
-	UncompressedBytes int64  `json:"uncompressed_bytes" gorm:"bigint;default:0"`
-	CompressedBytes   int64  `json:"compressed_bytes" gorm:"bigint;default:0"`
-	ShardCount        int    `json:"shard_count" gorm:"default:0"`
-	QualityReportJSON string `json:"quality_report_json,omitempty" gorm:"type:text"`
+	TotalRecords       int64  `json:"total_records" gorm:"bigint;default:0"`
+	ExportedRecords    int64  `json:"exported_records" gorm:"bigint;default:0"`
+	TotalSessions      int64  `json:"total_sessions" gorm:"bigint;default:0"`
+	ExportedSessions   int64  `json:"exported_sessions" gorm:"bigint;default:0"`
+	SnapshotMaxID      int    `json:"snapshot_max_id" gorm:"default:0"`
+	ScanPositionID     int    `json:"scan_position_id" gorm:"default:0"`
+	ScannedRecords     int64  `json:"scanned_records" gorm:"bigint;default:0"`
+	DeleteTotalRecords int64  `json:"delete_total_records" gorm:"bigint;default:0"`
+	DeletedRecords     int64  `json:"deleted_records" gorm:"bigint;default:0"`
+	UncompressedBytes  int64  `json:"uncompressed_bytes" gorm:"bigint;default:0"`
+	CompressedBytes    int64  `json:"compressed_bytes" gorm:"bigint;default:0"`
+	ShardCount         int    `json:"shard_count" gorm:"default:0"`
+	QualityReportJSON  string `json:"quality_report_json,omitempty" gorm:"type:text"`
 
 	ManifestPath    string `json:"manifest_path" gorm:"type:text"`
 	OutputDirectory string `json:"output_directory" gorm:"type:text"`

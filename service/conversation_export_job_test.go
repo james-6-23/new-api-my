@@ -403,6 +403,37 @@ func TestSessionProcessedSourceIDsAllowDeletingRejectedSessionRows(t *testing.T)
 	require.EqualValues(t, 0, remaining)
 }
 
+func TestDeleteConversationLogsByExportBatchIDReportsProgress(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	now := int64(1710000000)
+	ids := make([]int, 0, 5)
+	for i := 1; i <= 5; i++ {
+		log := &model.ConversationLog{
+			CreatedAt:        now + int64(i),
+			SessionId:        "sess_delete_progress",
+			Provider:         "openai",
+			RequestPath:      "/v1/chat/completions",
+			RequestBody:      `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`,
+			ResponseBody:     `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+			RequestTime:      now + int64(i),
+			ResponseTime:     now + int64(i) + 1,
+			ValidationStatus: ConversationValidationValid,
+		}
+		require.NoError(t, model.CreateConversationLog(log))
+		ids = append(ids, log.Id)
+	}
+	require.NoError(t, model.MarkConversationLogsExported(ids, "job-delete-progress", now))
+
+	var updates []int64
+	deleted, err := model.DeleteConversationLogsByExportBatchIDWithProgress(context.Background(), "job-delete-progress", 2, func(deleted int64) {
+		updates = append(updates, deleted)
+	})
+
+	require.NoError(t, err)
+	require.EqualValues(t, 5, deleted)
+	require.Equal(t, []int64{2, 4, 5}, updates)
+}
+
 func TestAutoExportDeleteAfterRemovesInvalidRowsInScope(t *testing.T) {
 	setupConversationExportJobTestDB(t)
 	requestBody := `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`

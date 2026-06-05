@@ -303,6 +303,21 @@ function QualityReportPanel({ job, t }) {
 function computeJobPercent(job) {
   if (!job) return 0;
   if (job.status === 'completed') return 100;
+  const progressText = String(job.progress || '').toLowerCase();
+  if (
+    job.status === 'running' &&
+    progressText.includes('deleting') &&
+    Number(job.delete_total_records || 0) > 0
+  ) {
+    return Math.min(
+      99,
+      Math.round(
+        (Number(job.deleted_records || 0) /
+          Number(job.delete_total_records || 1)) *
+          100,
+      ),
+    );
+  }
   if (job.status === 'failed' || job.status === 'cancelled') {
     if (job.total_records > 0 && job.exported_records > 0) {
       return Math.min(
@@ -885,6 +900,13 @@ const ExportJobs = ({
                 { key: t('状态'), value: statusTag(detail.status, t) },
                 { key: t('进度'), value: detail.progress || '-' },
                 { key: t('记录数'), value: detail.exported_records },
+                {
+                  key: t('删除进度'),
+                  value:
+                    detail.delete_total_records > 0
+                      ? `${formatInteger(detail.deleted_records)} / ${formatInteger(detail.delete_total_records)}`
+                      : '-',
+                },
                 { key: t('会话数'), value: detail.exported_sessions },
                 {
                   key: t('原始/压缩'),

@@ -648,7 +648,13 @@ func DeleteConversationLogsByIDs(ids []int) (int64, error) {
 	return result.RowsAffected, result.Error
 }
 
+type ConversationLogDeleteProgressFunc func(deleted int64)
+
 func DeleteConversationLogsByExportBatchID(ctx context.Context, batchID string, batchSize int) (int64, error) {
+	return DeleteConversationLogsByExportBatchIDWithProgress(ctx, batchID, batchSize, nil)
+}
+
+func DeleteConversationLogsByExportBatchIDWithProgress(ctx context.Context, batchID string, batchSize int, onProgress ConversationLogDeleteProgressFunc) (int64, error) {
 	batchID = strings.TrimSpace(batchID)
 	if batchID == "" {
 		return 0, nil
@@ -688,6 +694,9 @@ func DeleteConversationLogsByExportBatchID(ctx context.Context, batchID string, 
 			return total, err
 		}
 		total += rows
+		if onProgress != nil {
+			onProgress(total)
+		}
 	}
 }
 
