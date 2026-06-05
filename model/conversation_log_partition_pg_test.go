@@ -227,6 +227,29 @@ func TestPartitionIntegration(t *testing.T) {
 	}
 	t.Logf("chart OK: status(exp=%d pend=%d inv=%d) providers=%d models=%d hours=%d",
 		exported, pending, invalid, len(chart.ByProvider), len(chart.ByModel), len(chart.ByHour))
+
+	// 11) Closed loop for the no-data-loss guarantee: old2 is old enough to drop
+	//     but was protected at step 6 because it held a valid+unexported row.
+	//     Once that row is exported, the same drop call removes it. This proves
+	//     retain-time alone never deletes un-exported data — the export mark is
+	//     what unlocks the drop.
+	var old2Present bool
+	db.Raw(`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = ?)`, partitionNameForStart(old2)).Scan(&old2Present)
+	if !old2Present {
+		t.Fatal("precondition: old2 should still exist before export")
+	}
+	if err := db.Exec("UPDATE conversation_logs SET exported_at = ? WHERE created_at >= ? AND created_at < ?",
+		now, old2, old2+3600).Error; err != nil {
+		t.Fatalf("mark old2 exported: %v", err)
+	}
+	if _, err := DropExportedConversationLogPartitions(context.Background(), cutoff, "valid"); err != nil {
+		t.Fatalf("DropExportedConversationLogPartitions(after export): %v", err)
+	}
+	db.Raw(`SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = ?)`, partitionNameForStart(old2)).Scan(&old2Present)
+	if old2Present {
+		t.Fatal("after its rows were exported, the old partition should now be dropped")
+	}
+	t.Log("closed loop OK: protected while unexported, dropped only after export")
 }
 
 func mustExec(t *testing.T, db *gorm.DB, sql string) {
