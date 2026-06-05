@@ -28,6 +28,11 @@ services:
     environment:
       - SQL_DSN=postgresql://root:123456@postgres:5432/new-api # ⚠️ IMPORTANT: Change the password in production!
 #      - SQL_DSN=root:123456@tcp(mysql:3306)/new-api  # Point to the mysql service, uncomment if using MySQL
+      # 会话日志专用数据库 (Dedicated conversation-log database).
+      # 配置此项后“会话日志”功能才会启用（数据采集 + 接口 + 前端入口）；
+      # 删除此行连同下方的 conversation-log-db 服务，即可彻底关闭会话日志功能。
+      # 隔离到独立库后，日志的清理/膨胀/回收都不会影响主数据库。
+      - LOG_SQL_DSN=postgresql://root:123456@conversation-log-db:5432/conversation_log # ⚠️ IMPORTANT: Change the password in production!
       - REDIS_CONN_STRING=redis://:123456@redis:6379 # ⚠️ IMPORTANT: Change the password in production!
       - TZ=Asia/Shanghai
       - ERROR_LOG_ENABLED=true # 是否启用错误日志记录 (Whether to enable error log recording)
@@ -43,6 +48,7 @@ services:
     depends_on:
       - redis
       - postgres
+      - conversation-log-db  # 会话日志专用库；不需要会话日志功能时可连同 LOG_SQL_DSN 一起删除
 #      - mysql  # Uncomment if using MySQL
     networks:
       - new-api-network
@@ -75,6 +81,25 @@ services:
 #    ports:
 #      - "5432:5432"  # Uncomment if you need to access PostgreSQL from outside Docker
 
+  # 会话日志专用数据库 (Dedicated conversation-log database).
+  # 仅供 new-api 内部通过 LOG_SQL_DSN 访问，故意不开放端口（无 ports）。
+  # 会话日志的写入、清理、膨胀回收全部在此库进行，与主库完全隔离，
+  # 因此清理/删除/重建会话日志数据不会影响主程序。
+  # 不需要会话日志功能时，删除本服务并移除上面的 LOG_SQL_DSN 即可。
+  conversation-log-db:
+    image: postgres:15
+    container_name: conversation-log-db
+    restart: always
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: 123456  # ⚠️ IMPORTANT: Change this password in production!
+      POSTGRES_DB: conversation_log
+    volumes:
+      - conversation_log_data:/var/lib/postgresql/data
+    networks:
+      - new-api-network
+    # 故意不暴露 ports：该库只在 docker 内网被 new-api 访问
+
 #  mysql:
 #    image: mysql:8.2
 #    container_name: mysql
@@ -91,6 +116,7 @@ services:
 
 volumes:
   pg_data:
+  conversation_log_data:  # 会话日志专用库数据卷；删除会话日志功能时可一并移除
 #  mysql_data:
 
 networks:

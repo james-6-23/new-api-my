@@ -211,6 +211,7 @@ func SetApiRouter(router *gin.Engine) {
 		}
 		conversationLogRoute := apiRouter.Group("/conversation_logs")
 		conversationLogRoute.Use(middleware.RootAuth())
+		conversationLogRoute.Use(middleware.RequireConversationLogStore())
 		{
 			conversationLogRoute.GET("/summary", controller.GetConversationLogSummary)
 			conversationLogRoute.GET("/export_summary", controller.GetConversationLogExportSummary)

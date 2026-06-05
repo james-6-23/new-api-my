@@ -35,6 +35,9 @@ func recordConversationLog(ctx *gin.Context, log *model.ConversationLog) {
 	if log == nil {
 		return
 	}
+	if !common.ConversationLogStoreConfigured {
+		return
+	}
 	setting := conversation_log_setting.GetSetting()
 	if !setting.CaptureEnabled || conversationCapturePausedByDisk(setting) {
 		return

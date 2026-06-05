@@ -172,6 +172,9 @@ func BuildConversationLogDiskSpaceStatus(setting conversation_log_setting.Conver
 }
 
 func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
+	if !common.ConversationLogStoreConfigured {
+		return
+	}
 	if c == nil || relayInfo == nil || relayInfo.ChannelMeta == nil {
 		return
 	}
