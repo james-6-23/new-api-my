@@ -724,6 +724,23 @@ func TestNormalizeConversationSessionIDHashesOversizedValues(t *testing.T) {
 	require.True(t, strings.HasPrefix(sessionID, "hash_"))
 }
 
+func TestBuildConversationLogDiskSpaceStatusReportsConfiguredPath(t *testing.T) {
+	path := t.TempDir()
+
+	status := BuildConversationLogDiskSpaceStatus(conversation_log_setting.ConversationLogSetting{
+		CapturePauseDiskPath:   path,
+		CapturePauseDiskUsedGB: 1048576,
+	})
+
+	require.Equal(t, path, status.Path)
+	require.True(t, status.Available)
+	require.Greater(t, status.Total, uint64(0))
+	require.GreaterOrEqual(t, status.UsedPercent, float64(0))
+	require.Equal(t, 1048576, status.PauseThresholdGB)
+	require.Equal(t, uint64(1048576)<<30, status.PauseThresholdBytes)
+	require.False(t, status.CapturePaused)
+}
+
 func validConversationLog(id int, sessionID string, provider string, requestBody string, responseBody string) *model.ConversationLog {
 	return &model.ConversationLog{
 		Id:           id,

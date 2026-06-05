@@ -96,6 +96,18 @@ type ConversationExportSummary struct {
 	SubsequenceRemovedCount      int64            `json:"subsequence_removed_count"`
 }
 
+type ConversationLogDiskSpaceStatus struct {
+	Path                string  `json:"path"`
+	Available           bool    `json:"available"`
+	Total               uint64  `json:"total"`
+	Free                uint64  `json:"free"`
+	Used                uint64  `json:"used"`
+	UsedPercent         float64 `json:"used_percent"`
+	PauseThresholdGB    int     `json:"pause_threshold_gb"`
+	PauseThresholdBytes uint64  `json:"pause_threshold_bytes"`
+	CapturePaused       bool    `json:"capture_paused"`
+}
+
 type sessionCandidate struct {
 	Trajectory      SessionTrajectory
 	RecordIDs       []int
@@ -129,6 +141,36 @@ var (
 	conversationCaptureDiskPauseLastLog atomic.Int64
 )
 
+func BuildConversationLogDiskSpaceStatus(setting conversation_log_setting.ConversationLogSetting) ConversationLogDiskSpaceStatus {
+	path := strings.TrimSpace(setting.CapturePauseDiskPath)
+	if path == "" {
+		path = "/"
+	}
+	thresholdGB := setting.CapturePauseDiskUsedGB
+	if thresholdGB < 0 {
+		thresholdGB = 0
+	}
+	status := ConversationLogDiskSpaceStatus{
+		Path:             path,
+		PauseThresholdGB: thresholdGB,
+	}
+	if thresholdGB > 0 {
+		status.PauseThresholdBytes = uint64(thresholdGB) << 30
+	}
+
+	info := common.GetDiskSpaceInfoForPath(path)
+	if info.Total == 0 {
+		return status
+	}
+	status.Available = true
+	status.Total = info.Total
+	status.Free = info.Free
+	status.Used = info.Used
+	status.UsedPercent = info.UsedPercent
+	status.CapturePaused = status.PauseThresholdBytes > 0 && status.Used > status.PauseThresholdBytes
+	return status
+}
+
 func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
 	if c == nil || relayInfo == nil || relayInfo.ChannelMeta == nil {
 		return
@@ -160,12 +202,8 @@ func conversationCapturePausedByDisk(setting conversation_log_setting.Conversati
 	if setting.CapturePauseDiskUsedGB <= 0 {
 		return false
 	}
-	info := common.GetDiskSpaceInfoForPath(setting.CapturePauseDiskPath)
-	if info.Total == 0 {
-		return false
-	}
-	thresholdBytes := uint64(setting.CapturePauseDiskUsedGB) << 30
-	if info.Used <= thresholdBytes {
+	status := BuildConversationLogDiskSpaceStatus(setting)
+	if !status.CapturePaused {
 		return false
 	}
 
@@ -174,9 +212,9 @@ func conversationCapturePausedByDisk(setting conversation_log_setting.Conversati
 	if now-last >= 60 && conversationCaptureDiskPauseLastLog.CompareAndSwap(last, now) {
 		common.SysLog(fmt.Sprintf(
 			"conversation capture paused: disk used %.2f GiB exceeds threshold %d GiB on %s",
-			float64(info.Used)/(1<<30),
-			setting.CapturePauseDiskUsedGB,
-			setting.CapturePauseDiskPath,
+			float64(status.Used)/(1<<30),
+			status.PauseThresholdGB,
+			status.Path,
 		))
 	}
 	return true

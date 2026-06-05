@@ -40,9 +40,11 @@ func GetConversationLogSummary(c *gin.Context) {
 		return
 	}
 	minBatch, maxBatch := conversation_log_setting.ExportBatchSizeBounds()
+	setting := conversation_log_setting.GetSetting()
 	common.ApiSuccess(c, gin.H{
 		"summary":                     summary,
-		"settings":                    conversation_log_setting.GetSetting(),
+		"settings":                    setting,
+		"disk_space":                  service.BuildConversationLogDiskSpaceStatus(setting),
 		"export_batch_recommendation": service.BuildConversationExportBatchRecommendation(summary),
 		"export_batch_size_bounds": gin.H{
 			"min": minBatch,

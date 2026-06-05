@@ -26,6 +26,7 @@ import {
   Empty,
   Form,
   Modal,
+  Progress,
   Row,
   Space,
   Spin,
@@ -310,6 +311,7 @@ const ConversationLog = () => {
   const [mode, setMode] = useState('api_hijack_jsonl');
   const [settings, setSettings] = useState(defaultSettings);
   const [summary, setSummary] = useState(null);
+  const [diskSpace, setDiskSpace] = useState(null);
   const [batchRecommendationHint, setBatchRecommendationHint] = useState(null);
   const [batchSizeBounds, setBatchSizeBounds] = useState(
     defaultBatchSizeBounds,
@@ -369,6 +371,16 @@ const ConversationLog = () => {
     currentBatchSettings.scan === batchRecommendation.scan &&
     currentBatchSettings.mark === batchRecommendation.mark &&
     currentBatchSettings.delete === batchRecommendation.delete;
+  const diskSpaceAvailable =
+    diskSpace?.available === true && Number(diskSpace?.total || 0) > 0;
+  const diskSpaceUsedPercent = diskSpaceAvailable
+    ? Math.min(100, Math.max(0, Number(diskSpace?.used_percent || 0)))
+    : 0;
+  const diskPauseThresholdGB = Number(
+    diskSpace?.pause_threshold_gb ?? settings.capture_pause_disk_used_gb ?? 0,
+  );
+  const diskPauseEnabled = diskPauseThresholdGB > 0;
+  const diskCapturePaused = diskSpace?.capture_paused === true;
 
   const getFilterParams = () =>
     normalizeFilterParams(filterFormRef.current?.getValues() || {});
@@ -444,6 +456,7 @@ const ConversationLog = () => {
         };
         const bounds = payload.export_batch_size_bounds || {};
         setSummary(payload.summary);
+        setDiskSpace(payload.disk_space || null);
         setBatchRecommendationHint(payload.export_batch_recommendation || null);
         setBatchSizeBounds({
           min: Number(bounds.min || defaultBatchSizeBounds.min),
@@ -1632,6 +1645,67 @@ const ConversationLog = () => {
                           })
                         }
                       />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <div className='h-full pt-1'>
+                        <div className='mb-2 flex items-center justify-between gap-2'>
+                          <Text strong>{t('磁盘占用情况')}</Text>
+                          <Tag
+                            color={
+                              diskCapturePaused
+                                ? 'red'
+                                : diskPauseEnabled
+                                  ? 'green'
+                                  : 'grey'
+                            }
+                          >
+                            {diskCapturePaused
+                              ? t('暂停采集')
+                              : diskPauseEnabled
+                                ? t('正常')
+                                : t('未启用')}
+                          </Tag>
+                        </div>
+                        {diskSpaceAvailable ? (
+                          <>
+                            <Progress
+                              percent={Number(diskSpaceUsedPercent.toFixed(1))}
+                              showInfo
+                              stroke={
+                                diskCapturePaused || diskSpaceUsedPercent >= 90
+                                  ? 'var(--semi-color-danger)'
+                                  : diskSpaceUsedPercent >= 70
+                                    ? 'var(--semi-color-warning)'
+                                    : 'var(--semi-color-success)'
+                              }
+                            />
+                            <div className='mt-2 flex flex-wrap gap-x-3 gap-y-1'>
+                              <Text type='tertiary' size='small'>
+                                {t('已用')}: {formatBytes(diskSpace.used)}
+                              </Text>
+                              <Text type='tertiary' size='small'>
+                                {t('可用')}: {formatBytes(diskSpace.free)}
+                              </Text>
+                              <Text type='tertiary' size='small'>
+                                {t('总计')}: {formatBytes(diskSpace.total)}
+                              </Text>
+                            </div>
+                            {diskPauseEnabled ? (
+                              <Text
+                                type={diskCapturePaused ? 'danger' : 'tertiary'}
+                                size='small'
+                                className='mt-2 block'
+                              >
+                                {t('暂停阈值')}: {diskPauseThresholdGB} GB
+                              </Text>
+                            ) : null}
+                          </>
+                        ) : (
+                          <Text type='tertiary' size='small'>
+                            {t('无法读取磁盘占用')}
+                          </Text>
+                        )}
+                      </div>
                     </Col>
                   </Row>
                   <Row gutter={16} className='mt-2'>
