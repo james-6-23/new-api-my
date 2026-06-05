@@ -196,6 +196,37 @@ func TestPartitionIntegration(t *testing.T) {
 	t.Logf("monitor OK: partitions=%d future=%d pending=%d oldestAge=%ds ingest=%.3f/s export=%.3f/s keepingUp=%v",
 		stats.PartitionCount, stats.FuturePartitionCount, stats.PendingExportRecords,
 		stats.OldestPendingAgeSeconds, stats.IngestRatePerSec, stats.ExportRatePerSec, stats.ExportKeepingUp)
+
+	// 10) Chart aggregations must run on the partitioned table and be correct.
+	// Remaining rows after the drops above: rows[0] now(valid, marked exported in
+	// step 4), rows[1] now(valid, exported), old2(valid, unexported).
+	// → exported=2, pending_valid=1, invalid=0.
+	chart, err := GetConversationLogChartStats("valid", 365*24*3600, 15)
+	if err != nil {
+		t.Fatalf("GetConversationLogChartStats: %v", err)
+	}
+	var exported, pending, invalid int64
+	for _, d := range chart.ExportStatus {
+		switch d.Name {
+		case "exported":
+			exported = d.Value
+		case "pending_valid":
+			pending = d.Value
+		case "invalid":
+			invalid = d.Value
+		}
+	}
+	if exported != 2 || pending != 1 || invalid != 0 {
+		t.Fatalf("chart export_status: exported=%d pending=%d invalid=%d, want 2/1/0", exported, pending, invalid)
+	}
+	if len(chart.ByProvider) == 0 {
+		t.Fatal("chart by_provider should not be empty")
+	}
+	if len(chart.ByHour) == 0 {
+		t.Fatal("chart by_hour should not be empty")
+	}
+	t.Logf("chart OK: status(exp=%d pend=%d inv=%d) providers=%d models=%d hours=%d",
+		exported, pending, invalid, len(chart.ByProvider), len(chart.ByModel), len(chart.ByHour))
 }
 
 func mustExec(t *testing.T, db *gorm.DB, sql string) {

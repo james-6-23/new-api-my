@@ -70,6 +70,22 @@ func GetConversationLogMonitorStats(c *gin.Context) {
 	common.ApiSuccess(c, stats)
 }
 
+// GetConversationLogChartStats returns aggregations for the UI charts:
+// export-status breakdown, by-provider / by-model distribution, and per-hour
+// volume, scoped to a recent window (?days=, default 7) to bound the scan.
+func GetConversationLogChartStats(c *gin.Context) {
+	days := int64(7)
+	if v, err := strconv.ParseInt(strings.TrimSpace(c.Query("days")), 10, 64); err == nil && v > 0 {
+		days = v
+	}
+	stats, err := model.GetConversationLogChartStats(service.ConversationValidationValid, days*24*3600, 15)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, stats)
+}
+
 func GetConversationLogExportSummary(c *gin.Context) {
 	mode := conversationLogMode(c.Query("mode"))
 	exportSummary, err := service.BuildConversationLogExportSummaryCached(c.Request.Context(), parseConversationLogQuery(c), mode)

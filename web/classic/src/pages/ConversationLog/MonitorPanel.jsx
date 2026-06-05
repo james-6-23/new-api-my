@@ -21,10 +21,13 @@ import {
   Typography,
 } from '@douyinfe/semi-ui';
 import { IconRefresh } from '@douyinfe/semi-icons';
+import { VChart } from '@visactor/react-vchart';
 import { useTranslation } from 'react-i18next';
-import { API, showError } from '../../helpers';
+import { API, showError, timestamp2string } from '../../helpers';
 
 const { Text, Title } = Typography;
+
+const VCHART_OPTION = { mode: 'desktop-browser' };
 
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
@@ -59,6 +62,7 @@ const AUTO_REFRESH_MS = 30000;
 export default function MonitorPanel() {
   const { t } = useTranslation();
   const [stats, setStats] = useState(null);
+  const [charts, setCharts] = useState(null);
   const [loading, setLoading] = useState(false);
   const timerRef = useRef(null);
 
@@ -73,6 +77,13 @@ export default function MonitorPanel() {
         setStats(res.data.data || null);
       } else if (showSpinner) {
         showError(res.data.message);
+      }
+      const chartRes = await API.get(
+        '/api/conversation_logs/chart_stats?days=7',
+        { disableDuplicate: true },
+      );
+      if (chartRes.data.success) {
+        setCharts(chartRes.data.data || null);
       }
     } catch (error) {
       if (showSpinner) showError(error.message || t('刷新失败'));
@@ -136,6 +147,7 @@ export default function MonitorPanel() {
           )}
         </Text>
         <ThroughputBlock t={t} stats={stats} />
+        <ChartsSection t={t} charts={charts} />
       </Card>
     );
   }
@@ -208,7 +220,101 @@ export default function MonitorPanel() {
           </Text>
         )}
       </Spin>
+      <ChartsSection t={t} charts={charts} />
     </Card>
+  );
+}
+
+// ChartsSection renders the export-status pie, provider/model bars, and the
+// per-hour volume bar from /chart_stats (last 7 days).
+function ChartsSection({ t, charts }) {
+  if (!charts) return null;
+
+  const statusLabel = {
+    exported: t('已导出'),
+    pending_valid: t('待导出'),
+    invalid: t('无效'),
+  };
+  const statusValues = (charts.export_status || [])
+    .filter((d) => Number(d.value) > 0)
+    .map((d) => ({ type: statusLabel[d.name] || d.name, value: Number(d.value) }));
+
+  const providerValues = (charts.by_provider || []).map((d) => ({
+    type: d.name || t('未知'),
+    value: Number(d.value),
+  }));
+  const modelValues = (charts.by_model || []).map((d) => ({
+    type: d.name || t('未知'),
+    value: Number(d.value),
+  }));
+  const hourValues = (charts.by_hour || []).map((d) => ({
+    time: timestamp2string(d.hour_start).slice(5, 16), // MM-DD HH:mm
+    records: Number(d.records),
+  }));
+
+  const pieSpec = {
+    type: 'pie',
+    data: [{ id: 'status', values: statusValues }],
+    valueField: 'value',
+    categoryField: 'type',
+    outerRadius: 0.8,
+    innerRadius: 0.5,
+    legends: { visible: true, orient: 'bottom' },
+    title: { visible: true, text: t('导出状态占比') },
+    tooltip: { mark: { content: [{ key: (d) => d.type, value: (d) => d.value }] } },
+  };
+  const barSpec = (values, title) => ({
+    type: 'bar',
+    data: [{ id: 'd', values }],
+    xField: 'type',
+    yField: 'value',
+    title: { visible: true, text: title },
+    axes: [{ orient: 'bottom', label: { autoRotate: true, autoLimit: true } }],
+  });
+  const hourSpec = {
+    type: 'bar',
+    data: [{ id: 'h', values: hourValues }],
+    xField: 'time',
+    yField: 'records',
+    title: { visible: true, text: t('各小时记录量(近7天)') },
+    axes: [{ orient: 'bottom', label: { autoRotate: true, autoLimit: true } }],
+  };
+
+  return (
+    <Row gutter={16} className='mt-4'>
+      <Col xs={24} md={8}>
+        <div className='h-64'>
+          {statusValues.length > 0 ? (
+            <VChart spec={pieSpec} option={VCHART_OPTION} />
+          ) : (
+            <Text type='tertiary' size='small'>
+              {t('暂无数据')}
+            </Text>
+          )}
+        </div>
+      </Col>
+      <Col xs={24} md={8}>
+        <div className='h-64'>
+          <VChart
+            spec={barSpec(providerValues, t('按 Provider 分布'))}
+            option={VCHART_OPTION}
+          />
+        </div>
+      </Col>
+      <Col xs={24} md={8}>
+        <div className='h-64'>
+          <VChart
+            spec={barSpec(modelValues, t('按模型分布(Top 15)'))}
+            option={VCHART_OPTION}
+          />
+        </div>
+      </Col>
+      <Col xs={24}>
+        <div className='h-64'>
+          <VChart spec={hourSpec} option={VCHART_OPTION} />
+        </div>
+      </Col>
+    </Row>
   );
 }
 
