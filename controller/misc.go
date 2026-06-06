@@ -229,6 +229,17 @@ func GetHomePageContent(c *gin.Context) {
 	return
 }
 
+func SendRegistrationEmailVerification(c *gin.Context) {
+	if !common.RegisterEnabled || !common.PasswordRegisterEnabled || !common.EmailVerificationEnabled {
+		c.JSON(http.StatusOK, gin.H{
+			"success": false,
+			"message": "邮箱验证码发送未启用",
+		})
+		return
+	}
+	SendEmailVerification(c)
+}
+
 func SendEmailVerification(c *gin.Context) {
 	email := c.Query("email")
 	if err := common.Validate.Var(email, "required,email"); err != nil {

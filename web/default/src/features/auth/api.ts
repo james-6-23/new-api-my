@@ -26,6 +26,16 @@ import type {
   ApiResponse,
 } from './types'
 
+function getTurnstileParams(turnstile?: string) {
+  return turnstile ? { turnstile } : undefined
+}
+
+function getEmailVerificationParams(email: string, turnstile?: string) {
+  const params: { email: string; turnstile?: string } = { email }
+  if (turnstile) params.turnstile = turnstile
+  return params
+}
+
 // ============================================================================
 // Authentication APIs
 // ============================================================================
@@ -36,13 +46,13 @@ import type {
 
 // User login with username and password
 export async function login(payload: LoginPayload) {
-  const turnstile = payload.turnstile ?? ''
   const res = await api.post<LoginResponse>(
-    `/api/user/login?turnstile=${turnstile}`,
+    '/api/user/login',
     {
       username: payload.username,
       password: payload.password,
-    }
+    },
+    { params: getTurnstileParams(payload.turnstile) }
   )
   return res.data
 }
@@ -69,7 +79,7 @@ export async function sendPasswordResetEmail(
   turnstile?: string
 ): Promise<ApiResponse> {
   const res = await api.get('/api/reset_password', {
-    params: { email, turnstile },
+    params: getEmailVerificationParams(email, turnstile),
   })
   return res.data
 }
@@ -105,8 +115,9 @@ export async function wechatLoginByCode(code: string): Promise<ApiResponse> {
 
 // User registration
 export async function register(payload: RegisterPayload): Promise<ApiResponse> {
-  const res = await api.post(`/api/user/register`, payload, {
-    params: { turnstile: payload.turnstile ?? '' },
+  const { turnstile, ...body } = payload
+  const res = await api.post(`/api/user/register`, body, {
+    params: getTurnstileParams(turnstile),
   })
   return res.data
 }
@@ -117,7 +128,7 @@ export async function sendEmailVerification(
   turnstile?: string
 ): Promise<ApiResponse> {
   const res = await api.get('/api/verification', {
-    params: { email, turnstile },
+    params: getEmailVerificationParams(email, turnstile),
   })
   return res.data
 }
