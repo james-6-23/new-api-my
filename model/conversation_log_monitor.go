@@ -115,3 +115,19 @@ func GetConversationLogMonitorStats(validStatus string, rateWindowSecs int64) (C
 
 	return stats, nil
 }
+
+// PendingExportStorageBytes returns the total storage_bytes of records still
+// pending export: valid (validStatus) and not yet exported (exported_at = 0).
+// This is the right trigger signal for auto-export — unlike the whole-table
+// StorageBytes it drops back down after a batch is exported. In partition mode
+// rows are no longer deleted, so total storage only grows and can't serve as a
+// watermark. Uses the exported_at/validation indexes, scanning only the
+// usually-small pending set.
+func PendingExportStorageBytes(validStatus string) (int64, error) {
+	var bytes int64
+	err := LOG_DB.Model(&ConversationLog{}).
+		Where("exported_at = 0 AND validation_status = ?", validStatus).
+		Select("COALESCE(SUM(storage_bytes), 0)").
+		Scan(&bytes).Error
+	return bytes, err
+}

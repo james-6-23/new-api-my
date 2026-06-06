@@ -57,12 +57,17 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		return
 	}
 
-	summary, err := model.GetConversationLogSummary()
+	// Trigger on the PENDING-export backlog (un-exported valid bytes), not the
+	// whole-table storage. Total storage no longer drops after export in
+	// partition mode (rows aren't deleted), so it would stay above any threshold
+	// and fire on every tick; the backlog falls back to 0 after each batch and
+	// restores the intended "export once enough has accumulated" behaviour.
+	pendingBytes, err := model.PendingExportStorageBytes(ConversationValidationValid)
 	if err != nil {
-		common.SysError("auto export: summary lookup failed: " + err.Error())
+		common.SysError("auto export: pending bytes lookup failed: " + err.Error())
 		return
 	}
-	if summary.StorageBytes < threshold {
+	if pendingBytes < threshold {
 		return
 	}
 
