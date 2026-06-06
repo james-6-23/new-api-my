@@ -120,6 +120,7 @@ const defaultSettings = {
   capture_max_bytes_per_request: 16 * MiB,
   partition_ahead_hours: 6,
   partition_retain_hours: 4,
+  exported_local_max_gb: 0,
 };
 
 const formInitValues = {
@@ -1890,6 +1891,24 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             partition_retain_hours: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='exported_local_max_gb'
+                        label={t('已导出数据本地上限')}
+                        min={0}
+                        step={1}
+                        suffix='GB'
+                        extraText={t(
+                          '仅分区模式生效：已导出数据(已在S3)本地累计超过此值就 DROP 最老的已导出分区。0=不启用,只靠保留小时+总水位',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            exported_local_max_gb: Number(value || 0),
                           })
                         }
                       />

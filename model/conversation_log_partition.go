@@ -335,3 +335,76 @@ func DropOldestExportedPartitionsToFitStorage(ctx context.Context, maxBytes int6
 	}
 	return dropped, nil
 }
+
+// DropOldestExportedPartitionsToFitExportedSize bounds how much already-exported
+// data lingers locally. Exported partitions are already safe in S3, so when the
+// on-disk size of fully-exported partitions exceeds maxBytes, the oldest are
+// dropped until back under it. More aggressive than the total-size watermark
+// (which also counts un-exported data). Same safety gate — only fully-exported
+// partitions are considered, so un-trained data is never deleted. PostgreSQL +
+// partitioning only. Returns the number dropped.
+func DropOldestExportedPartitionsToFitExportedSize(ctx context.Context, maxBytes int64, validStatus string) (int, error) {
+	if !conversationLogPartitioningActive() || maxBytes <= 0 {
+		return 0, nil
+	}
+	names, err := listConversationLogPartitions()
+	if err != nil {
+		return 0, err
+	}
+	type part struct {
+		name  string
+		start int64
+		size  int64
+	}
+	exported := make([]part, 0, len(names))
+	var exportedTotal int64
+	for _, n := range names {
+		start, ok := partitionStartFromName(n)
+		if !ok {
+			continue
+		}
+		// Only fully-exported partitions (no valid+unexported rows) count and
+		// are eligible to drop.
+		var pending int64
+		if err := LOG_DB.Raw(
+			fmt.Sprintf("SELECT count(*) FROM %s WHERE exported_at = 0 AND validation_status = ?", n),
+			validStatus,
+		).Scan(&pending).Error; err != nil {
+			return 0, fmt.Errorf("count pending-export in %s: %w", n, err)
+		}
+		if pending > 0 {
+			continue
+		}
+		var sz int64
+		if err := LOG_DB.Raw(fmt.Sprintf("SELECT pg_total_relation_size('%s')", n)).Scan(&sz).Error; err != nil {
+			return 0, err
+		}
+		exported = append(exported, part{name: n, start: start, size: sz})
+		exportedTotal += sz
+	}
+	if exportedTotal <= maxBytes {
+		return 0, nil
+	}
+	sort.Slice(exported, func(i, j int) bool { return exported[i].start < exported[j].start })
+
+	dropped := 0
+	for _, p := range exported {
+		if exportedTotal <= maxBytes {
+			break
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return dropped, err
+			}
+		}
+		if err := LOG_DB.Exec("DROP TABLE IF EXISTS " + p.name).Error; err != nil {
+			return dropped, fmt.Errorf("drop partition %s: %w", p.name, err)
+		}
+		exportedTotal -= p.size
+		dropped++
+	}
+	if dropped > 0 {
+		InvalidateConversationLogStatsCache()
+	}
+	return dropped, nil
+}

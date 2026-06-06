@@ -275,6 +275,24 @@ func TestPartitionIntegration(t *testing.T) {
 		t.Fatalf("watermark drop did not reduce partitions: before=%d after=%d", len(before), len(after))
 	}
 	t.Logf("watermark OK: dropped %d, partitions %d→%d", wdropped, len(before), len(after))
+
+	// 13) Exported-size cap: recreate several fully-exported old partitions, then
+	//     bound exported data to 1 byte — all fully-exported partitions drop.
+	for h := int64(400); h <= 403; h++ {
+		hs := partitionHourStart(now) - h*3600
+		mustExec(t, db, sprintfPartition(hs))
+		if err := db.Create(&ConversationLog{CreatedAt: hs + 1, RequestBody: "{}", ValidationStatus: "valid", ExportedAt: now}).Error; err != nil {
+			t.Fatalf("insert exported into %d: %v", hs, err)
+		}
+	}
+	edropped, err := DropOldestExportedPartitionsToFitExportedSize(context.Background(), 1, "valid")
+	if err != nil {
+		t.Fatalf("DropOldestExportedPartitionsToFitExportedSize: %v", err)
+	}
+	if edropped == 0 {
+		t.Fatal("exported-size cap should have dropped at least one exported partition")
+	}
+	t.Logf("exported-size cap OK: dropped %d", edropped)
 }
 
 func mustExec(t *testing.T, db *gorm.DB, sql string) {

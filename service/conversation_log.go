@@ -451,6 +451,17 @@ func runConversationLogPartitionMaintenance(ctx context.Context) {
 			common.SysLog(fmt.Sprintf("watermark: dropped %d oldest exported partition(s) to fit %dGB", dropped, setting.MaxStorageGB))
 		}
 	}
+	// 4. Exported-data local cap: exported partitions are already safe in S3, so
+	// bound how much of them lingers locally — drop the oldest exported ones once
+	// they exceed ExportedLocalMaxGB. More aggressive than the total watermark.
+	if setting.ExportedLocalMaxGB > 0 {
+		maxBytes := int64(setting.ExportedLocalMaxGB) << 30
+		if dropped, err := model.DropOldestExportedPartitionsToFitExportedSize(ctx, maxBytes, ConversationValidationValid); err != nil {
+			common.SysError("conversation log exported-size drop failed: " + err.Error())
+		} else if dropped > 0 {
+			common.SysLog(fmt.Sprintf("exported cap: dropped %d oldest exported partition(s) to fit %dGB exported", dropped, setting.ExportedLocalMaxGB))
+		}
+	}
 }
 
 // conversationLogVacuumFullLoop periodically reclaims disk space on the

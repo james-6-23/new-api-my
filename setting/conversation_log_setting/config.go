@@ -129,6 +129,14 @@ const (
 	defaultPartitionRetainHours = 4
 	minPartitionRetainHours     = 1
 	maxPartitionRetainHours     = 720 // 30 days
+
+	// Local retention cap for ALREADY-EXPORTED data (GB). Exported data is safe
+	// in S3, so this bounds how much of it lingers locally: when the on-disk
+	// size of fully-exported partitions exceeds it, the oldest exported
+	// partitions are dropped. More aggressive than the total-size watermark.
+	// 0 disables this trigger (rely on retain_hours + max_storage_gb).
+	minExportedLocalMaxGB = 0
+	maxExportedLocalMaxGB = 1048576
 )
 
 type S3Setting struct {
@@ -240,6 +248,10 @@ type ConversationLogSetting struct {
 	// PartitionRetainHours is how many hours an already-exported partition is
 	// kept before being dropped (partition-mode disk reclaim horizon, in HOURS).
 	PartitionRetainHours int `json:"partition_retain_hours"`
+	// ExportedLocalMaxGB caps how much already-exported data lingers locally
+	// (GB). When fully-exported partitions exceed it, the oldest are dropped.
+	// 0 disables this trigger. Partition-mode only.
+	ExportedLocalMaxGB int `json:"exported_local_max_gb"`
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
@@ -365,6 +377,9 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.PartitionRetainHours < minPartitionRetainHours || setting.PartitionRetainHours > maxPartitionRetainHours {
 		setting.PartitionRetainHours = defaultPartitionRetainHours
+	}
+	if setting.ExportedLocalMaxGB < minExportedLocalMaxGB || setting.ExportedLocalMaxGB > maxExportedLocalMaxGB {
+		setting.ExportedLocalMaxGB = minExportedLocalMaxGB
 	}
 
 	if setting.AutoExportThresholdBytes <= 0 {
