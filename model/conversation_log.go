@@ -14,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/cachex"
+	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
 
 	"github.com/samber/hot"
 	"gorm.io/gorm"
@@ -91,11 +92,16 @@ type ConversationLogEligibleCounts struct {
 }
 
 const (
-	conversationLogStatsCacheTTL                = 30 * time.Second
 	conversationLogCreateInvalidationInterval   = 30 * time.Second
 	conversationLogMutationInvalidationInterval = 5 * time.Second
 	conversationLogUnknownStorageBytes          = int64(4) << 20
 )
+
+// conversationLogStatsCacheTTL is the UI stats cache TTL, read from settings so
+// it can be tuned at runtime (effective on the next cache write).
+func conversationLogStatsCacheTTL() time.Duration {
+	return time.Duration(conversation_log_setting.GetSetting().StatsCacheTTLSeconds) * time.Second
+}
 
 var (
 	conversationLogSummaryCacheOnce sync.Once
@@ -174,7 +180,7 @@ func getConversationLogSummaryCache() *cachex.HybridCache[ConversationLogSummary
 			},
 			Memory: func() *hot.HotCache[string, ConversationLogSummary] {
 				return hot.NewHotCache[string, ConversationLogSummary](hot.LRU, 8).
-					WithTTL(conversationLogStatsCacheTTL).
+					WithTTL(conversationLogStatsCacheTTL()).
 					WithJanitor().
 					Build()
 			},
@@ -194,7 +200,7 @@ func getConversationLogCountCache() *cachex.HybridCache[int64] {
 			},
 			Memory: func() *hot.HotCache[string, int64] {
 				return hot.NewHotCache[string, int64](hot.LRU, 2048).
-					WithTTL(conversationLogStatsCacheTTL).
+					WithTTL(conversationLogStatsCacheTTL()).
 					WithJanitor().
 					Build()
 			},
@@ -214,7 +220,7 @@ func getConversationLogEligibleCache() *cachex.HybridCache[ConversationLogEligib
 			},
 			Memory: func() *hot.HotCache[string, ConversationLogEligibleCounts] {
 				return hot.NewHotCache[string, ConversationLogEligibleCounts](hot.LRU, 1024).
-					WithTTL(conversationLogStatsCacheTTL).
+					WithTTL(conversationLogStatsCacheTTL()).
 					WithJanitor().
 					Build()
 			},
@@ -396,7 +402,7 @@ func countConversationLogsCached(query ConversationLogQuery) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := cache.SetWithTTL(key, total, conversationLogStatsCacheTTL); err != nil {
+	if err := cache.SetWithTTL(key, total, conversationLogStatsCacheTTL()); err != nil {
 		common.SysLog("conversation log count cache set failed: " + err.Error())
 	}
 	return total, nil
@@ -487,7 +493,7 @@ func GetConversationLogSummaryCached() (ConversationLogSummary, error) {
 	if err != nil {
 		return summary, err
 	}
-	if err := cache.SetWithTTL(key, summary, conversationLogStatsCacheTTL); err != nil {
+	if err := cache.SetWithTTL(key, summary, conversationLogStatsCacheTTL()); err != nil {
 		common.SysLog("conversation log summary cache set failed: " + err.Error())
 	}
 	return summary, nil
@@ -562,7 +568,7 @@ func CountEligibleConversationLogsCached(ctx context.Context, query Conversation
 	if err != nil {
 		return 0, 0, err
 	}
-	if err := cache.SetWithTTL(key, ConversationLogEligibleCounts{Records: records, Sessions: sessions}, conversationLogStatsCacheTTL); err != nil {
+	if err := cache.SetWithTTL(key, ConversationLogEligibleCounts{Records: records, Sessions: sessions}, conversationLogStatsCacheTTL()); err != nil {
 		common.SysLog("conversation log eligible cache set failed: " + err.Error())
 	}
 	return records, sessions, nil

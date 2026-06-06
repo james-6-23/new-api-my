@@ -207,6 +207,7 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		PartitionMaintenanceIntervalMinutes *int   `json:"partition_maintenance_interval_minutes"`
 		PartitionRetainHours                *int   `json:"partition_retain_hours"`
 		ExportedLocalMaxGB                  *int   `json:"exported_local_max_gb"`
+		StatsCacheTTLSeconds                *int   `json:"stats_cache_ttl_seconds"`
 	}
 	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
 		common.ApiError(c, err)
@@ -491,6 +492,16 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 		if err := model.UpdateOption("conversation_log_setting.exported_local_max_gb", strconv.Itoa(*req.ExportedLocalMaxGB)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.StatsCacheTTLSeconds != nil {
+		if *req.StatsCacheTTLSeconds <= 0 {
+			common.ApiErrorMsg(c, "stats_cache_ttl_seconds must be > 0")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.stats_cache_ttl_seconds", strconv.Itoa(*req.StatsCacheTTLSeconds)); err != nil {
 			common.ApiError(c, err)
 			return
 		}

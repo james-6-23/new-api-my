@@ -152,6 +152,13 @@ const (
 	// 0 disables this trigger (rely on retain_hours + max_storage_gb).
 	minExportedLocalMaxGB = 0
 	maxExportedLocalMaxGB = 1048576
+
+	// TTL (seconds) for the UI stats cache (summary / counts / eligible). The
+	// dashboard numbers can lag up to this long; lower = fresher but more
+	// frequent full-table COUNT/SUM aggregations against the log DB.
+	defaultStatsCacheTTLSeconds = 10
+	minStatsCacheTTLSeconds     = 1
+	maxStatsCacheTTLSeconds     = 3600
 )
 
 type S3Setting struct {
@@ -273,6 +280,9 @@ type ConversationLogSetting struct {
 	// (GB). When fully-exported partitions exceed it, the oldest are dropped.
 	// 0 disables this trigger. Partition-mode only.
 	ExportedLocalMaxGB int `json:"exported_local_max_gb"`
+	// StatsCacheTTLSeconds is the TTL of the UI stats cache (summary/counts).
+	// Lower = fresher dashboard numbers, more frequent aggregations.
+	StatsCacheTTLSeconds int `json:"stats_cache_ttl_seconds"`
 
 	// Auto-export configuration. When enabled, a background watcher creates an
 	// export job once stored conversation log bytes reach AutoExportThresholdBytes,
@@ -323,6 +333,7 @@ var conversationLogSetting = ConversationLogSetting{
 	PartitionAheadHours:                 defaultPartitionAheadHours,
 	PartitionIntervalMinutes:            defaultPartitionIntervalMinutes,
 	PartitionMaintenanceIntervalMinutes: defaultPartitionMaintenanceIntervalMinutes,
+	StatsCacheTTLSeconds:                defaultStatsCacheTTLSeconds,
 	PartitionRetainHours:                defaultPartitionRetainHours,
 
 	AutoExportEnabled:              false,
@@ -403,6 +414,9 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.PartitionMaintenanceIntervalMinutes < minPartitionMaintenanceIntervalMinutes || setting.PartitionMaintenanceIntervalMinutes > maxPartitionMaintenanceIntervalMinutes {
 		setting.PartitionMaintenanceIntervalMinutes = defaultPartitionMaintenanceIntervalMinutes
+	}
+	if setting.StatsCacheTTLSeconds < minStatsCacheTTLSeconds || setting.StatsCacheTTLSeconds > maxStatsCacheTTLSeconds {
+		setting.StatsCacheTTLSeconds = defaultStatsCacheTTLSeconds
 	}
 	if setting.PartitionRetainHours < minPartitionRetainHours || setting.PartitionRetainHours > maxPartitionRetainHours {
 		setting.PartitionRetainHours = defaultPartitionRetainHours

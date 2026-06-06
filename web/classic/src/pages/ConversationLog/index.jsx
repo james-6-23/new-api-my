@@ -122,6 +122,7 @@ const defaultSettings = {
   partition_interval_minutes: 60,
   partition_retain_hours: 4,
   exported_local_max_gb: 0,
+  stats_cache_ttl_seconds: 10,
 };
 
 const formInitValues = {
@@ -1929,6 +1930,25 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             exported_local_max_gb: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='stats_cache_ttl_seconds'
+                        label={t('统计数据缓存秒数')}
+                        min={1}
+                        max={3600}
+                        step={1}
+                        suffix={t('秒')}
+                        extraText={t(
+                          '界面统计数字的缓存时长。越小越实时,但刷新会更频繁地跑全表聚合查询,高吞吐时增加数据库负担',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            stats_cache_ttl_seconds: Number(value || 0),
                           })
                         }
                       />
