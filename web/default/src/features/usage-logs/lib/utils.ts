@@ -29,6 +29,8 @@ import {
 } from '../api'
 import {
   LOG_TYPES,
+  LOG_TYPE_ENUM,
+  EMPTY_RESPONSE_FILTER_VALUE,
   DISPLAYABLE_LOG_TYPES,
   TIMING_LOG_TYPES,
 } from '../constants'
@@ -182,16 +184,33 @@ export function buildApiParams(config: {
   // Helper to process type parameter (single value from array)
   const processType = (value: unknown) => {
     if (Array.isArray(value) && value.length === 1) {
-      return Number(value[0])
+      const first = value[0]
+      // 空回是消费日志的子集，由 empty_response 单独表达，这里不作为 type
+      if (first === EMPTY_RESPONSE_FILTER_VALUE) {
+        return undefined
+      }
+      return Number(first)
     }
     return undefined
   }
+
+  // 是否选择了"空回"筛选（无输出的消费日志）
+  const isEmptyResponseSelected = (value: unknown) =>
+    Array.isArray(value) &&
+    value.length === 1 &&
+    value[0] === EMPTY_RESPONSE_FILTER_VALUE
+
+  const emptyResponse = isEmptyResponseSelected(searchParams.type)
 
   // Build base params from search params
   const params: GetLogsParams = {
     p: page,
     page_size: pageSize,
-    ...(searchParams.type ? { type: processType(searchParams.type) } : {}),
+    ...(emptyResponse
+      ? { type: LOG_TYPE_ENUM.CONSUME, empty_response: true }
+      : searchParams.type
+        ? { type: processType(searchParams.type) }
+        : {}),
     ...(searchParams.model ? { model_name: String(searchParams.model) } : {}),
     ...(searchParams.token ? { token_name: String(searchParams.token) } : {}),
     ...(searchParams.group ? { group: String(searchParams.group) } : {}),
@@ -217,7 +236,13 @@ export function buildApiParams(config: {
 
       switch (id) {
         case 'type':
-          params.type = processType(value)
+          if (isEmptyResponseSelected(value)) {
+            params.type = LOG_TYPE_ENUM.CONSUME
+            params.empty_response = true
+          } else {
+            params.type = processType(value)
+            delete params.empty_response
+          }
           break
         case 'model_name':
           params.model_name = String(value)

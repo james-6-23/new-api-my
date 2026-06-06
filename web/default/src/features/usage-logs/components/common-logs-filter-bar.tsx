@@ -39,7 +39,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { DataTableToolbar } from '@/components/data-table'
-import { LOG_TYPES } from '../constants'
+import { LOG_TYPES, EMPTY_RESPONSE_FILTER_VALUE } from '../constants'
 import { buildSearchParams } from '../lib/filter'
 import { getDefaultTimeRange } from '../lib/utils'
 import type { CommonLogFilters } from '../types'
@@ -48,7 +48,16 @@ import { CompactDateTimeRangePicker } from './compact-date-time-range-picker'
 import { useUsageLogsContext } from './usage-logs-provider'
 
 const route = getRouteApi('/_authenticated/usage-logs/$section')
-const logTypeValues = ['0', '1', '2', '3', '4', '5', '6'] as const
+const logTypeValues = [
+  '0',
+  '1',
+  '2',
+  '3',
+  '4',
+  '5',
+  '6',
+  EMPTY_RESPONSE_FILTER_VALUE,
+] as const
 
 type LogTypeValue = (typeof logTypeValues)[number]
 
@@ -236,6 +245,10 @@ export function CommonLogsFilterBar<TData>(
                 value: String(type.value),
                 label: t(type.label),
               })),
+              {
+                value: EMPTY_RESPONSE_FILTER_VALUE,
+                label: t('Empty Response'),
+              },
             ]}
             value={logType}
             onValueChange={(value) => {
@@ -253,6 +266,9 @@ export function CommonLogsFilterBar<TData>(
                     {t(type.label)}
                   </SelectItem>
                 ))}
+                <SelectItem value={EMPTY_RESPONSE_FILTER_VALUE}>
+                  {t('Empty Response')}
+                </SelectItem>
               </SelectGroup>
             </SelectContent>
           </Select>

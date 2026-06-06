@@ -60,6 +60,14 @@ export const LOG_TYPE_ENUM = {
   REFUND: 6,
 } as const
 
+/**
+ * 类型筛选下拉框中"空回"选项的取值。
+ * 空回不是真实的日志类型，而是消费日志（CONSUME）中没有任何输出
+ * （completion_tokens = 0）的子集，因此用一个独立的哨兵值标识，
+ * 在构造接口参数时翻译为 { type: CONSUME, empty_response: true }。
+ */
+export const EMPTY_RESPONSE_FILTER_VALUE = 'empty' as const
+
 // ============================================================================
 // Time Range Presets
 // ============================================================================

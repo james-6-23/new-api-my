@@ -269,6 +269,8 @@ export interface GetLogsParams {
   group?: string
   request_id?: string
   upstream_request_id?: string
+  // 空回：仅查询没有任何输出（completion_tokens = 0）的消费日志
+  empty_response?: boolean
 }
 
 export interface GetLogsResponse {
@@ -293,6 +295,8 @@ export interface GetLogStatsParams {
   group?: string
   request_id?: string
   upstream_request_id?: string
+  // 空回：仅统计没有任何输出（completion_tokens = 0）的消费日志
+  empty_response?: boolean
 }
 
 export interface GetLogStatsResponse {
