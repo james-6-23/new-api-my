@@ -181,11 +181,14 @@ func CreateConversationLogFuturePartitions(nowTs int64, aheadHours int) (int, er
 		aheadHours = 1
 	}
 	secs := conversation_log_setting.PartitionIntervalSeconds()
+	if secs <= 0 {
+		secs = 3600
+	}
 	created := 0
-	// Start one interval in the past to cover the current partial hour and any
-	// slight clock skew.
+	// Cover [now-1 interval, now + aheadHours] stepping by the partition width.
+	// end uses fixed hours so changing granularity doesn't shrink the lookahead.
 	start := partitionHourStart(nowTs) - secs
-	end := partitionHourStart(nowTs) + int64(aheadHours)*secs
+	end := partitionHourStart(nowTs) + int64(aheadHours)*3600
 	for hourStart := start; hourStart <= end; hourStart += secs {
 		name := partitionNameForStart(hourStart)
 		// %q is not valid for SQL identifiers; the name is fully derived from a
@@ -195,7 +198,12 @@ func CreateConversationLogFuturePartitions(nowTs int64, aheadHours int) (int, er
 			name, hourStart, hourStart+secs,
 		)
 		if err := LOG_DB.Exec(sql).Error; err != nil {
-			return created, fmt.Errorf("create partition %s: %w", name, err)
+			// On a granularity change new slots overlap still-present old-width
+			// partitions; PostgreSQL rejects the overlap. Skip and continue
+			// rather than abort maintenance — the old partition keeps serving
+			// that window, and once it is dropped the new-width slot succeeds.
+			common.SysLog(fmt.Sprintf("conversation log: skip partition %s (likely granularity overlap): %s", name, err.Error()))
+			continue
 		}
 		created++
 	}

@@ -116,10 +116,18 @@ const (
 	// cleanup drops whole partitions (instant, zero extra disk, no bloat)
 	// instead of row DELETE. Off by default so existing deployments are
 	// unaffected; only enable on a fresh dedicated PG store.
-	defaultPartitionAheadHours   = 6
-	minPartitionAheadHours       = 1
-	maxPartitionAheadHours       = 168 // 7 days
-	conversationLogPartitionSecs = int64(3600)
+	defaultPartitionAheadHours = 6
+	minPartitionAheadHours     = 1
+	maxPartitionAheadHours     = 168 // 7 days
+
+	// Partition granularity (minutes). Finer granularity lets a partition reach
+	// "fully exported" sooner, so already-exported data is reclaimed faster
+	// (DROP is whole-partition). Default 60 (hourly). NOTE: changing this on a
+	// live DB makes new partitions until old ones expire; partition creation
+	// tolerates the transient boundary overlap by skipping conflicting slots.
+	defaultPartitionIntervalMinutes = 60
+	minPartitionIntervalMinutes     = 1
+	maxPartitionIntervalMinutes     = 1440 // 1 day
 
 	// Hours an already-exported partition is kept before DROP. This is the
 	// partition-mode cleanup horizon and is HOURS (not days): once a partition's
@@ -245,6 +253,9 @@ type ConversationLogSetting struct {
 	// is enabled via the CONVERSATION_LOG_PARTITIONING env var (the enablement
 	// itself is a structural deployment decision, not a DB setting).
 	PartitionAheadHours int `json:"partition_ahead_hours"`
+	// PartitionIntervalMinutes is the partition granularity in minutes (default
+	// 60). Finer granularity reclaims exported data sooner.
+	PartitionIntervalMinutes int `json:"partition_interval_minutes"`
 	// PartitionRetainHours is how many hours an already-exported partition is
 	// kept before being dropped (partition-mode disk reclaim horizon, in HOURS).
 	PartitionRetainHours int `json:"partition_retain_hours"`
@@ -300,6 +311,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoVacuumFullIntervalHours: defaultAutoVacuumFullIntervalHours,
 	AutoVacuumFullMaxTableBytes: defaultAutoVacuumFullMaxTableBytes,
 	PartitionAheadHours:         defaultPartitionAheadHours,
+	PartitionIntervalMinutes:    defaultPartitionIntervalMinutes,
 	PartitionRetainHours:        defaultPartitionRetainHours,
 
 	AutoExportEnabled:              false,
@@ -374,6 +386,9 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.PartitionAheadHours < minPartitionAheadHours || setting.PartitionAheadHours > maxPartitionAheadHours {
 		setting.PartitionAheadHours = defaultPartitionAheadHours
+	}
+	if setting.PartitionIntervalMinutes < minPartitionIntervalMinutes || setting.PartitionIntervalMinutes > maxPartitionIntervalMinutes {
+		setting.PartitionIntervalMinutes = defaultPartitionIntervalMinutes
 	}
 	if setting.PartitionRetainHours < minPartitionRetainHours || setting.PartitionRetainHours > maxPartitionRetainHours {
 		setting.PartitionRetainHours = defaultPartitionRetainHours
@@ -537,9 +552,9 @@ func CaptureMaxBytesBounds() (min, max int64) {
 }
 
 // PartitionIntervalSeconds is the width of each conversation_logs time
-// partition (hourly).
+// partition, derived from the configurable PartitionIntervalMinutes.
 func PartitionIntervalSeconds() int64 {
-	return conversationLogPartitionSecs
+	return int64(GetSetting().PartitionIntervalMinutes) * 60
 }
 
 func clampCapturePauseDiskUsedGB(value int) int {

@@ -203,6 +203,7 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		RetentionDeleteUnexported *bool  `json:"retention_delete_unexported"`
 		CaptureMaxBytesPerRequest *int64 `json:"capture_max_bytes_per_request"`
 		PartitionAheadHours       *int   `json:"partition_ahead_hours"`
+		PartitionIntervalMinutes  *int   `json:"partition_interval_minutes"`
 		PartitionRetainHours      *int   `json:"partition_retain_hours"`
 		ExportedLocalMaxGB        *int   `json:"exported_local_max_gb"`
 	}
@@ -489,6 +490,16 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 		if err := model.UpdateOption("conversation_log_setting.exported_local_max_gb", strconv.Itoa(*req.ExportedLocalMaxGB)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.PartitionIntervalMinutes != nil {
+		if *req.PartitionIntervalMinutes <= 0 {
+			common.ApiErrorMsg(c, "partition_interval_minutes must be > 0")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.partition_interval_minutes", strconv.Itoa(*req.PartitionIntervalMinutes)); err != nil {
 			common.ApiError(c, err)
 			return
 		}

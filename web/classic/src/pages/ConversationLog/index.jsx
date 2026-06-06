@@ -119,6 +119,7 @@ const defaultSettings = {
   retention_delete_unexported: false,
   capture_max_bytes_per_request: 16 * MiB,
   partition_ahead_hours: 6,
+  partition_interval_minutes: 60,
   partition_retain_hours: 4,
   exported_local_max_gb: 0,
 };
@@ -1872,6 +1873,25 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             partition_ahead_hours: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='partition_interval_minutes'
+                        label={t('分区粒度(分钟)')}
+                        min={1}
+                        max={1440}
+                        step={1}
+                        suffix={t('分钟')}
+                        extraText={t(
+                          '仅分区模式生效：每个分区覆盖多少分钟。粒度越细,已导出数据越快达到整分区导出而被释放(默认60=按小时)。改动后新粒度从新时间段生效,旧分区自然过期',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            partition_interval_minutes: Number(value || 0),
                           })
                         }
                       />
