@@ -1085,6 +1085,18 @@ func newConversationS3HTTPClient() *http.Client {
 	transport := &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
 		ForceAttemptHTTP2: true,
+		// Without these timeouts an unresponsive S3 endpoint (e.g. a stalled
+		// upload that never returns a response) makes client.Do block forever,
+		// hanging the whole export job and stalling every later export. Bound
+		// each phase so a stuck upload fails instead of hanging indefinitely.
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: 10 * time.Second,
 	}
 	if common.TLSInsecureSkipVerify {
 		transport.TLSClientConfig = common.InsecureTLSConfig
