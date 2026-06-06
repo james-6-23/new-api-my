@@ -129,6 +129,13 @@ const (
 	minPartitionIntervalMinutes     = 1
 	maxPartitionIntervalMinutes     = 1440 // 1 day
 
+	// How often the partition maintenance task runs (pre-create future
+	// partitions + DROP expired/over-limit ones). Read each cycle so changes
+	// take effect on the next run without a restart.
+	defaultPartitionMaintenanceIntervalMinutes = 10
+	minPartitionMaintenanceIntervalMinutes     = 1
+	maxPartitionMaintenanceIntervalMinutes     = 1440
+
 	// Hours an already-exported partition is kept before DROP. This is the
 	// partition-mode cleanup horizon and is HOURS (not days): once a partition's
 	// data is in S3, PG is just a short buffer, so for high-volume ingest it must
@@ -256,6 +263,9 @@ type ConversationLogSetting struct {
 	// PartitionIntervalMinutes is the partition granularity in minutes (default
 	// 60). Finer granularity reclaims exported data sooner.
 	PartitionIntervalMinutes int `json:"partition_interval_minutes"`
+	// PartitionMaintenanceIntervalMinutes is how often the maintenance task runs
+	// (pre-create + DROP). Default 10. Effective on the next cycle, no restart.
+	PartitionMaintenanceIntervalMinutes int `json:"partition_maintenance_interval_minutes"`
 	// PartitionRetainHours is how many hours an already-exported partition is
 	// kept before being dropped (partition-mode disk reclaim horizon, in HOURS).
 	PartitionRetainHours int `json:"partition_retain_hours"`
@@ -306,13 +316,14 @@ var conversationLogSetting = ConversationLogSetting{
 	CaptureMaxBytesPerRequest:  defaultCaptureMaxBytes,
 	CaptureGlobalMaxBytes:      defaultCaptureGlobalMaxBytes,
 
-	AutoVacuumFullEnabled:       defaultAutoVacuumFullEnabled,
-	AutoVacuumFullMinBloatRatio: defaultAutoVacuumFullMinBloatRatio,
-	AutoVacuumFullIntervalHours: defaultAutoVacuumFullIntervalHours,
-	AutoVacuumFullMaxTableBytes: defaultAutoVacuumFullMaxTableBytes,
-	PartitionAheadHours:         defaultPartitionAheadHours,
-	PartitionIntervalMinutes:    defaultPartitionIntervalMinutes,
-	PartitionRetainHours:        defaultPartitionRetainHours,
+	AutoVacuumFullEnabled:               defaultAutoVacuumFullEnabled,
+	AutoVacuumFullMinBloatRatio:         defaultAutoVacuumFullMinBloatRatio,
+	AutoVacuumFullIntervalHours:         defaultAutoVacuumFullIntervalHours,
+	AutoVacuumFullMaxTableBytes:         defaultAutoVacuumFullMaxTableBytes,
+	PartitionAheadHours:                 defaultPartitionAheadHours,
+	PartitionIntervalMinutes:            defaultPartitionIntervalMinutes,
+	PartitionMaintenanceIntervalMinutes: defaultPartitionMaintenanceIntervalMinutes,
+	PartitionRetainHours:                defaultPartitionRetainHours,
 
 	AutoExportEnabled:              false,
 	AutoExportThresholdBytes:       defaultAutoExportThresholdBytes,
@@ -389,6 +400,9 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.PartitionIntervalMinutes < minPartitionIntervalMinutes || setting.PartitionIntervalMinutes > maxPartitionIntervalMinutes {
 		setting.PartitionIntervalMinutes = defaultPartitionIntervalMinutes
+	}
+	if setting.PartitionMaintenanceIntervalMinutes < minPartitionMaintenanceIntervalMinutes || setting.PartitionMaintenanceIntervalMinutes > maxPartitionMaintenanceIntervalMinutes {
+		setting.PartitionMaintenanceIntervalMinutes = defaultPartitionMaintenanceIntervalMinutes
 	}
 	if setting.PartitionRetainHours < minPartitionRetainHours || setting.PartitionRetainHours > maxPartitionRetainHours {
 		setting.PartitionRetainHours = defaultPartitionRetainHours

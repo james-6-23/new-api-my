@@ -407,13 +407,15 @@ func conversationLogPartitionMaintenanceLoop() {
 	if !model.ConversationLogPartitioningActive() {
 		return
 	}
-	// Run more often than the partition width so a future partition always
-	// exists before writes need it.
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
+	// Interval is read each cycle so changing
+	// partition_maintenance_interval_minutes takes effect without a restart.
 	for {
 		runConversationLogPartitionMaintenance(context.Background())
-		<-ticker.C
+		minutes := conversation_log_setting.GetSetting().PartitionMaintenanceIntervalMinutes
+		if minutes <= 0 {
+			minutes = 10
+		}
+		time.Sleep(time.Duration(minutes) * time.Minute)
 	}
 }
 

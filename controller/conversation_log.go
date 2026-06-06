@@ -199,13 +199,14 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		AutoExportDeleteAfter          *bool   `json:"auto_export_delete_after"`
 
 		// High-volume / data-quality knobs added for the partitioned pipeline.
-		RetainOriginalBodies      *bool  `json:"retain_original_bodies"`
-		RetentionDeleteUnexported *bool  `json:"retention_delete_unexported"`
-		CaptureMaxBytesPerRequest *int64 `json:"capture_max_bytes_per_request"`
-		PartitionAheadHours       *int   `json:"partition_ahead_hours"`
-		PartitionIntervalMinutes  *int   `json:"partition_interval_minutes"`
-		PartitionRetainHours      *int   `json:"partition_retain_hours"`
-		ExportedLocalMaxGB        *int   `json:"exported_local_max_gb"`
+		RetainOriginalBodies                *bool  `json:"retain_original_bodies"`
+		RetentionDeleteUnexported           *bool  `json:"retention_delete_unexported"`
+		CaptureMaxBytesPerRequest           *int64 `json:"capture_max_bytes_per_request"`
+		PartitionAheadHours                 *int   `json:"partition_ahead_hours"`
+		PartitionIntervalMinutes            *int   `json:"partition_interval_minutes"`
+		PartitionMaintenanceIntervalMinutes *int   `json:"partition_maintenance_interval_minutes"`
+		PartitionRetainHours                *int   `json:"partition_retain_hours"`
+		ExportedLocalMaxGB                  *int   `json:"exported_local_max_gb"`
 	}
 	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
 		common.ApiError(c, err)
@@ -500,6 +501,16 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 		if err := model.UpdateOption("conversation_log_setting.partition_interval_minutes", strconv.Itoa(*req.PartitionIntervalMinutes)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.PartitionMaintenanceIntervalMinutes != nil {
+		if *req.PartitionMaintenanceIntervalMinutes <= 0 {
+			common.ApiErrorMsg(c, "partition_maintenance_interval_minutes must be > 0")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.partition_maintenance_interval_minutes", strconv.Itoa(*req.PartitionMaintenanceIntervalMinutes)); err != nil {
 			common.ApiError(c, err)
 			return
 		}
