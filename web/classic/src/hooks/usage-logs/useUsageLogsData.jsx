@@ -248,6 +248,11 @@ export const useLogsData = () => {
       end_timestamp = formValues.dateRange[1];
     }
 
+    // 空回：消费日志中没有任何输出（completion_tokens = 0）的子集，
+    // 下拉框用 '2-empty' 哨兵值表示，拆解为 type=2 + empty_response=true
+    const rawLogType = formValues.logType;
+    const isEmptyResponse = rawLogType === '2-empty';
+
     return {
       username: formValues.username || '',
       token_name: formValues.token_name || '',
@@ -257,7 +262,8 @@ export const useLogsData = () => {
       channel: formValues.channel || '',
       group: formValues.group || '',
       request_id: formValues.request_id || '',
-      logType: formValues.logType ? parseInt(formValues.logType) : 0,
+      logType: rawLogType ? parseInt(rawLogType) : 0,
+      empty_response: isEmptyResponse,
     };
   };
 
@@ -270,11 +276,12 @@ export const useLogsData = () => {
       end_timestamp,
       group,
       logType: formLogType,
+      empty_response,
     } = getFormValues();
     const currentLogType = formLogType !== undefined ? formLogType : logType;
     let localStartTimestamp = Date.parse(start_timestamp) / 1000;
     let localEndTimestamp = Date.parse(end_timestamp) / 1000;
-    let url = `/api/log/self/stat?type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}`;
+    let url = `/api/log/self/stat?type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}${empty_response ? '&empty_response=true' : ''}`;
     url = encodeURI(url);
     let res = await API.get(url);
     const { success, message, data } = res.data;
@@ -295,11 +302,12 @@ export const useLogsData = () => {
       channel,
       group,
       logType: formLogType,
+      empty_response,
     } = getFormValues();
     const currentLogType = formLogType !== undefined ? formLogType : logType;
     let localStartTimestamp = Date.parse(start_timestamp) / 1000;
     let localEndTimestamp = Date.parse(end_timestamp) / 1000;
-    let url = `/api/log/stat?type=${currentLogType}&username=${username}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&channel=${channel}&group=${group}`;
+    let url = `/api/log/stat?type=${currentLogType}&username=${username}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&channel=${channel}&group=${group}${empty_response ? '&empty_response=true' : ''}`;
     url = encodeURI(url);
     let res = await API.get(url);
     const { success, message, data } = res.data;
@@ -740,6 +748,7 @@ export const useLogsData = () => {
       group,
       request_id,
       logType: formLogType,
+      empty_response,
     } = getFormValues();
 
     const currentLogType =
@@ -749,12 +758,18 @@ export const useLogsData = () => {
           ? formLogType
           : logType;
 
+    // 仅当使用表单里的"空回"选项时才追加 empty_response（外部指定 customLogType 时不生效）
+    const currentEmptyResponse = customLogType !== null ? false : empty_response;
+    const emptyResponseParam = currentEmptyResponse
+      ? '&empty_response=true'
+      : '';
+
     let localStartTimestamp = Date.parse(start_timestamp) / 1000;
     let localEndTimestamp = Date.parse(end_timestamp) / 1000;
     if (isAdminUser) {
-      url = `/api/log/?p=${startIdx}&page_size=${pageSize}&type=${currentLogType}&username=${username}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&channel=${channel}&group=${group}&request_id=${request_id}`;
+      url = `/api/log/?p=${startIdx}&page_size=${pageSize}&type=${currentLogType}&username=${username}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&channel=${channel}&group=${group}&request_id=${request_id}${emptyResponseParam}`;
     } else {
-      url = `/api/log/self/?p=${startIdx}&page_size=${pageSize}&type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}&request_id=${request_id}`;
+      url = `/api/log/self/?p=${startIdx}&page_size=${pageSize}&type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}&request_id=${request_id}${emptyResponseParam}`;
     }
     url = encodeURI(url);
     const res = await API.get(url);
