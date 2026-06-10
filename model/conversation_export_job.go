@@ -189,4 +189,22 @@ func FailOrphanedRunningJobs(ctx context.Context, errorMessage string, finishedA
 	return result.RowsAffected, result.Error
 }
 
+// ListFailedExportJobsWithArtifacts returns failed export jobs that still have an
+// on-disk output directory recorded. The local-file cleanup (cleanupLocalExportArtifacts)
+// only runs on the success path after S3 upload, so any job that failed or was
+// orphaned by a restart leaves its partial/complete shards stranded on disk. Startup
+// cleanup uses this to reclaim those directories. Successful jobs clear
+// output_directory, so a non-empty value on a failed job is always leaked garbage.
+func ListFailedExportJobsWithArtifacts(ctx context.Context) ([]ConversationExportJob, error) {
+	db := LOG_DB
+	if ctx != nil {
+		db = db.WithContext(ctx)
+	}
+	var jobs []ConversationExportJob
+	err := db.
+		Where("status = ? AND output_directory IS NOT NULL AND output_directory <> ''", ConversationExportJobStatusFailed).
+		Find(&jobs).Error
+	return jobs, err
+}
+
 var _ = gorm.ErrRecordNotFound // suppress unused import in environments without callers

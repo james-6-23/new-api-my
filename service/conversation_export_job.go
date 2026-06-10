@@ -2798,7 +2798,8 @@ func exportSessionsSharded(ctx context.Context, query model.ConversationLogQuery
 }
 
 // CleanupOrphanedExportJobs is called on service startup to mark jobs that were
-// running when the process died as failed, and to wipe any leftover .tmp/ dirs.
+// running when the process died as failed, reclaim the on-disk output directories
+// of failed jobs, and wipe any leftover .tmp/ dirs.
 func CleanupOrphanedExportJobs() {
 	count, err := model.FailOrphanedRunningJobs(context.Background(), "orphaned_after_restart", common.GetTimestamp())
 	if err != nil {
@@ -2808,6 +2809,13 @@ func CleanupOrphanedExportJobs() {
 	if count > 0 {
 		common.SysLog(fmt.Sprintf("cleanup: %d orphaned export job(s) marked failed", count))
 	}
+	// Reclaim stranded output directories of failed jobs. The local-file cleanup
+	// (cleanupLocalExportArtifacts) only runs on the success path after S3 upload,
+	// so a job that failed or was orphaned by a restart leaves its partial/complete
+	// shards on disk forever — there is otherwise no GC for them. A failed job's
+	// output is incomplete garbage and its source records stay in the DB (re-exported
+	// by the next auto-export cycle), so removing the directory loses no data.
+	reclaimFailedExportJobArtifacts()
 	// Wipe any .tmp/ in the export directory.
 	settings := conversation_log_setting.GetSetting()
 	if settings.ExportDirectory == "" {
@@ -2825,6 +2833,46 @@ func CleanupOrphanedExportJobs() {
 		if st, err := os.Stat(tmp); err == nil && st.IsDir() {
 			_ = os.RemoveAll(tmp)
 		}
+	}
+}
+
+// reclaimFailedExportJobArtifacts removes the on-disk output directories of every
+// failed export job that still records one, then clears the DB pointers so the
+// directory is reclaimed exactly once. Best-effort: individual failures are logged
+// and skipped rather than aborting the whole sweep.
+func reclaimFailedExportJobArtifacts() {
+	jobs, err := model.ListFailedExportJobsWithArtifacts(context.Background())
+	if err != nil {
+		common.SysError("reclaim failed export job artifacts: " + err.Error())
+		return
+	}
+	reclaimed := 0
+	for i := range jobs {
+		job := &jobs[i]
+		dir := strings.TrimSpace(job.OutputDirectory)
+		// Guard against wiping the export root or a degenerate path if the column
+		// ever holds something unexpected.
+		if dir == "" || dir == "/" || dir == "." || dir == ".." {
+			continue
+		}
+		if err := os.RemoveAll(job.OutputDirectory); err != nil {
+			common.SysError(fmt.Sprintf("reclaim failed export job %s artifacts (%s): %s", job.JobId, job.OutputDirectory, err.Error()))
+			continue
+		}
+		// Clear the pointers so we do not re-attempt this directory on the next
+		// startup. Leaving the row otherwise intact preserves the failure record.
+		if strings.TrimSpace(job.JobId) != "" {
+			if err := model.UpdateConversationExportJobFields(job.JobId, map[string]interface{}{
+				"output_directory": "",
+				"manifest_path":    "",
+			}); err != nil {
+				common.SysError(fmt.Sprintf("clear reclaimed export job %s pointers: %s", job.JobId, err.Error()))
+			}
+		}
+		reclaimed++
+	}
+	if reclaimed > 0 {
+		common.SysLog(fmt.Sprintf("cleanup: reclaimed %d failed export job output director(ies)", reclaimed))
 	}
 }
 
