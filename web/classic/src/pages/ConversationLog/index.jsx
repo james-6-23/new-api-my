@@ -118,6 +118,7 @@ const defaultSettings = {
   retain_original_bodies: false,
   retention_delete_unexported: false,
   capture_max_bytes_per_request: 16 * MiB,
+  capture_global_max_bytes: 4096 * MiB,
   partition_ahead_hours: 6,
   partition_interval_minutes: 60,
   partition_retain_hours: 4,
@@ -517,6 +518,9 @@ const ConversationLog = () => {
           capture_max_mb: bytesToMiB(
             nextSettings.capture_max_bytes_per_request,
           ),
+          capture_global_max_mb: bytesToMiB(
+            nextSettings.capture_global_max_bytes,
+          ),
         };
         settingsFormRef.current?.setValues(formValues);
         void loadS3RotationStatus(false, nextSettings.s3);
@@ -634,6 +638,9 @@ const ConversationLog = () => {
         write_queue_max_mb: bytesToMiB(nextSettings.write_queue_max_bytes),
         write_batch_max_mb: bytesToMiB(nextSettings.write_batch_max_bytes),
         capture_max_mb: bytesToMiB(nextSettings.capture_max_bytes_per_request),
+        capture_global_max_mb: bytesToMiB(
+          nextSettings.capture_global_max_bytes,
+        ),
       };
       settingsFormRef.current?.setValues(formValues);
       showSuccess(t('保存成功'));
@@ -1854,6 +1861,27 @@ const ConversationLog = () => {
                             capture_max_bytes_per_request: mibToBytes(
                               value,
                               settings.capture_max_bytes_per_request,
+                            ),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='capture_global_max_mb'
+                        label={t('全局捕获内存预算')}
+                        min={64}
+                        step={1024}
+                        suffix='MB'
+                        extraText={t(
+                          '所有并发请求捕获正文合计的进程级内存预算，耗尽后并发请求被截断(capture_truncated_global_budget)；需与实例内存匹配',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            capture_global_max_bytes: mibToBytes(
+                              value,
+                              settings.capture_global_max_bytes,
                             ),
                           })
                         }

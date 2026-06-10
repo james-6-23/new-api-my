@@ -202,6 +202,7 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		RetainOriginalBodies                *bool  `json:"retain_original_bodies"`
 		RetentionDeleteUnexported           *bool  `json:"retention_delete_unexported"`
 		CaptureMaxBytesPerRequest           *int64 `json:"capture_max_bytes_per_request"`
+		CaptureGlobalMaxBytes               *int64 `json:"capture_global_max_bytes"`
 		PartitionAheadHours                 *int   `json:"partition_ahead_hours"`
 		PartitionIntervalMinutes            *int   `json:"partition_interval_minutes"`
 		PartitionMaintenanceIntervalMinutes *int   `json:"partition_maintenance_interval_minutes"`
@@ -462,6 +463,18 @@ func UpdateConversationLogSettings(c *gin.Context) {
 			return
 		}
 		if err := model.UpdateOption("conversation_log_setting.capture_max_bytes_per_request", strconv.FormatInt(*req.CaptureMaxBytesPerRequest, 10)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.CaptureGlobalMaxBytes != nil {
+		// Out-of-range values are clamped in GetSetting; reject only obviously
+		// invalid (<= 0) input here for clear feedback.
+		if *req.CaptureGlobalMaxBytes <= 0 {
+			common.ApiErrorMsg(c, "capture_global_max_bytes must be > 0")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.capture_global_max_bytes", strconv.FormatInt(*req.CaptureGlobalMaxBytes, 10)); err != nil {
 			common.ApiError(c, err)
 			return
 		}
