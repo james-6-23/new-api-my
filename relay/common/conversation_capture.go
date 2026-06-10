@@ -1,12 +1,14 @@
 package common
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
 )
 
@@ -63,10 +65,12 @@ type ConversationCapture struct {
 
 	// maxTotalBytes bounds the combined retained bytes across all captured
 	// fields below. <= 0 means unbounded. Once exceeded, further bytes are
-	// dropped and truncated is set so the record can be flagged.
-	maxTotalBytes int64
-	totalBytes    int64
-	truncated     bool
+	// dropped and the matching truncated flag is set so the record can be
+	// flagged with the cause (per-request cap vs global budget).
+	maxTotalBytes         int64
+	totalBytes            int64
+	truncatedRequestCap   bool
+	truncatedGlobalBudget bool
 
 	clientRequestBody       []byte
 	upstreamRequestBody     []byte
@@ -84,8 +88,14 @@ type ConversationCaptureSnapshot struct {
 	ClientResponseBody      []byte
 	StreamChunksPath        string
 	Truncated               bool
-	RequestTime             int64
-	ResponseTime            int64
+	// TruncatedRequestCap: bytes were dropped because the per-request cap
+	// (capture_max_bytes_per_request) was exhausted.
+	TruncatedRequestCap bool
+	// TruncatedGlobalBudget: bytes were dropped because the process-wide
+	// in-flight budget (capture_global_max_bytes) was exhausted.
+	TruncatedGlobalBudget bool
+	RequestTime           int64
+	ResponseTime          int64
 }
 
 // NewConversationCapture creates a capture that retains at most maxTotalBytes
@@ -151,7 +161,9 @@ func (capture *ConversationCapture) Snapshot() ConversationCaptureSnapshot {
 		UpstreamResponseBodyRaw: cloneBytes(capture.upstreamResponseBodyRaw),
 		ClientResponseBody:      cloneBytes(capture.clientResponseBody),
 		StreamChunksPath:        capture.streamChunksPath,
-		Truncated:               capture.truncated,
+		Truncated:               capture.truncatedRequestCap || capture.truncatedGlobalBudget,
+		TruncatedRequestCap:     capture.truncatedRequestCap,
+		TruncatedGlobalBudget:   capture.truncatedGlobalBudget,
 		RequestTime:             capture.requestTime,
 		ResponseTime:            capture.responseTime,
 	}
@@ -184,15 +196,23 @@ func (capture *ConversationCapture) setBytes(target *[]byte, data []byte) {
 	capture.totalBytes -= oldLen
 	releaseGlobalCaptureBytes(oldLen)
 
+	if len(data) == 0 {
+		// Clearing a field drops nothing — not truncation.
+		*target = nil
+		return
+	}
 	allowed := capture.acceptable(len(data)) // per-request remaining
 	if allowed <= 0 {
-		capture.truncated = true
+		capture.markTruncated(truncateCauseRequestCap)
 		*target = nil
 		return
 	}
 	granted := reserveGlobalCaptureBytes(int64(allowed))
-	if granted < int64(allowed) || allowed < len(data) {
-		capture.truncated = true
+	if allowed < len(data) {
+		capture.markTruncated(truncateCauseRequestCap)
+	}
+	if granted < int64(allowed) {
+		capture.markTruncated(truncateCauseGlobalBudget)
 	}
 	*target = cloneBytes(data[:int(granted)])
 	capture.totalBytes += granted
@@ -206,18 +226,58 @@ func (capture *ConversationCapture) appendBytes(target *[]byte, data []byte) {
 	defer capture.mu.Unlock()
 	allowed := capture.acceptable(len(data)) // per-request remaining
 	if allowed <= 0 {
-		capture.truncated = true
+		capture.markTruncated(truncateCauseRequestCap)
 		return
 	}
 	granted := reserveGlobalCaptureBytes(int64(allowed))
-	if granted < int64(allowed) || allowed < len(data) {
-		capture.truncated = true
+	if allowed < len(data) {
+		capture.markTruncated(truncateCauseRequestCap)
+	}
+	if granted < int64(allowed) {
+		capture.markTruncated(truncateCauseGlobalBudget)
 	}
 	if granted <= 0 {
 		return
 	}
 	*target = append(*target, data[:int(granted)]...)
 	capture.totalBytes += granted
+}
+
+type captureTruncateCause int
+
+const (
+	truncateCauseRequestCap captureTruncateCause = iota
+	truncateCauseGlobalBudget
+)
+
+// captureTruncateLastLog rate-limits the operator hint to once per minute per
+// cause, process-wide — mass truncation must not flood the log.
+var captureTruncateLastLog [2]atomic.Int64
+
+// markTruncated records why bytes were dropped and emits a rate-limited log
+// naming the setting to raise. Caller must hold capture.mu.
+func (capture *ConversationCapture) markTruncated(cause captureTruncateCause) {
+	switch cause {
+	case truncateCauseRequestCap:
+		capture.truncatedRequestCap = true
+	case truncateCauseGlobalBudget:
+		capture.truncatedGlobalBudget = true
+	}
+	now := time.Now().Unix()
+	last := captureTruncateLastLog[cause].Load()
+	if now-last < 60 || !captureTruncateLastLog[cause].CompareAndSwap(last, now) {
+		return
+	}
+	switch cause {
+	case truncateCauseRequestCap:
+		common.SysLog(fmt.Sprintf(
+			"conversation capture truncated: per-request cap reached (%d bytes); raise capture_max_bytes_per_request if these records must stay exportable",
+			capture.maxTotalBytes))
+	case truncateCauseGlobalBudget:
+		common.SysLog(fmt.Sprintf(
+			"conversation capture truncated: global in-flight budget exhausted (%d/%d bytes in use); raise capture_global_max_bytes or reduce capture concurrency",
+			globalCaptureBytes.Load(), globalCaptureMaxBytes.Load()))
+	}
 }
 
 // Release returns this capture's retained bytes to the global capture budget

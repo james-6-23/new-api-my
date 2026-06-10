@@ -359,6 +359,12 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 	validation.Reasons = append(validation.Reasons, reconstructionReasons...)
 	if snapshot.Truncated {
 		validation.Reasons = append(validation.Reasons, "capture_truncated")
+		if snapshot.TruncatedRequestCap {
+			validation.Reasons = append(validation.Reasons, "capture_truncated_request_cap")
+		}
+		if snapshot.TruncatedGlobalBudget {
+			validation.Reasons = append(validation.Reasons, "capture_truncated_global_budget")
+		}
 	}
 	validation.Reasons = uniqueStrings(validation.Reasons)
 	if validation.Exportable && len(reconstructionReasons) == 0 && !snapshot.Truncated {

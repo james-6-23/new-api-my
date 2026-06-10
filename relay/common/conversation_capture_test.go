@@ -71,6 +71,49 @@ func TestConversationCaptureSetBytesReclaimsBudget(t *testing.T) {
 	}
 }
 
+func TestConversationCaptureSetEmptyNotTruncated(t *testing.T) {
+	// Setting an empty body clears the field; nothing is dropped, so the
+	// capture must not be flagged truncated.
+	capture := NewConversationCapture(1000)
+	capture.SetClientRequestBody(nil)
+	if snap := capture.Snapshot(); snap.Truncated {
+		t.Fatal("setting empty data must not flag truncated")
+	}
+	capture.SetClientRequestBody(make([]byte, 500))
+	capture.SetClientRequestBody(nil) // clear again after a real set
+	snap := capture.Snapshot()
+	if snap.Truncated || len(snap.ClientRequestBody) != 0 {
+		t.Fatalf("clearing a field must release its bytes without truncation, truncated=%v len=%d",
+			snap.Truncated, len(snap.ClientRequestBody))
+	}
+}
+
+func TestConversationCaptureTruncationCauses(t *testing.T) {
+	// Per-request cap exhaustion must be attributed to the request cap only.
+	capture := NewConversationCapture(100)
+	capture.AppendUpstreamResponseBody(make([]byte, 200))
+	snap := capture.Snapshot()
+	if !snap.TruncatedRequestCap || snap.TruncatedGlobalBudget {
+		t.Fatalf("expected request-cap cause only, requestCap=%v global=%v",
+			snap.TruncatedRequestCap, snap.TruncatedGlobalBudget)
+	}
+
+	// Global budget exhaustion must be attributed to the global budget only.
+	t.Cleanup(func() { SetGlobalCaptureMaxBytes(0); globalCaptureBytes.Store(0) })
+	globalCaptureBytes.Store(0)
+	SetGlobalCaptureMaxBytes(300)
+	c1 := NewConversationCapture(800)
+	c1.SetClientRequestBody(make([]byte, 500)) // wants 500, global grants 300
+	s1 := c1.Snapshot()
+	if !s1.TruncatedGlobalBudget || s1.TruncatedRequestCap {
+		t.Fatalf("expected global-budget cause only, requestCap=%v global=%v",
+			s1.TruncatedRequestCap, s1.TruncatedGlobalBudget)
+	}
+	if !s1.Truncated {
+		t.Fatal("cause flags must imply the aggregate Truncated flag")
+	}
+}
+
 func TestConversationCaptureGlobalBudget(t *testing.T) {
 	// Global budget bounds the sum across concurrent captures; release returns it.
 	t.Cleanup(func() { SetGlobalCaptureMaxBytes(0); globalCaptureBytes.Store(0) })
