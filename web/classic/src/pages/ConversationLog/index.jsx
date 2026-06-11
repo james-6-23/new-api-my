@@ -143,6 +143,57 @@ const formInitValues = {
 
 const defaultBatchSizeBounds = { min: 100, max: 10000 };
 
+// SettingsSection renders a grouped config header: a colored accent bar + title
+// + optional description, with a divider above (except the first), and optional
+// right-aligned extra (e.g. an action button). Replaces the flat bold-text
+// headers so the settings form reads as clearly separated, scannable sections.
+function SettingsSection({ title, desc, accent, first, extra }) {
+  return (
+    <div
+      className={first ? 'mb-4' : 'mt-8 mb-4 pt-5'}
+      style={first ? undefined : { borderTop: '1px solid var(--semi-color-border)' }}
+    >
+      <div className='flex items-center justify-between gap-2'>
+        <div className='flex items-stretch gap-2.5'>
+          <div
+            style={{
+              width: 4,
+              borderRadius: 4,
+              background: accent || 'var(--semi-color-primary)',
+              flexShrink: 0,
+            }}
+          />
+          <div>
+            <div
+              style={{
+                fontSize: 15,
+                fontWeight: 600,
+                lineHeight: '20px',
+                color: 'var(--semi-color-text-0)',
+              }}
+            >
+              {title}
+            </div>
+            {desc ? (
+              <div
+                style={{
+                  fontSize: 12,
+                  lineHeight: '18px',
+                  color: 'var(--semi-color-text-2)',
+                  marginTop: 2,
+                }}
+              >
+                {desc}
+              </div>
+            ) : null}
+          </div>
+        </div>
+        {extra || null}
+      </div>
+    </div>
+  );
+}
+
 function bytesToMiB(bytes) {
   return Math.round(Number(bytes || 0) / MiB);
 }
@@ -1700,12 +1751,12 @@ const ConversationLog = () => {
                   getFormApi={(formApi) => (settingsFormRef.current = formApi)}
                   layout='vertical'
                 >
-                  <div
-                    className='text-sm font-semibold mb-3'
-                    style={{ color: 'var(--semi-color-text-0)' }}
-                  >
-                    {t('基础配置')}
-                  </div>
+                  <SettingsSection
+                    first
+                    accent='#3b82f6'
+                    title={t('采集与基础')}
+                    desc={t('采集开关、数据保留天数与存储上限，以及磁盘保护')}
+                  />
                   <Row gutter={16}>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.Switch
@@ -1859,47 +1910,12 @@ const ConversationLog = () => {
                     </Col>
                   </Row>
 
-                  <div
-                    className='text-sm font-semibold mt-4 mb-3'
-                    style={{ color: 'var(--semi-color-text-0)' }}
-                  >
-                    {t('数据治理与高吞吐')}
-                  </div>
+                  <SettingsSection
+                    accent='#06b6d4'
+                    title={t('采集内存上限')}
+                    desc={t('限制单请求与全局并发捕获占用的内存，超出即截断')}
+                  />
                   <Row gutter={16}>
-                    <Col xs={24} sm={12} lg={8}>
-                      <Form.Switch
-                        field='retention_delete_unexported'
-                        label={t('时间清理删除未导出数据')}
-                        checkedText={t('开')}
-                        uncheckedText={t('关')}
-                        extraText={t(
-                          '默认关：到期清理只删已导出记录，避免误删未训练数据。开启则按时间删除（含未导出）',
-                        )}
-                        onChange={(value) =>
-                          setSettings({
-                            ...settings,
-                            retention_delete_unexported: value === true,
-                          })
-                        }
-                      />
-                    </Col>
-                    <Col xs={24} sm={12} lg={8}>
-                      <Form.Switch
-                        field='retain_original_bodies'
-                        label={t('保留原始多份请求/响应体')}
-                        checkedText={t('开')}
-                        uncheckedText={t('关')}
-                        extraText={t(
-                          '默认关：去冗余只存导出所需正文，省约 65-70% 存储。开启保留客户端/上游原始多份（便于审计，更占空间）',
-                        )}
-                        onChange={(value) =>
-                          setSettings({
-                            ...settings,
-                            retain_original_bodies: value === true,
-                          })
-                        }
-                      />
-                    </Col>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
                         field='capture_max_mb'
@@ -1942,6 +1958,56 @@ const ConversationLog = () => {
                         }
                       />
                     </Col>
+                  </Row>
+
+                  <SettingsSection
+                    accent='#3b82f6'
+                    title={t('数据保留与质量')}
+                    desc={t('到期清理策略，以及是否保留原始多份正文')}
+                  />
+                  <Row gutter={16}>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='retention_delete_unexported'
+                        label={t('时间清理删除未导出数据')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          '默认关：到期清理只删已导出记录，避免误删未训练数据。开启则按时间删除（含未导出）',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            retention_delete_unexported: value === true,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='retain_original_bodies'
+                        label={t('保留原始多份请求/响应体')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          '默认关：去冗余只存导出所需正文，省约 65-70% 存储。开启保留客户端/上游原始多份（便于审计，更占空间）',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            retain_original_bodies: value === true,
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
+
+                  <SettingsSection
+                    accent='#6366f1'
+                    title={t('分区策略')}
+                    desc={t('仅分区模式(CONVERSATION_LOG_PARTITIONING)生效：预建、粒度、保留与本地上限')}
+                  />
+                  <Row gutter={16}>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
                         field='partition_ahead_hours'
@@ -1999,6 +2065,8 @@ const ConversationLog = () => {
                         }
                       />
                     </Col>
+                  </Row>
+                  <Row gutter={16} className='mt-2'>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.InputNumber
                         field='exported_local_max_gb'
@@ -2017,28 +2085,14 @@ const ConversationLog = () => {
                         }
                       />
                     </Col>
-                    <Col xs={24} sm={12} lg={8}>
-                      <Form.InputNumber
-                        field='stats_cache_ttl_seconds'
-                        label={t('统计数据缓存秒数')}
-                        min={1}
-                        max={3600}
-                        step={1}
-                        suffix={t('秒')}
-                        extraText={t(
-                          '界面统计数字的缓存时长。越小越实时,但刷新会更频繁地跑全表聚合查询,高吞吐时增加数据库负担',
-                        )}
-                        onChange={(value) =>
-                          setSettings({
-                            ...settings,
-                            stats_cache_ttl_seconds: Number(value || 0),
-                          })
-                        }
-                      />
-                    </Col>
                   </Row>
 
-                  <Row gutter={16} className='mt-2'>
+                  <SettingsSection
+                    accent='#10b981'
+                    title={t('导出目标与界面')}
+                    desc={t('默认导出模式、本地导出目录，以及界面统计缓存')}
+                  />
+                  <Row gutter={16}>
                     <Col xs={24} md={8}>
                       <Form.Select
                         field='default_export_mode'
@@ -2087,16 +2141,33 @@ const ConversationLog = () => {
                       />
                     </Col>
                   </Row>
+                  <Row gutter={16} className='mt-2'>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.InputNumber
+                        field='stats_cache_ttl_seconds'
+                        label={t('统计数据缓存秒数')}
+                        min={1}
+                        max={3600}
+                        step={1}
+                        suffix={t('秒')}
+                        extraText={t(
+                          '界面统计数字的缓存时长。越小越实时,但刷新会更频繁地跑全表聚合查询,高吞吐时增加数据库负担',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            stats_cache_ttl_seconds: Number(value || 0),
+                          })
+                        }
+                      />
+                    </Col>
+                  </Row>
 
-                  <div
-                    className='text-sm font-semibold mt-6 mb-3 border-t pt-4'
-                    style={{
-                      borderColor: 'var(--semi-color-border)',
-                      color: 'var(--semi-color-text-0)',
-                    }}
-                  >
-                    {t('导出性能批处理')}
-                  </div>
+                  <SettingsSection
+                    accent='#f59e0b'
+                    title={t('写入与导出性能')}
+                    desc={t('数据库批处理、gzip 压缩与异步写入调优（高级）')}
+                  />
                   <div
                     className='rounded-lg p-3 mb-3'
                     style={{
@@ -2396,15 +2467,11 @@ const ConversationLog = () => {
                     </Col>
                   </Row>
 
-                  <div
-                    className='text-sm font-semibold mt-6 mb-3 border-t pt-4'
-                    style={{
-                      borderColor: 'var(--semi-color-border)',
-                      color: 'var(--semi-color-text-0)',
-                    }}
-                  >
-                    {t('自动导出与清理')}
-                  </div>
+                  <SettingsSection
+                    accent='#10b981'
+                    title={t('自动导出与清理')}
+                    desc={t('达到大小阈值或积压超时自动导出分片，并按需清理')}
+                  />
                   <Row gutter={16}>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.Switch
@@ -2542,26 +2609,22 @@ const ConversationLog = () => {
                     </Col>
                   </Row>
 
-                  <div
-                    className='flex flex-col md:flex-row md:items-center md:justify-between gap-2 mt-6 mb-3 border-t pt-4'
-                    style={{
-                      borderColor: 'var(--semi-color-border)',
-                      color: 'var(--semi-color-text-0)',
-                    }}
-                  >
-                    <span className='text-sm font-semibold'>
-                      {t('S3 备份存储设置')}
-                    </span>
-                    <Button
-                      size='small'
-                      icon={<IconLink />}
-                      loading={s3Testing}
-                      disabled={!settings.s3?.enabled}
-                      onClick={testS3Connection}
-                    >
-                      {t('测试连接')}
-                    </Button>
-                  </div>
+                  <SettingsSection
+                    accent='#8b5cf6'
+                    title={t('S3 备份存储')}
+                    desc={t('导出分片上传到对象存储，作为离线备份与训练源')}
+                    extra={
+                      <Button
+                        size='small'
+                        icon={<IconLink />}
+                        loading={s3Testing}
+                        disabled={!settings.s3?.enabled}
+                        onClick={testS3Connection}
+                      >
+                        {t('测试连接')}
+                      </Button>
+                    }
+                  />
                   <Row gutter={16}>
                     <Col xs={24} sm={12} lg={8}>
                       <Form.Switch
