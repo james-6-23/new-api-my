@@ -66,6 +66,7 @@ import {
 import ExportJobs from './ExportJobs';
 import S3UploadLogs from './S3UploadLogs';
 import MonitorPanel from './MonitorPanel';
+import PartitionPanel from './PartitionPanel';
 
 const { Text, Title } = Typography;
 
@@ -1651,6 +1652,9 @@ const ConversationLog = () => {
         </Tabs.TabPane>
         <Tabs.TabPane tab={t('运行监控')} itemKey='monitoring'>
           <MonitorPanel />
+        </Tabs.TabPane>
+        <Tabs.TabPane tab={t('分区视图')} itemKey='partitions'>
+          <PartitionPanel />
         </Tabs.TabPane>
         <Tabs.TabPane tab={t('S3 上传记录')} itemKey='s3_uploads'>
           <S3UploadLogs />

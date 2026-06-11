@@ -217,6 +217,7 @@ func SetApiRouter(router *gin.Engine) {
 			conversationLogRoute.GET("/summary", controller.GetConversationLogSummary)
 			conversationLogRoute.GET("/monitor_stats", controller.GetConversationLogMonitorStats)
 			conversationLogRoute.GET("/chart_stats", controller.GetConversationLogChartStats)
+			conversationLogRoute.GET("/partitions", controller.GetConversationLogPartitions)
 			conversationLogRoute.GET("/export_summary", controller.GetConversationLogExportSummary)
 			conversationLogRoute.GET("/h2_preflight", controller.GetConversationLogH2Preflight)
 			conversationLogRoute.GET("/quality_preflight", controller.GetConversationLogQualityPreflight)

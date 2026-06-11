@@ -164,6 +164,18 @@ func DeleteConversationLogs(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"deleted": deleted})
 }
 
+// GetConversationLogPartitions returns the physical partition inventory with a
+// per-partition three-way record breakdown, on-disk size, and reclaim
+// eligibility — the data behind the partition visualization panel.
+func GetConversationLogPartitions(c *gin.Context) {
+	overview, err := model.GetConversationLogPartitionStats()
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, overview)
+}
+
 // BackfillNonCompliantConversationLogs rescans valid + un-exported records and
 // reclassifies the ones that fail the api-hijack session admission rules from
 // 'valid' to 'non_compliant', draining the legacy backlog so it stops counting

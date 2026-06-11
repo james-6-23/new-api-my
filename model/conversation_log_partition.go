@@ -416,3 +416,128 @@ func DropOldestExportedPartitionsToFitExportedSize(ctx context.Context, maxBytes
 	}
 	return dropped, nil
 }
+
+// ConversationLogPartitionInfo describes one physical partition for the UI:
+// its time window, the three-way record breakdown, on-disk + logical size, and
+// whether it is a pre-created future slot or already eligible for reclamation.
+type ConversationLogPartitionInfo struct {
+	Name          string `json:"name"`
+	StartTs       int64  `json:"start_ts"`
+	EndTs         int64  `json:"end_ts"`
+	Total         int64  `json:"total"`
+	ValidPending  int64  `json:"valid_pending"`  // valid & not yet exported (blocks DROP)
+	ValidExported int64  `json:"valid_exported"` // valid & exported (safe in S3)
+	NonCompliant  int64  `json:"non_compliant"`  // admission-rejected (reclaimed with partition)
+	Invalid       int64  `json:"invalid"`        // structurally broken
+	StorageBytes  int64  `json:"storage_bytes"`  // logical payload sum
+	DiskBytes     int64  `json:"disk_bytes"`     // physical footprint incl. TOAST + indexes
+	IsFuture      bool   `json:"is_future"`      // window starts in the future (pre-created)
+	Droppable     bool   `json:"droppable"`      // past retention AND no valid_pending → auto-DROP eligible
+}
+
+// ConversationLogPartitionOverview is the payload for the partition viz panel.
+type ConversationLogPartitionOverview struct {
+	PartitioningEnabled bool                           `json:"partitioning_enabled"`
+	IntervalSeconds     int64                          `json:"interval_seconds"`
+	RetainHours         int                            `json:"retain_hours"`
+	Now                 int64                          `json:"now"`
+	TotalDiskBytes      int64                          `json:"total_disk_bytes"`
+	TotalStorageBytes   int64                          `json:"total_storage_bytes"`
+	Partitions          []ConversationLogPartitionInfo `json:"partitions"`
+}
+
+// GetConversationLogPartitionStats lists every physical partition with its
+// three-way record breakdown, on-disk size, and reclaim eligibility. Returns an
+// overview with PartitioningEnabled=false (and no partitions) when partitioning
+// is not active. PostgreSQL + partitioning only.
+func GetConversationLogPartitionStats() (ConversationLogPartitionOverview, error) {
+	overview := ConversationLogPartitionOverview{
+		PartitioningEnabled: conversationLogPartitioningActive(),
+		Now:                 common.GetTimestamp(),
+		Partitions:          []ConversationLogPartitionInfo{},
+	}
+	if !overview.PartitioningEnabled {
+		return overview, nil
+	}
+	secs := conversation_log_setting.PartitionIntervalSeconds()
+	if secs <= 0 {
+		secs = 3600
+	}
+	overview.IntervalSeconds = secs
+	overview.RetainHours = conversation_log_setting.GetSetting().PartitionRetainHours
+
+	// Physical partitions + their on-disk footprint (incl. TOAST and indexes).
+	type sizeRow struct {
+		Name      string
+		DiskBytes int64
+	}
+	var sizes []sizeRow
+	if err := LOG_DB.Raw(`
+		SELECT c.relname AS name, pg_total_relation_size(c.oid) AS disk_bytes
+		FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'conversation_logs'::regclass
+	`).Scan(&sizes).Error; err != nil {
+		return overview, err
+	}
+
+	// Per-partition record breakdown via a single GROUP BY on the partition-key
+	// bucket. secs is an int64 derived from settings, so the %d interpolation is
+	// injection-safe by construction (no string inputs).
+	type bucketRow struct {
+		Bucket        int64
+		ValidPending  int64
+		ValidExported int64
+		NonCompliant  int64
+		Invalid       int64
+		Bytes         int64
+	}
+	var rows []bucketRow
+	aggSQL := fmt.Sprintf(`
+		SELECT (created_at/%d)*%d AS bucket,
+			SUM(CASE WHEN validation_status='valid' AND exported_at=0 THEN 1 ELSE 0 END) AS valid_pending,
+			SUM(CASE WHEN validation_status='valid' AND exported_at>0 THEN 1 ELSE 0 END) AS valid_exported,
+			SUM(CASE WHEN validation_status='non_compliant' THEN 1 ELSE 0 END) AS non_compliant,
+			SUM(CASE WHEN validation_status NOT IN ('valid','non_compliant') THEN 1 ELSE 0 END) AS invalid,
+			COALESCE(SUM(storage_bytes),0) AS bytes
+		FROM conversation_logs GROUP BY (created_at/%d)*%d`, secs, secs, secs, secs)
+	if err := LOG_DB.Raw(aggSQL).Scan(&rows).Error; err != nil {
+		return overview, err
+	}
+	byBucket := make(map[int64]bucketRow, len(rows))
+	for _, r := range rows {
+		byBucket[r.Bucket] = r
+	}
+
+	now := overview.Now
+	retainCutoff := now - int64(overview.RetainHours)*3600
+	infos := make([]ConversationLogPartitionInfo, 0, len(sizes))
+	for _, s := range sizes {
+		start, ok := partitionStartFromName(s.Name)
+		if !ok {
+			continue
+		}
+		r := byBucket[start]
+		end := start + secs
+		infos = append(infos, ConversationLogPartitionInfo{
+			Name:          s.Name,
+			StartTs:       start,
+			EndTs:         end,
+			Total:         r.ValidPending + r.ValidExported + r.NonCompliant + r.Invalid,
+			ValidPending:  r.ValidPending,
+			ValidExported: r.ValidExported,
+			NonCompliant:  r.NonCompliant,
+			Invalid:       r.Invalid,
+			StorageBytes:  r.Bytes,
+			DiskBytes:     s.DiskBytes,
+			IsFuture:      start > now,
+			// Mirror DropExportedConversationLogPartitions: whole window past the
+			// retention cutoff AND no valid+un-exported rows pinning it.
+			Droppable: end <= retainCutoff && r.ValidPending == 0,
+		})
+		overview.TotalDiskBytes += s.DiskBytes
+		overview.TotalStorageBytes += r.Bytes
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].StartTs < infos[j].StartTs })
+	overview.Partitions = infos
+	return overview, nil
+}
