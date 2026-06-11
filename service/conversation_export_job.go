@@ -1901,6 +1901,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	if !ok {
 		return nil
 	}
+	enforce := conversation_log_setting.GetSetting().APIHijackEnforceSessionRules
 	return forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1912,6 +1913,9 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 		for _, item := range logs {
 			prepared := prepareConversationExportLog(item)
 			if !prepared.validation.Exportable {
+				continue
+			}
+			if len(apiHijackRecordAdmissionReasons(item, &prepared, enforce)) > 0 {
 				continue
 			}
 			rec := StrictAPIRecord{

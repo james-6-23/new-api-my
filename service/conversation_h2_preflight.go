@@ -136,6 +136,7 @@ func BuildConversationLogH2Preflight(ctx context.Context, query model.Conversati
 		if !ok {
 			return acc.finalize(), nil
 		}
+		enforce := conversation_log_setting.GetSetting().APIHijackEnforceSessionRules
 		err := forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 			if err := conversationContextErr(ctx); err != nil {
 				return err
@@ -143,6 +144,9 @@ func BuildConversationLogH2Preflight(ctx context.Context, query model.Conversati
 			for _, item := range logs {
 				prepared := prepareConversationExportLog(item)
 				if !prepared.validation.Exportable {
+					continue
+				}
+				if len(apiHijackRecordAdmissionReasons(item, &prepared, enforce)) > 0 {
 					continue
 				}
 				acc.report.CheckedRecords++

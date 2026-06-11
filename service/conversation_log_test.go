@@ -36,6 +36,40 @@ func restoreConversationLogTestSettings(t *testing.T) {
 	})
 }
 
+func TestAPIHijackRecordAdmissionGate(t *testing.T) {
+	restoreConversationLogTestSettings(t)
+
+	singleShot := &model.ConversationLog{
+		SessionId:    "inferred_probe",
+		Provider:     "openai",
+		RequestBody:  `{"model":"gpt-5","messages":[{"role":"user","content":"Calculate and respond with ONLY the number. 3+5"}]}`,
+		ResponseBody: `{"choices":[{"message":{"role":"assistant","content":"8"}}]}`,
+		RequestTime:  1710000000000,
+		ResponseTime: 1710000000100,
+	}
+	prepared := prepareConversationExportLog(singleShot)
+	reasons := apiHijackRecordAdmissionReasons(singleShot, &prepared, true)
+	require.Contains(t, reasons, "effective_turns_lt_2")
+	require.Contains(t, reasons, "structured_tool_call_missing")
+
+	// Disabling enforcement always admits (legacy raw dump).
+	require.Empty(t, apiHijackRecordAdmissionReasons(singleShot, &prepared, false))
+
+	toolSession := &model.ConversationLog{
+		SessionId: "sess_real",
+		Provider:  "openai",
+		RequestBody: `{"model":"gpt-5","messages":[` +
+			`{"role":"user","content":"what is the weather?"},` +
+			`{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"call_1","content":"sunny"}]}`,
+		ResponseBody: `{"choices":[{"message":{"role":"assistant","content":"It is sunny."}}]}`,
+		RequestTime:  1710000000000,
+		ResponseTime: 1710000000100,
+	}
+	preparedTool := prepareConversationExportLog(toolSession)
+	require.Empty(t, apiHijackRecordAdmissionReasons(toolSession, &preparedTool, true))
+}
+
 func TestStrictAPIRecordContainsOnlyPDFFields(t *testing.T) {
 	record := StrictAPIRecord{
 		SessionID:    "sess_1",

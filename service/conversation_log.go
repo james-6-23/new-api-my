@@ -667,13 +667,22 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	validRecordBytes := int64(0)
 	overflowed := false
 	collectSessionRecords := mode == conversation_log_setting.ExportModeSessionJSONL
+	apiHijackEnforce := mode == conversation_log_setting.ExportModeAPIHijackJSONL &&
+		conversation_log_setting.GetSetting().APIHijackEnforceSessionRules
 
 	err := forEachConversationExportLog(ctx, query, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
 			summary.TotalCapturedRecords++
 			prepared := prepareConversationExportLog(item)
 			validation := prepared.validation
-			if validation.Exportable && item.ValidationStatus == ConversationValidationValid {
+			exportable := validation.Exportable && item.ValidationStatus == ConversationValidationValid
+			var hijackReasons []string
+			if exportable && apiHijackEnforce {
+				if hijackReasons = apiHijackRecordAdmissionReasons(item, &prepared, true); len(hijackReasons) > 0 {
+					exportable = false
+				}
+			}
+			if exportable {
 				summary.APIExportableRecords++
 				if collectSessionRecords && !overflowed {
 					itemBytes := estimateConversationLogMemoryBytes(item)
@@ -686,7 +695,7 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 					}
 				}
 			} else {
-				reasons := validation.Reasons
+				reasons := append(append([]string(nil), validation.Reasons...), hijackReasons...)
 				if item.InvalidReason != "" {
 					reasons = append(reasons, splitReasons(item.InvalidReason)...)
 				}
@@ -742,10 +751,14 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 		if !ok {
 			return exportedIDs, summary, nil
 		}
+		enforce := conversation_log_setting.GetSetting().APIHijackEnforceSessionRules
 		err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 			for _, item := range logs {
 				prepared := prepareConversationExportLog(item)
 				if !prepared.validation.Exportable {
+					continue
+				}
+				if len(apiHijackRecordAdmissionReasons(item, &prepared, enforce)) > 0 {
 					continue
 				}
 				record := StrictAPIRecord{
@@ -1476,6 +1489,54 @@ func validateSessionTrajectory(trajectory SessionTrajectory) []string {
 		reasons = append(reasons, "tool_result_pairing_lt_0_5")
 	}
 	return uniqueStrings(reasons)
+}
+
+// apiHijackRecordMessages reconstructs the standard session-message list for a
+// single captured request/response record (the request's accumulated history
+// plus this turn's response). Shared by the H2 preflight and the api_hijack
+// export admission gate.
+func apiHijackRecordMessages(log *model.ConversationLog, prepared *conversationExportPreparedLog) []SessionMessage {
+	if log == nil || prepared == nil {
+		return nil
+	}
+	var request map[string]interface{}
+	if err := common.Unmarshal([]byte(prepared.EffectiveRequestBody()), &request); err != nil {
+		return nil
+	}
+	systemPrompt := extractSystemPrompt(request)
+	messages := make([]SessionMessage, 0)
+	messages = append(messages, extractRequestMessages(request, log.Provider, &systemPrompt)...)
+	messages = append(messages, extractResponseMessages(prepared.parsed.Response, log.Provider)...)
+	return messages
+}
+
+// apiHijackRecordAdmissionReasons returns the traj-standard admission failures
+// (empty slice == admitted) for a single api_hijack record graded as a
+// standalone session. It mirrors validateSessionTrajectory's H1/H3/H4 gates so
+// api_hijack and session_jsonl exports admit the same conversations: single-shot
+// / template / probe traffic (one user turn, no structured tool call) is
+// dropped instead of polluting the consumer's pass rates. The record's
+// request_body already carries the full accumulated history, so per-record
+// evaluation is faithful. When enforce is false the record is always admitted
+// (legacy raw per-request dump).
+func apiHijackRecordAdmissionReasons(log *model.ConversationLog, prepared *conversationExportPreparedLog, enforce bool) []string {
+	if !enforce {
+		return nil
+	}
+	messages := apiHijackRecordMessages(log, prepared)
+	reasons := make([]string, 0, 2)
+	if effectiveTurnCount(messages) < 2 {
+		reasons = append(reasons, "effective_turns_lt_2")
+	}
+	if countSessionToolCalls(messages) == 0 {
+		reasons = append(reasons, "structured_tool_call_missing")
+	} else {
+		info := checkSessionToolPairingStrict(normalizeSessionToolPairingIDs(messages))
+		if !sessionToolPairingRatePass(info) {
+			reasons = append(reasons, "tool_result_pairing_lt_0_5")
+		}
+	}
+	return reasons
 }
 
 func effectiveTurnCount(messages []SessionMessage) int {

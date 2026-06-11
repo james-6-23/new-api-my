@@ -198,6 +198,18 @@ type ConversationLogSetting struct {
 	DefaultExportMode      string    `json:"default_export_mode"`
 	S3                     S3Setting `json:"s3"`
 
+	// APIHijackEnforceSessionRules gates the api_hijack_jsonl export on the same
+	// traj-standard admission rules that session_jsonl already enforces
+	// (H1 effective turns >= 2, H3 >= 1 structured tool call, H4 tool pairing
+	// rate >= 0.5). In api_hijack mode every record is graded by the consumer as
+	// a standalone session, so single-shot / template / probe traffic (one user
+	// turn, no tool call) must be dropped here just like session mode drops it —
+	// otherwise it tanks the consumer's H1/H3/H4 pass rates. Each record's
+	// request_body already carries the full accumulated history, so per-record
+	// evaluation is faithful. Default true; set false for the legacy raw
+	// per-request dump (every structurally-valid record exported).
+	APIHijackEnforceSessionRules bool `json:"api_hijack_enforce_session_rules"`
+
 	DefaultShardTargetBytes    int64 `json:"default_shard_target_bytes"`
 	DefaultShardMaxBytes       int64 `json:"default_shard_max_bytes"`
 	ExportJobConcurrency       int   `json:"export_job_concurrency"`
@@ -298,33 +310,34 @@ type ConversationLogSetting struct {
 }
 
 var conversationLogSetting = ConversationLogSetting{
-	CaptureEnabled:             true,
-	RetentionDays:              30,
-	MaxStorageGB:               50,
-	CapturePauseDiskUsedGB:     0,
-	CapturePauseDiskPath:       defaultCapturePauseDiskPath,
-	LocalExportEnabled:         true,
-	ExportDirectory:            filepath.Join("data", "conversation_exports"),
-	DefaultExportMode:          ExportModeAPIHijackJSONL,
-	DefaultShardTargetBytes:    defaultShardTargetBytes,
-	DefaultShardMaxBytes:       defaultShardMaxBytes,
-	ExportJobConcurrency:       1,
-	ExportJobRetentionDays:     14,
-	ExportScanBatchSize:        defaultExportScanBatchSize,
-	ExportScanBatchMaxBytes:    defaultExportScanBatchBytes,
-	ExportMarkBatchSize:        defaultExportMarkBatchSize,
-	ExportDeleteBatchSize:      defaultExportDeleteBatchSize,
-	ExportCompressionWorkers:   defaultExportCompressionWorkers,
-	ExportCompressionQueueSize: defaultExportCompressionQueueSize,
-	ExportCompressionLevel:     defaultExportCompressionLevel,
-	AsyncWriteEnabled:          defaultAsyncWriteEnabled,
-	WriteQueueSize:             defaultWriteQueueSize,
-	WriteQueueMaxBytes:         defaultWriteQueueBytes,
-	WriteBatchSize:             defaultWriteBatchSize,
-	WriteBatchMaxBytes:         defaultWriteBatchBytes,
-	WriteFlushIntervalMs:       defaultWriteFlushIntervalMs,
-	CaptureMaxBytesPerRequest:  defaultCaptureMaxBytes,
-	CaptureGlobalMaxBytes:      defaultCaptureGlobalMaxBytes,
+	CaptureEnabled:               true,
+	RetentionDays:                30,
+	MaxStorageGB:                 50,
+	CapturePauseDiskUsedGB:       0,
+	CapturePauseDiskPath:         defaultCapturePauseDiskPath,
+	LocalExportEnabled:           true,
+	ExportDirectory:              filepath.Join("data", "conversation_exports"),
+	DefaultExportMode:            ExportModeAPIHijackJSONL,
+	APIHijackEnforceSessionRules: true,
+	DefaultShardTargetBytes:      defaultShardTargetBytes,
+	DefaultShardMaxBytes:         defaultShardMaxBytes,
+	ExportJobConcurrency:         1,
+	ExportJobRetentionDays:       14,
+	ExportScanBatchSize:          defaultExportScanBatchSize,
+	ExportScanBatchMaxBytes:      defaultExportScanBatchBytes,
+	ExportMarkBatchSize:          defaultExportMarkBatchSize,
+	ExportDeleteBatchSize:        defaultExportDeleteBatchSize,
+	ExportCompressionWorkers:     defaultExportCompressionWorkers,
+	ExportCompressionQueueSize:   defaultExportCompressionQueueSize,
+	ExportCompressionLevel:       defaultExportCompressionLevel,
+	AsyncWriteEnabled:            defaultAsyncWriteEnabled,
+	WriteQueueSize:               defaultWriteQueueSize,
+	WriteQueueMaxBytes:           defaultWriteQueueBytes,
+	WriteBatchSize:               defaultWriteBatchSize,
+	WriteBatchMaxBytes:           defaultWriteBatchBytes,
+	WriteFlushIntervalMs:         defaultWriteFlushIntervalMs,
+	CaptureMaxBytesPerRequest:    defaultCaptureMaxBytes,
+	CaptureGlobalMaxBytes:        defaultCaptureGlobalMaxBytes,
 
 	AutoVacuumFullEnabled:               defaultAutoVacuumFullEnabled,
 	AutoVacuumFullMinBloatRatio:         defaultAutoVacuumFullMinBloatRatio,
