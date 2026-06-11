@@ -343,6 +343,7 @@ const ConversationLog = () => {
   const [s3RotationStatus, setS3RotationStatus] = useState(null);
   const [exportLoading, setExportLoading] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [backfillLoading, setBackfillLoading] = useState(false);
   const [mode, setMode] = useState('api_hijack_jsonl');
   const [settings, setSettings] = useState(defaultSettings);
   const [summary, setSummary] = useState(null);
@@ -761,6 +762,43 @@ const ConversationLog = () => {
     }
   };
 
+  const backfillNonCompliant = () => {
+    Modal.confirm({
+      title: t('回填不合规记录'),
+      content: t(
+        '将重新扫描所有"合规且未导出"的记录，把不满足会话准入规则（单轮 / 无工具调用）的记录重新归类为"不合规"，使其退出导出积压并允许分区回收。操作幂等，可重复执行。',
+      ),
+      okText: t('开始回填'),
+      cancelText: t('取消'),
+      onOk: async () => {
+        setBackfillLoading(true);
+        try {
+          const res = await API.post(
+            '/api/conversation_logs/backfill_non_compliant',
+            {},
+            { disableDuplicate: true },
+          );
+          const { success, message, data } = res.data;
+          if (!success) {
+            showError(message);
+            return;
+          }
+          showSuccess(
+            t('回填完成：扫描 {{scanned}} 条，重新归类 {{reclassified}} 条', {
+              scanned: data?.scanned ?? 0,
+              reclassified: data?.reclassified ?? 0,
+            }),
+          );
+          refreshAll();
+        } catch (error) {
+          showError(error.message || t('回填失败'));
+        } finally {
+          setBackfillLoading(false);
+        }
+      },
+    });
+  };
+
   const deleteFilteredLogs = () => {
     Modal.confirm({
       title: t('确认删除会话日志'),
@@ -879,6 +917,11 @@ const ConversationLog = () => {
       label: t('API 合规记录'),
       value: summary?.exportable_api_count || 0,
       color: 'var(--semi-color-success)',
+    },
+    {
+      label: t('不合规记录'),
+      value: summary?.non_compliant_count || 0,
+      color: 'var(--semi-color-tertiary)',
     },
     {
       label: t('异常记录'),
@@ -1191,6 +1234,13 @@ const ConversationLog = () => {
           onClick={exportJSONL}
         >
           {t('预览导出 JSONL')}
+        </Button>
+        <Button
+          theme='light'
+          loading={backfillLoading}
+          onClick={backfillNonCompliant}
+        >
+          {t('回填不合规记录')}
         </Button>
         <Button
           type='danger'

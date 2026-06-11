@@ -80,8 +80,9 @@ type ConversationLogSummary struct {
 	StorageBytes       int64 `json:"storage_bytes"`
 	RecordCount        int64 `json:"record_count"`
 	ExportedCount      int64 `json:"exported_count"`
-	ExportableAPICount int64 `json:"exportable_api_count"`
-	InvalidCount       int64 `json:"invalid_count"`
+	ExportableAPICount int64 `json:"exportable_api_count"` // valid (compliant, exportable)
+	NonCompliantCount  int64 `json:"non_compliant_count"`  // structurally valid but admission-rejected
+	InvalidCount       int64 `json:"invalid_count"`        // structurally broken
 	EarliestCreatedAt  int64 `json:"earliest_created_at"`
 	LatestCreatedAt    int64 `json:"latest_created_at"`
 }
@@ -448,6 +449,7 @@ func GetConversationLogSummary() (ConversationLogSummary, error) {
 		RecordCount        sql.NullInt64 `gorm:"column:record_count"`
 		ExportedCount      sql.NullInt64 `gorm:"column:exported_count"`
 		ExportableAPICount sql.NullInt64 `gorm:"column:exportable_api_count"`
+		NonCompliantCount  sql.NullInt64 `gorm:"column:non_compliant_count"`
 		InvalidCount       sql.NullInt64 `gorm:"column:invalid_count"`
 		EarliestCreatedAt  sql.NullInt64 `gorm:"column:earliest_created_at"`
 		LatestCreatedAt    sql.NullInt64 `gorm:"column:latest_created_at"`
@@ -458,7 +460,8 @@ func GetConversationLogSummary() (ConversationLogSummary, error) {
 			COUNT(*) AS record_count,
 			SUM(CASE WHEN exported_at > 0 THEN 1 ELSE 0 END) AS exported_count,
 			SUM(CASE WHEN validation_status = 'valid' THEN 1 ELSE 0 END) AS exportable_api_count,
-			SUM(CASE WHEN validation_status <> 'valid' OR validation_status = '' THEN 1 ELSE 0 END) AS invalid_count,
+			SUM(CASE WHEN validation_status = 'non_compliant' THEN 1 ELSE 0 END) AS non_compliant_count,
+			SUM(CASE WHEN validation_status NOT IN ('valid', 'non_compliant') THEN 1 ELSE 0 END) AS invalid_count,
 			COALESCE(MIN(created_at), 0) AS earliest_created_at,
 			COALESCE(MAX(created_at), 0) AS latest_created_at
 		`).
@@ -469,6 +472,7 @@ func GetConversationLogSummary() (ConversationLogSummary, error) {
 	summary.RecordCount = row.RecordCount.Int64
 	summary.ExportedCount = row.ExportedCount.Int64
 	summary.ExportableAPICount = row.ExportableAPICount.Int64
+	summary.NonCompliantCount = row.NonCompliantCount.Int64
 	summary.InvalidCount = row.InvalidCount.Int64
 	summary.EarliestCreatedAt = row.EarliestCreatedAt.Int64
 	summary.LatestCreatedAt = row.LatestCreatedAt.Int64
@@ -721,6 +725,26 @@ func MarkConversationLogsExported(ids []int, batchID string, exportedAt int64) e
 		invalidateConversationLogStatsCacheThrottled(conversationLogMutationInvalidationInterval)
 	}
 	return err
+}
+
+// MarkConversationLogsNonCompliant reclassifies structurally-valid records that
+// failed the api-hijack session admission rules from 'valid' to 'non_compliant'.
+// invalidReason records the failed rule list. The WHERE guard on validation_status
+// keeps it idempotent — already-reclassified or invalid rows are never touched.
+func MarkConversationLogsNonCompliant(ids []int, invalidReason string) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result := LOG_DB.Model(&ConversationLog{}).
+		Where("id IN ? AND validation_status = ?", ids, "valid").
+		Updates(map[string]interface{}{
+			"validation_status": "non_compliant",
+			"invalid_reason":    invalidReason,
+		})
+	if result.Error == nil && result.RowsAffected > 0 {
+		invalidateConversationLogStatsCacheThrottled(conversationLogMutationInvalidationInterval)
+	}
+	return result.RowsAffected, result.Error
 }
 
 func DeleteConversationLogsByIDs(ids []int) (int64, error) {

@@ -31,6 +31,14 @@ const (
 
 	ConversationValidationValid   = "valid"
 	ConversationValidationInvalid = "invalid"
+	// ConversationValidationNonCompliant marks records that pass the structural
+	// ValidateAPIRecord checks (well-formed request/response, has model/messages/
+	// usage, etc.) but fail the api-hijack session admission rules (H1 effective
+	// turns >= 2, H3 >= 1 structured tool call, H4 tool pairing >= 0.5) — i.e.
+	// single-shot / template / probe traffic. Graded as "not valid", so it is
+	// never exported, never counts toward the pending-export backlog, and never
+	// blocks partition DROP — it is reclaimed together with invalid records.
+	ConversationValidationNonCompliant = "non_compliant"
 )
 
 type ConversationAPIValidation struct {
@@ -355,7 +363,11 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		UsageJSON:               usageJSON,
 	}
 
-	validation := ValidateAPIRecord(log)
+	// prepareConversationExportLog parses the bodies once and runs the same
+	// structural validation as ValidateAPIRecord; reuse it so the api-hijack
+	// admission gate below can be evaluated without re-parsing.
+	prepared := prepareConversationExportLog(log)
+	validation := prepared.validation
 	validation.Reasons = append(validation.Reasons, reconstructionReasons...)
 	if snapshot.Truncated {
 		validation.Reasons = append(validation.Reasons, "capture_truncated")
@@ -367,11 +379,20 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		}
 	}
 	validation.Reasons = uniqueStrings(validation.Reasons)
-	if validation.Exportable && len(reconstructionReasons) == 0 && !snapshot.Truncated {
-		log.ValidationStatus = ConversationValidationValid
-	} else {
+	// Three-way classification, decided once at write time:
+	//   invalid       — structurally broken (can never be exported, reclaimed with the partition)
+	//   non_compliant — structurally valid but fails the session admission rules
+	//                   (single-shot / no real tool call); not exported, not counted
+	//                   as backlog, does not block partition DROP — same fate as invalid
+	//   valid         — structurally valid AND admitted
+	if !(validation.Exportable && len(reconstructionReasons) == 0 && !snapshot.Truncated) {
 		log.ValidationStatus = ConversationValidationInvalid
 		log.InvalidReason = strings.Join(validation.Reasons, ",")
+	} else if hijackReasons := apiHijackRecordAdmissionReasons(log, &prepared, conversation_log_setting.GetSetting().APIHijackEnforceSessionRules); len(hijackReasons) > 0 {
+		log.ValidationStatus = ConversationValidationNonCompliant
+		log.InvalidReason = strings.Join(hijackReasons, ",")
+	} else {
+		log.ValidationStatus = ConversationValidationValid
 	}
 
 	log.StorageBytes = int64(len(log.ClientRequestBody) +
@@ -667,21 +688,16 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 	validRecordBytes := int64(0)
 	overflowed := false
 	collectSessionRecords := mode == conversation_log_setting.ExportModeSessionJSONL
-	apiHijackEnforce := mode == conversation_log_setting.ExportModeAPIHijackJSONL &&
-		conversation_log_setting.GetSetting().APIHijackEnforceSessionRules
 
 	err := forEachConversationExportLog(ctx, query, func(logs []*model.ConversationLog) error {
 		for _, item := range logs {
 			summary.TotalCapturedRecords++
 			prepared := prepareConversationExportLog(item)
 			validation := prepared.validation
+			// Admission is settled at write time: non_compliant records carry a
+			// non-valid status and fall to the rejected branch below, where their
+			// InvalidReason (the failed admission rules) is folded into the counts.
 			exportable := validation.Exportable && item.ValidationStatus == ConversationValidationValid
-			var hijackReasons []string
-			if exportable && apiHijackEnforce {
-				if hijackReasons = apiHijackRecordAdmissionReasons(item, &prepared, true); len(hijackReasons) > 0 {
-					exportable = false
-				}
-			}
 			if exportable {
 				summary.APIExportableRecords++
 				if collectSessionRecords && !overflowed {
@@ -695,7 +711,7 @@ func buildConversationLogExportSummary(ctx context.Context, query model.Conversa
 					}
 				}
 			} else {
-				reasons := append(append([]string(nil), validation.Reasons...), hijackReasons...)
+				reasons := append([]string(nil), validation.Reasons...)
 				if item.InvalidReason != "" {
 					reasons = append(reasons, splitReasons(item.InvalidReason)...)
 				}
@@ -751,14 +767,12 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 		if !ok {
 			return exportedIDs, summary, nil
 		}
-		enforce := conversation_log_setting.GetSetting().APIHijackEnforceSessionRules
+		// Admission is settled at write time; the `valid` filter already excludes
+		// non_compliant records, so no per-record re-check here.
 		err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 			for _, item := range logs {
 				prepared := prepareConversationExportLog(item)
 				if !prepared.validation.Exportable {
-					continue
-				}
-				if len(apiHijackRecordAdmissionReasons(item, &prepared, enforce)) > 0 {
 					continue
 				}
 				record := StrictAPIRecord{

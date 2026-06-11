@@ -1901,7 +1901,10 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	if !ok {
 		return nil
 	}
-	enforce := conversation_log_setting.GetSetting().APIHijackEnforceSessionRules
+	// Session admission is decided once at write time (validation_status):
+	// non_compliant records are already excluded by conversationExportValidQuery,
+	// so the export scan only sees admitted `valid` records — no per-record
+	// re-evaluation needed here.
 	return forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1913,9 +1916,6 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 		for _, item := range logs {
 			prepared := prepareConversationExportLog(item)
 			if !prepared.validation.Exportable {
-				continue
-			}
-			if len(apiHijackRecordAdmissionReasons(item, &prepared, enforce)) > 0 {
 				continue
 			}
 			rec := StrictAPIRecord{

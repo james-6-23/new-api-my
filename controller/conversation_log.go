@@ -164,6 +164,20 @@ func DeleteConversationLogs(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"deleted": deleted})
 }
 
+// BackfillNonCompliantConversationLogs rescans valid + un-exported records and
+// reclassifies the ones that fail the api-hijack session admission rules from
+// 'valid' to 'non_compliant', draining the legacy backlog so it stops counting
+// as export pending / blocking partition DROP. One-shot, manually triggered,
+// idempotent — safe to re-run.
+func BackfillNonCompliantConversationLogs(c *gin.Context) {
+	result, err := service.BackfillNonCompliantConversationLogs(c.Request.Context())
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
 func UpdateConversationLogSettings(c *gin.Context) {
 	var req struct {
 		CaptureEnabled         *bool                               `json:"capture_enabled"`

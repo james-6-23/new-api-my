@@ -222,6 +222,7 @@ func SetApiRouter(router *gin.Engine) {
 			conversationLogRoute.GET("/quality_preflight", controller.GetConversationLogQualityPreflight)
 			conversationLogRoute.GET("/export.jsonl", controller.ExportConversationLogs)
 			conversationLogRoute.POST("/export_and_delete", controller.ExportAndDeleteConversationLogs)
+			conversationLogRoute.POST("/backfill_non_compliant", controller.BackfillNonCompliantConversationLogs)
 			conversationLogRoute.PUT("/settings", controller.UpdateConversationLogSettings)
 			conversationLogRoute.POST("/s3/test", controller.TestConversationLogS3Connection)
 			conversationLogRoute.POST("/s3/rotation_status", controller.GetConversationLogS3RotationStatus)
