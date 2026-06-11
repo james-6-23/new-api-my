@@ -20,14 +20,50 @@ import {
   Typography,
 } from '@douyinfe/semi-ui';
 import { IconRefresh } from '@douyinfe/semi-icons';
-import { VChart } from '@visactor/react-vchart';
 import { useTranslation } from 'react-i18next';
 import { API, showError, timestamp2string } from '../../helpers';
 
 const { Text, Title } = Typography;
 
-const VCHART_OPTION = { mode: 'desktop-browser' };
 const AUTO_REFRESH_MS = 30000;
+
+// Scoped styles for the card grid: hover lift + smooth transitions. Injected
+// once so we don't need per-card hover state on dozens of partitions.
+const PANEL_CSS = `
+.cl-part-card {
+  border: 1px solid var(--semi-color-border);
+  border-radius: 16px;
+  padding: 14px 16px;
+  background: var(--semi-color-bg-1);
+  transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease;
+  height: 100%;
+}
+.cl-part-card:hover {
+  box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+  transform: translateY(-3px);
+  border-color: var(--semi-color-primary-light-active);
+}
+.cl-part-current {
+  border-color: var(--semi-color-success);
+  box-shadow: 0 0 0 1px var(--semi-color-success-light-active) inset;
+}
+.cl-part-donut {
+  width: 86px; height: 86px; border-radius: 50%;
+  flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.cl-part-hole {
+  width: 60px; height: 60px; border-radius: 50%;
+  background: var(--semi-color-bg-1);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+}
+.cl-stat-card {
+  background: var(--semi-color-fill-0);
+  border-radius: 14px;
+  padding: 12px 16px;
+  height: 100%;
+}
+`;
 
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
@@ -41,16 +77,14 @@ function formatBytes(bytes) {
   return `${value.toFixed(value >= 100 || idx === 0 ? 0 : 2)} ${units[idx]}`;
 }
 
-// MM-DD HH:mm from a unix-second timestamp.
-function shortTime(ts) {
-  if (!ts) return '-';
-  return timestamp2string(ts).slice(5, 16);
-}
-
-// HH:mm only — compact x-axis / row label.
 function hourMinute(ts) {
   if (!ts) return '-';
   return timestamp2string(ts).slice(11, 16);
+}
+
+function dayLabel(ts) {
+  if (!ts) return '';
+  return timestamp2string(ts).slice(5, 10); // MM-DD
 }
 
 export default function PartitionPanel() {
@@ -59,7 +93,6 @@ export default function PartitionPanel() {
   const [loading, setLoading] = useState(false);
   const timerRef = useRef(null);
 
-  // The four record classes, in stack order, with their semantic colors.
   const SEGMENTS = useMemo(
     () => [
       { key: 'valid_exported', label: t('已导出'), color: '#52c41a' },
@@ -100,72 +133,47 @@ export default function PartitionPanel() {
   const partitions = data?.partitions || [];
   const now = data?.now || 0;
 
-  // statusOf classifies a partition into a colored badge.
+  const isCurrent = (p) => now >= p.start_ts && now < p.end_ts;
+
   const statusOf = (p) => {
     if (p.is_future) return { text: t('预留'), color: 'blue' };
-    const isCurrent = now >= p.start_ts && now < p.end_ts;
-    if (isCurrent) return { text: t('写入中'), color: 'green' };
+    if (isCurrent(p)) return { text: t('写入中'), color: 'green' };
     if (p.valid_pending > 0) return { text: t('导出中'), color: 'amber' };
     if (p.droppable) return { text: t('待回收'), color: 'grey' };
     return { text: t('保留中'), color: 'light-blue' };
   };
 
-  // Aggregate counters for the overview row.
+  // Split active (has data or currently writing) from empty pre-created slots so
+  // the grid stays focused and dozens of empty future partitions don't flood it.
+  const { active, futureEmpty } = useMemo(() => {
+    const a = [];
+    const f = [];
+    partitions.forEach((p) => {
+      if (p.is_future && (p.total || 0) <= 0 && !isCurrent(p)) f.push(p);
+      else a.push(p);
+    });
+    return { active: a, futureEmpty: f };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [partitions, now]);
+
   const overview = useMemo(() => {
     const acc = {
       count: partitions.length,
-      future: 0,
-      droppable: 0,
       writing: 0,
+      droppable: 0,
+      future: futureEmpty.length,
       validPending: 0,
       nonCompliant: 0,
     };
     partitions.forEach((p) => {
-      if (p.is_future) acc.future += 1;
-      else if (p.droppable) acc.droppable += 1;
-      if (now >= p.start_ts && now < p.end_ts) acc.writing += 1;
+      if (isCurrent(p)) acc.writing += 1;
+      if (p.droppable) acc.droppable += 1;
       acc.validPending += p.valid_pending || 0;
       acc.nonCompliant += p.non_compliant || 0;
     });
     return acc;
-  }, [partitions, now]);
-
-  // Long-format values for the stacked bar (only partitions that hold data).
-  const stackValues = useMemo(() => {
-    const out = [];
-    partitions.forEach((p) => {
-      if ((p.total || 0) <= 0) return;
-      SEGMENTS.forEach((seg) => {
-        out.push({
-          time: hourMinute(p.start_ts),
-          category: seg.label,
-          count: Number(p[seg.key] || 0),
-        });
-      });
-    });
-    return out;
-  }, [partitions, SEGMENTS]);
-
-  const barSpec = {
-    type: 'bar',
-    data: [{ id: 'bar', values: stackValues }],
-    xField: 'time',
-    yField: 'count',
-    seriesField: 'category',
-    stack: true,
-    color: SEGMENTS.map((s) => s.color),
-    legends: { visible: true, orient: 'bottom' },
-    title: { visible: true, text: t('各分区数据构成') },
-    axes: [
-      { orient: 'bottom', label: { autoRotate: true, autoLimit: true } },
-      { orient: 'left', label: { visible: true } },
-    ],
-    tooltip: {
-      dimension: {
-        content: [{ key: (d) => d.category, value: (d) => d.count }],
-      },
-    },
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [partitions, futureEmpty, now]);
 
   const header = (
     <div className='flex items-center justify-between gap-2'>
@@ -174,14 +182,14 @@ export default function PartitionPanel() {
           {t('分区视图')}
         </Title>
         {data ? (
-          <Tag color='cyan'>
+          <Tag color='cyan' shape='circle'>
             {t('粒度 {{m}} 分钟', {
               m: Math.round((data.interval_seconds || 0) / 60),
             })}
           </Tag>
         ) : null}
         {data ? (
-          <Tag color='light-blue'>
+          <Tag color='light-blue' shape='circle'>
             {t('保留 {{h}} 小时', { h: data.retain_hours || 0 })}
           </Tag>
         ) : null}
@@ -211,9 +219,10 @@ export default function PartitionPanel() {
 
   return (
     <Card className='!rounded-2xl mt-4' title={header}>
+      <style>{PANEL_CSS}</style>
       <Spin spinning={loading && !data}>
-        {/* Overview stat cards */}
-        <Row gutter={12} className='mb-2'>
+        {/* Overview stats */}
+        <Row gutter={12} className='mb-3'>
           <StatCard label={t('分区总数')} value={overview.count} />
           <StatCard
             label={t('写入中')}
@@ -234,7 +243,7 @@ export default function PartitionPanel() {
           />
           <StatCard
             label={t('待导出记录')}
-            value={overview.validPending}
+            value={overview.validPending.toLocaleString()}
             color='var(--semi-color-warning)'
           />
           <StatCard
@@ -244,15 +253,8 @@ export default function PartitionPanel() {
           />
         </Row>
 
-        {/* Stacked bar of per-partition composition */}
-        {stackValues.length > 0 ? (
-          <div className='h-72 mt-2'>
-            <VChart spec={barSpec} option={VCHART_OPTION} />
-          </div>
-        ) : null}
-
-        {/* Legend for the composition bars */}
-        <Space spacing={16} className='mt-2 mb-1' wrap>
+        {/* Legend */}
+        <Space spacing={16} className='mb-3' wrap>
           {SEGMENTS.map((s) => (
             <span key={s.key} className='inline-flex items-center gap-1'>
               <span
@@ -260,7 +262,7 @@ export default function PartitionPanel() {
                   display: 'inline-block',
                   width: 10,
                   height: 10,
-                  borderRadius: 2,
+                  borderRadius: 3,
                   background: s.color,
                 }}
               />
@@ -271,40 +273,58 @@ export default function PartitionPanel() {
           ))}
         </Space>
 
-        {/* Per-partition detail rows */}
-        <div className='mt-1'>
-          {partitions.length === 0 ? (
+        {/* Partition card grid */}
+        {active.length === 0 ? (
+          <Text type='tertiary' size='small'>
+            {t('暂无分区数据')}
+          </Text>
+        ) : (
+          <Row gutter={12}>
+            {active.map((p) => (
+              <Col key={p.name} xs={24} sm={12} md={8} xl={6} className='mb-3'>
+                <PartitionCard
+                  p={p}
+                  segments={SEGMENTS}
+                  status={statusOf(p)}
+                  current={isCurrent(p)}
+                  t={t}
+                />
+              </Col>
+            ))}
+          </Row>
+        )}
+
+        {/* Collapsed empty future slots */}
+        {futureEmpty.length > 0 ? (
+          <div
+            className='mt-1 px-4 py-3 flex items-center gap-2'
+            style={{
+              borderRadius: 14,
+              border: '1px dashed var(--semi-color-border)',
+              background: 'var(--semi-color-fill-0)',
+            }}
+          >
+            <Tag color='blue' shape='circle'>
+              {t('预留 {{n}} 个', { n: futureEmpty.length })}
+            </Tag>
             <Text type='tertiary' size='small'>
-              {t('暂无分区数据')}
+              {t('为未来写入预创建的空分区，覆盖至 {{end}}', {
+                end: `${dayLabel(
+                  futureEmpty[futureEmpty.length - 1].end_ts,
+                )} ${hourMinute(futureEmpty[futureEmpty.length - 1].end_ts)}`,
+              })}
             </Text>
-          ) : (
-            partitions.map((p) => (
-              <PartitionRow
-                key={p.name}
-                p={p}
-                segments={SEGMENTS}
-                status={statusOf(p)}
-                t={t}
-              />
-            ))
-          )}
-        </div>
+          </div>
+        ) : null}
       </Spin>
     </Card>
   );
 }
 
-// StatCard renders one compact metric in the overview row.
+// StatCard — one compact metric in the overview row.
 function StatCard({ label, value, color, hint }) {
   const body = (
-    <div
-      style={{
-        background: 'var(--semi-color-fill-0)',
-        borderRadius: 12,
-        padding: '10px 14px',
-        height: '100%',
-      }}
-    >
+    <div className='cl-stat-card'>
       <Text size='small' type='tertiary'>
         {label}
       </Text>
@@ -322,34 +342,59 @@ function StatCard({ label, value, color, hint }) {
   );
   return (
     <Col xs={12} sm={8} md={4} className='mb-2'>
-      {hint ? <Tooltip content={hint}>{body}</Tooltip> : body}
+      {hint ? (
+        <Tooltip content={hint}>{body}</Tooltip>
+      ) : (
+        body
+      )}
     </Col>
   );
 }
 
-// PartitionRow is one partition: time window, a horizontal composition bar,
-// the on-disk size, and a status badge.
-function PartitionRow({ p, segments, status, t }) {
+// donutBackground builds the conic-gradient for one partition's composition ring.
+function donutBackground(p, segments) {
   const total = p.total || 0;
+  if (total <= 0) return 'var(--semi-color-fill-1)';
+  let acc = 0;
+  const stops = [];
+  segments.forEach((s) => {
+    const v = Number(p[s.key] || 0);
+    if (v <= 0) return;
+    const start = (acc / total) * 360;
+    acc += v;
+    const end = (acc / total) * 360;
+    stops.push(`${s.color} ${start.toFixed(2)}deg ${end.toFixed(2)}deg`);
+  });
+  if (stops.length === 0) return 'var(--semi-color-fill-1)';
+  return `conic-gradient(${stops.join(', ')})`;
+}
+
+// PartitionCard — one partition as a card: time window + status, a conic ring
+// with disk size at its center, and the four-class legend with counts.
+function PartitionCard({ p, segments, status, current, t }) {
+  const total = p.total || 0;
+  const ring = donutBackground(p, segments);
   return (
-    <div
-      className='flex items-center gap-3 py-2'
-      style={{ borderBottom: '1px solid var(--semi-color-border)' }}
-    >
-      {/* time window */}
-      <div style={{ width: 116, flexShrink: 0 }}>
-        <Text strong size='small'>
-          {hourMinute(p.start_ts)} – {hourMinute(p.end_ts)}
-        </Text>
+    <div className={`cl-part-card${current ? ' cl-part-current' : ''}`}>
+      {/* header */}
+      <div className='flex items-center justify-between gap-2'>
         <div>
-          <Text type='tertiary' size='small'>
-            {shortTime(p.start_ts).slice(0, 5)}
+          <Text strong>
+            {hourMinute(p.start_ts)} – {hourMinute(p.end_ts)}
           </Text>
+          <div>
+            <Text type='tertiary' size='small'>
+              {dayLabel(p.start_ts)}
+            </Text>
+          </div>
         </div>
+        <Tag color={status.color} shape='circle' size='small'>
+          {status.text}
+        </Tag>
       </div>
 
-      {/* composition bar */}
-      <div style={{ flex: 1, minWidth: 0 }}>
+      {/* body: ring + legend */}
+      <div className='flex items-center gap-3 mt-3'>
         <Tooltip
           content={
             <div>
@@ -358,53 +403,73 @@ function PartitionRow({ p, segments, status, t }) {
                   {s.label}: {Number(p[s.key] || 0).toLocaleString()}
                 </div>
               ))}
-              <div style={{ marginTop: 4, opacity: 0.7 }}>
+              <div style={{ marginTop: 4, opacity: 0.75 }}>
                 {t('磁盘')}: {formatBytes(p.disk_bytes)}
               </div>
             </div>
           }
         >
-          <div
-            style={{
-              display: 'flex',
-              width: '100%',
-              height: 16,
-              borderRadius: 8,
-              overflow: 'hidden',
-              background: 'var(--semi-color-fill-1)',
-            }}
-          >
-            {total > 0 ? (
-              segments.map((s) => {
-                const v = Number(p[s.key] || 0);
-                if (v <= 0) return null;
-                return (
-                  <div
-                    key={s.key}
-                    style={{
-                      width: `${(v / total) * 100}%`,
-                      background: s.color,
-                    }}
-                  />
-                );
-              })
-            ) : (
-              <div style={{ width: '100%' }} />
-            )}
+          <div className='cl-part-donut' style={{ background: ring }}>
+            <div className='cl-part-hole'>
+              <Text strong style={{ fontSize: 13, lineHeight: '16px' }}>
+                {formatBytes(p.disk_bytes)}
+              </Text>
+              <Text type='tertiary' style={{ fontSize: 11 }}>
+                {total >= 1000
+                  ? `${(total / 1000).toFixed(1)}k`
+                  : total}
+                {' '}
+                {t('条')}
+              </Text>
+            </div>
           </div>
         </Tooltip>
-        <div className='mt-1'>
-          <Text type='tertiary' size='small'>
-            {total.toLocaleString()} {t('条')} · {formatBytes(p.disk_bytes)}
-          </Text>
-        </div>
-      </div>
 
-      {/* status badge */}
-      <div style={{ width: 72, flexShrink: 0, textAlign: 'right' }}>
-        <Tag color={status.color} size='small'>
-          {status.text}
-        </Tag>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {segments.map((s) => {
+            const v = Number(p[s.key] || 0);
+            const pct = total > 0 ? (v / total) * 100 : 0;
+            return (
+              <div
+                key={s.key}
+                className='flex items-center justify-between gap-2'
+                style={{ lineHeight: '20px' }}
+              >
+                <span className='inline-flex items-center gap-1 min-w-0'>
+                  <span
+                    style={{
+                      display: 'inline-block',
+                      width: 8,
+                      height: 8,
+                      borderRadius: 2,
+                      background: s.color,
+                      flexShrink: 0,
+                      opacity: v > 0 ? 1 : 0.35,
+                    }}
+                  />
+                  <Text
+                    size='small'
+                    type={v > 0 ? 'primary' : 'tertiary'}
+                    ellipsis
+                  >
+                    {s.label}
+                  </Text>
+                </span>
+                <Text
+                  size='small'
+                  type={v > 0 ? 'primary' : 'tertiary'}
+                  style={{ flexShrink: 0 }}
+                >
+                  {v.toLocaleString()}
+                  <Text type='tertiary' size='small'>
+                    {' '}
+                    {pct >= 0.5 ? `${pct.toFixed(0)}%` : ''}
+                  </Text>
+                </Text>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
