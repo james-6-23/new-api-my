@@ -131,3 +131,20 @@ func PendingExportStorageBytes(validStatus string) (int64, error) {
 		Scan(&bytes).Error
 	return bytes, err
 }
+
+// PendingExportBacklog returns both auto-export trigger signals in a single
+// scan of the pending set: the total pending-export bytes and the oldest pending
+// record's created_at (0 when nothing is pending). The byte sum drives the
+// "enough accumulated" trigger; the oldest timestamp drives the backlog-age
+// fallback so low-traffic windows still export before their partitions age out.
+func PendingExportBacklog(validStatus string) (bytes int64, oldestCreatedAt int64, err error) {
+	var row struct {
+		Bytes  int64 `gorm:"column:bytes"`
+		Oldest int64 `gorm:"column:oldest"`
+	}
+	err = LOG_DB.Model(&ConversationLog{}).
+		Where("exported_at = 0 AND validation_status = ?", validStatus).
+		Select("COALESCE(SUM(storage_bytes), 0) AS bytes, COALESCE(MIN(created_at), 0) AS oldest").
+		Scan(&row).Error
+	return row.Bytes, row.Oldest, err
+}

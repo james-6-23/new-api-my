@@ -20,7 +20,8 @@ const (
 	// 10 GiB and bundle each shard up to 10 GiB.
 	defaultAutoExportThresholdBytes = int64(10) << 30
 	defaultAutoExportShardMaxBytes  = int64(10) << 30
-	defaultAutoExportCheckInterval  = 300 // seconds (5 minutes)
+	defaultAutoExportCheckInterval  = 300  // seconds (5 minutes)
+	defaultAutoExportMaxBacklogAge  = 1800 // seconds (30 minutes)
 
 	// S3 rotation defaults. When rotation is enabled, export artifacts are
 	// uploaded flat (compressed shard files only, no per-job subdirectory and no manifest.json)
@@ -307,6 +308,14 @@ type ConversationLogSetting struct {
 	AutoExportDirectory            string `json:"auto_export_directory"`
 	AutoExportCheckIntervalSeconds int    `json:"auto_export_check_interval_seconds"`
 	AutoExportDeleteAfter          bool   `json:"auto_export_delete_after"`
+	// AutoExportMaxBacklogAgeSeconds is the backlog-age fallback trigger: even
+	// when pending bytes are below AutoExportThresholdBytes, an export fires once
+	// the OLDEST pending-export record is older than this, so low-traffic periods
+	// (where the backlog never reaches the byte threshold) still export on time
+	// and their partitions can be reclaimed instead of pinning disk indefinitely.
+	// Should be well below partition_retain_hours. 0 disables the fallback (byte
+	// threshold only). Default 1800s (30 min).
+	AutoExportMaxBacklogAgeSeconds int64 `json:"auto_export_max_backlog_age_seconds"`
 }
 
 var conversationLogSetting = ConversationLogSetting{
@@ -356,6 +365,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoExportDirectory:            filepath.Join("data", "conversation_exports", "auto"),
 	AutoExportCheckIntervalSeconds: defaultAutoExportCheckInterval,
 	AutoExportDeleteAfter:          true,
+	AutoExportMaxBacklogAgeSeconds: defaultAutoExportMaxBacklogAge,
 	S3: S3Setting{
 		RotationMaxObjects:     defaultS3RotationMaxObjects,
 		UploadConcurrency:      defaultS3UploadConcurrency,
@@ -448,6 +458,11 @@ func GetSetting() ConversationLogSetting {
 	}
 	if setting.AutoExportCheckIntervalSeconds <= 0 {
 		setting.AutoExportCheckIntervalSeconds = defaultAutoExportCheckInterval
+	}
+	// Negative is a misconfiguration → restore the default; 0 is a valid explicit
+	// "disable the backlog-age fallback" (byte threshold only).
+	if setting.AutoExportMaxBacklogAgeSeconds < 0 {
+		setting.AutoExportMaxBacklogAgeSeconds = defaultAutoExportMaxBacklogAge
 	}
 
 	setting.S3.RotationMaxObjects = clampRotationMaxObjects(setting.S3.RotationMaxObjects)

@@ -223,6 +223,7 @@ func UpdateConversationLogSettings(c *gin.Context) {
 		AutoExportDirectory            *string `json:"auto_export_directory"`
 		AutoExportCheckIntervalSeconds *int    `json:"auto_export_check_interval_seconds"`
 		AutoExportDeleteAfter          *bool   `json:"auto_export_delete_after"`
+		AutoExportMaxBacklogAgeSeconds *int64  `json:"auto_export_max_backlog_age_seconds"`
 
 		// High-volume / data-quality knobs added for the partitioned pipeline.
 		RetainOriginalBodies                *bool  `json:"retain_original_bodies"`
@@ -465,6 +466,16 @@ func UpdateConversationLogSettings(c *gin.Context) {
 	}
 	if req.AutoExportDeleteAfter != nil {
 		if err := model.UpdateOption("conversation_log_setting.auto_export_delete_after", strconv.FormatBool(*req.AutoExportDeleteAfter)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.AutoExportMaxBacklogAgeSeconds != nil {
+		if *req.AutoExportMaxBacklogAgeSeconds < 0 {
+			common.ApiErrorMsg(c, "auto_export_max_backlog_age_seconds must be >= 0 (0 disables the fallback)")
+			return
+		}
+		if err := model.UpdateOption("conversation_log_setting.auto_export_max_backlog_age_seconds", strconv.FormatInt(*req.AutoExportMaxBacklogAgeSeconds, 10)); err != nil {
 			common.ApiError(c, err)
 			return
 		}

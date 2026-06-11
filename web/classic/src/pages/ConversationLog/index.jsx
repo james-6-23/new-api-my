@@ -103,6 +103,7 @@ const defaultSettings = {
   auto_export_directory: 'data/conversation_exports/auto',
   auto_export_check_interval_seconds: 300,
   auto_export_delete_after: true,
+  auto_export_max_backlog_age_seconds: 1800,
   export_scan_batch_size: 5000,
   export_scan_batch_max_bytes: defaultExportScanBatchMaxBytes,
   export_mark_batch_size: 2000,
@@ -2501,6 +2502,26 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             auto_export_delete_after: value,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} md={8}>
+                      <Form.InputNumber
+                        field='auto_export_max_backlog_age_seconds'
+                        label={t('积压兜底时长 (秒)')}
+                        min={0}
+                        step={60}
+                        suffix={t('秒')}
+                        extraText={t(
+                          '最老待导出记录超过此时长即强制导出（即使未达大小阈值），保证低流量时段分区也能按时回收。0 关闭，默认 1800（30 分钟）',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_max_backlog_age_seconds: Number(
+                              value || 0,
+                            ),
                           })
                         }
                       />

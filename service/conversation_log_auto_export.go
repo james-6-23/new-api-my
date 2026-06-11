@@ -62,12 +62,28 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 	// partition mode (rows aren't deleted), so it would stay above any threshold
 	// and fire on every tick; the backlog falls back to 0 after each batch and
 	// restores the intended "export once enough has accumulated" behaviour.
-	pendingBytes, err := model.PendingExportStorageBytes(ConversationValidationValid)
+	pendingBytes, oldestPendingAt, err := model.PendingExportBacklog(ConversationValidationValid)
 	if err != nil {
-		common.SysError("auto export: pending bytes lookup failed: " + err.Error())
+		common.SysError("auto export: pending backlog lookup failed: " + err.Error())
 		return
 	}
-	if pendingBytes < threshold {
+	// Two triggers (OR):
+	//   1. byte threshold  — enough has accumulated to be worth a batch (high traffic).
+	//   2. backlog-age fallback — the oldest pending record is older than
+	//      AutoExportMaxBacklogAgeSeconds. Without this, a low-traffic window whose
+	//      backlog never reaches the byte threshold would leave valid records
+	//      un-exported, which in turn pins their partition past retention (the
+	//      DROP safety gate blocks on valid+un-exported rows) and disk is never
+	//      reclaimed. The age trigger drains it on time. 0 disables the fallback.
+	reason := ""
+	if pendingBytes >= threshold {
+		reason = "byte_threshold"
+	} else if maxAge := settings.AutoExportMaxBacklogAgeSeconds; maxAge > 0 && oldestPendingAt > 0 {
+		if age := common.GetTimestamp() - oldestPendingAt; age >= maxAge {
+			reason = "backlog_age"
+		}
+	}
+	if reason == "" {
 		return
 	}
 
@@ -109,7 +125,7 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		common.SysError("auto export: create job failed: " + err.Error())
 		return
 	}
-	common.SysLog("auto export: triggered job " + job.JobId + " (storage_bytes >= threshold)")
+	common.SysLog("auto export: triggered job " + job.JobId + " (reason=" + reason + ")")
 }
 
 func autoExportLocalExportEnabled(settings conversation_log_setting.ConversationLogSetting) bool {
