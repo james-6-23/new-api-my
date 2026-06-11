@@ -433,6 +433,7 @@ type ConversationLogPartitionInfo struct {
 	DiskBytes     int64  `json:"disk_bytes"`     // physical footprint incl. TOAST + indexes
 	IsFuture      bool   `json:"is_future"`      // window starts in the future (pre-created)
 	Droppable     bool   `json:"droppable"`      // past retention AND no valid_pending → auto-DROP eligible
+	ReclaimAt     int64  `json:"reclaim_at"`     // earliest unix time eligible for DROP (window end + retain)
 }
 
 // ConversationLogPartitionOverview is the payload for the partition viz panel.
@@ -533,6 +534,11 @@ func GetConversationLogPartitionStats() (ConversationLogPartitionOverview, error
 			// Mirror DropExportedConversationLogPartitions: whole window past the
 			// retention cutoff AND no valid+un-exported rows pinning it.
 			Droppable: end <= retainCutoff && r.ValidPending == 0,
+			// Earliest time the retention gate opens (window end + retain window).
+			// now - retainCutoff is exactly the retain duration, so this stays in
+			// lockstep with the Droppable cutoff above. Actual DROP still also
+			// requires ValidPending == 0.
+			ReclaimAt: end + (now - retainCutoff),
 		})
 		overview.TotalDiskBytes += s.DiskBytes
 		overview.TotalStorageBytes += r.Bytes

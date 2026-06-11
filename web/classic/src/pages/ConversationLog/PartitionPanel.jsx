@@ -87,6 +87,18 @@ function dayLabel(ts) {
   return timestamp2string(ts).slice(5, 10); // MM-DD
 }
 
+// shortDuration renders a second count as a compact h/m/s string for "in X".
+function shortDuration(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h${m % 60}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  return h % 24 ? `${d}d${h % 24}h` : `${d}d`;
+}
+
 export default function PartitionPanel() {
   const { t } = useTranslation();
   const [data, setData] = useState(null);
@@ -287,6 +299,7 @@ export default function PartitionPanel() {
                   segments={SEGMENTS}
                   status={statusOf(p)}
                   current={isCurrent(p)}
+                  now={now}
                   t={t}
                 />
               </Col>
@@ -371,9 +384,48 @@ function donutBackground(p, segments) {
 
 // PartitionCard — one partition as a card: time window + status, a conic ring
 // with disk size at its center, and the four-class legend with counts.
-function PartitionCard({ p, segments, status, current, t }) {
+function PartitionCard({ p, segments, status, current, now, t }) {
   const total = p.total || 0;
   const ring = donutBackground(p, segments);
+
+  // Reclaim-time line: when the retention gate opens, and whether anything is
+  // still pinning the partition past that point.
+  const reclaimAt = p.reclaim_at || 0;
+  const remaining = reclaimAt - (now || 0);
+  let reclaimInfo;
+  if (reclaimAt <= 0) {
+    reclaimInfo = (
+      <Text type='tertiary' size='small'>
+        —
+      </Text>
+    );
+  } else if (remaining > 0) {
+    // Not yet eligible — show the countdown, absolute time on hover.
+    reclaimInfo = (
+      <Tooltip content={`${dayLabel(reclaimAt)} ${hourMinute(reclaimAt)}`}>
+        <Text type='tertiary' size='small'>
+          {t('约 {{d}} 后', { d: shortDuration(remaining) })}
+        </Text>
+      </Tooltip>
+    );
+  } else if (p.valid_pending > 0) {
+    // Past retention but blocked by un-exported valid records.
+    reclaimInfo = (
+      <Tooltip content={t('已过保留期，但仍有待导出记录，导出后才会回收')}>
+        <Text style={{ color: 'var(--semi-color-warning)' }} size='small'>
+          {t('待导出后回收')}
+        </Text>
+      </Tooltip>
+    );
+  } else {
+    // Past retention and clean — next maintenance tick will DROP it.
+    reclaimInfo = (
+      <Text style={{ color: 'var(--semi-color-success)' }} size='small'>
+        {t('即将回收')}
+      </Text>
+    );
+  }
+
   return (
     <div className={`cl-part-card${current ? ' cl-part-current' : ''}`}>
       {/* header */}
@@ -470,6 +522,23 @@ function PartitionCard({ p, segments, status, current, t }) {
             );
           })}
         </div>
+      </div>
+
+      {/* reclaim-time footer */}
+      <div
+        className='flex items-center justify-between mt-3 pt-2'
+        style={{ borderTop: '1px solid var(--semi-color-fill-1)' }}
+      >
+        <Text type='tertiary' size='small'>
+          {p.is_future ? t('预留窗口') : t('预计回收')}
+        </Text>
+        {p.is_future ? (
+          <Text type='tertiary' size='small'>
+            {dayLabel(p.start_ts)} {hourMinute(p.start_ts)}
+          </Text>
+        ) : (
+          reclaimInfo
+        )}
       </div>
     </div>
   );
