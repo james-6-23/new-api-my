@@ -215,6 +215,10 @@ const EditChannelModal = (props) => {
     allow_speed: false,
     conversation_log_enabled: false,
     claude_beta_query: false,
+    // 客户端限制（存入 settings JSON）
+    client_restriction_enabled: false,
+    client_restriction_mode: 'allow',
+    client_restriction_clients: [],
     upstream_model_update_check_enabled: false,
     upstream_model_update_auto_sync_enabled: false,
     upstream_model_update_last_check_time: 0,
@@ -919,6 +923,20 @@ const EditChannelModal = (props) => {
           data.conversation_log_enabled =
             parsedSettings.conversation_log_enabled === true;
           data.claude_beta_query = parsedSettings.claude_beta_query || false;
+          // 读取客户端限制设置
+          data.client_restriction_enabled =
+            parsedSettings.client_restriction_enabled === true;
+          data.client_restriction_mode =
+            parsedSettings.client_restriction_mode === 'block'
+              ? 'block'
+              : 'allow';
+          data.client_restriction_clients = Array.isArray(
+            parsedSettings.client_restriction_clients,
+          )
+            ? parsedSettings.client_restriction_clients.filter(
+                (c) => typeof c === 'string',
+              )
+            : [];
           data.upstream_model_update_check_enabled =
             parsedSettings.upstream_model_update_check_enabled === true;
           data.upstream_model_update_auto_sync_enabled =
@@ -950,6 +968,9 @@ const EditChannelModal = (props) => {
           data.allow_speed = false;
           data.conversation_log_enabled = false;
           data.claude_beta_query = false;
+          data.client_restriction_enabled = false;
+          data.client_restriction_mode = 'allow';
+          data.client_restriction_clients = [];
           data.upstream_model_update_check_enabled = false;
           data.upstream_model_update_auto_sync_enabled = false;
           data.upstream_model_update_last_check_time = 0;
@@ -969,6 +990,9 @@ const EditChannelModal = (props) => {
         data.allow_speed = false;
         data.conversation_log_enabled = false;
         data.claude_beta_query = false;
+        data.client_restriction_enabled = false;
+        data.client_restriction_mode = 'allow';
+        data.client_restriction_clients = [];
         data.upstream_model_update_check_enabled = false;
         data.upstream_model_update_auto_sync_enabled = false;
         data.upstream_model_update_last_check_time = 0;
@@ -1882,6 +1906,27 @@ const EditChannelModal = (props) => {
       settings.upstream_model_update_last_check_time = 0;
     }
 
+    // 客户端限制设置（适用于所有渠道类型）
+    if (localInputs.client_restriction_enabled === true) {
+      settings.client_restriction_enabled = true;
+      settings.client_restriction_mode =
+        localInputs.client_restriction_mode === 'block' ? 'block' : 'allow';
+      settings.client_restriction_clients = Array.from(
+        new Set(
+          (Array.isArray(localInputs.client_restriction_clients)
+            ? localInputs.client_restriction_clients
+            : []
+          )
+            .map((c) => String(c ?? '').trim())
+            .filter(Boolean),
+        ),
+      );
+    } else {
+      delete settings.client_restriction_enabled;
+      delete settings.client_restriction_mode;
+      delete settings.client_restriction_clients;
+    }
+
     localInputs.settings = JSON.stringify(settings);
 
     // 清理不需要发送到后端的字段
@@ -1905,6 +1950,9 @@ const EditChannelModal = (props) => {
     delete localInputs.allow_speed;
     delete localInputs.conversation_log_enabled;
     delete localInputs.claude_beta_query;
+    delete localInputs.client_restriction_enabled;
+    delete localInputs.client_restriction_mode;
+    delete localInputs.client_restriction_clients;
     delete localInputs.upstream_model_update_check_enabled;
     delete localInputs.upstream_model_update_auto_sync_enabled;
     delete localInputs.upstream_model_update_last_check_time;
@@ -2362,6 +2410,80 @@ const EditChannelModal = (props) => {
                     </div>
                   </div>
                 )}
+
+                {/* Client Restriction Section */}
+                <div className='py-3 border-b border-gray-100'>
+                  <Text className='text-sm font-medium text-gray-500 mb-3 block'>
+                    {t('客户端限制')}
+                  </Text>
+
+                  <Form.Switch
+                    field='client_restriction_enabled'
+                    label={t('开启客户端限制')}
+                    checkedText={t('开')}
+                    uncheckedText={t('关')}
+                    onChange={(value) =>
+                      handleChannelOtherSettingsChange(
+                        'client_restriction_enabled',
+                        value,
+                      )
+                    }
+                    extraText={t(
+                      '开启后，仅允许/禁止指定客户端（如 Claude Code）使用该渠道',
+                    )}
+                  />
+                  {inputs.client_restriction_enabled && (
+                    <>
+                      <Form.Select
+                        field='client_restriction_mode'
+                        label={t('限制模式')}
+                        style={{ width: '100%' }}
+                        optionList={[
+                          {
+                            label: t('白名单（仅允许列出的客户端）'),
+                            value: 'allow',
+                          },
+                          {
+                            label: t('黑名单（禁用列出的客户端）'),
+                            value: 'block',
+                          },
+                        ]}
+                        onChange={(value) =>
+                          handleChannelOtherSettingsChange(
+                            'client_restriction_mode',
+                            value,
+                          )
+                        }
+                      />
+                      <Form.Select
+                        field='client_restriction_clients'
+                        label={t('客户端')}
+                        placeholder={t(
+                          '选择客户端或输入自定义 User-Agent 关键词',
+                        )}
+                        multiple
+                        allowCreate
+                        filter
+                        style={{ width: '100%' }}
+                        optionList={[
+                          { label: 'Claude Code', value: 'claude-code' },
+                          { label: 'Codex CLI', value: 'codex-cli' },
+                          { label: 'Gemini CLI', value: 'gemini-cli' },
+                          { label: 'Factory CLI', value: 'factory-cli' },
+                        ]}
+                        onChange={(value) =>
+                          handleChannelOtherSettingsChange(
+                            'client_restriction_clients',
+                            value,
+                          )
+                        }
+                        extraText={t(
+                          '预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）',
+                        )}
+                      />
+                    </>
+                  )}
+                </div>
 
                 {/* Request Config Section */}
                 <div className='py-3 border-b border-gray-100'>

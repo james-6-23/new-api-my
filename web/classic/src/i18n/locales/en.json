@@ -4117,6 +4117,15 @@
     "总进度": "Overall progress",
     "删除进度": "Delete progress",
     "条记录": "records",
-    "原始": "Raw"
+    "原始": "Raw",
+    "客户端限制": "Client Restriction",
+    "开启客户端限制": "Enable Client Restriction",
+    "开启后，仅允许/禁止指定客户端（如 Claude Code）使用该渠道": "When enabled, only allow/deny specified clients (e.g. Claude Code) to use this channel",
+    "限制模式": "Restriction Mode",
+    "白名单（仅允许列出的客户端）": "Allowlist (only listed clients)",
+    "黑名单（禁用列出的客户端）": "Blocklist (listed clients denied)",
+    "客户端": "Clients",
+    "选择客户端或输入自定义 User-Agent 关键词": "Select clients or enter custom User-Agent keywords",
+    "预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）": "Preset clients are matched by request signals; custom entries match the User-Agent (supports * wildcard)"
   }
 }
