@@ -47,6 +47,7 @@ import {
   Route,
   Server,
   Settings,
+  ShieldCheck,
   SlidersHorizontal,
   Wand2,
 } from 'lucide-react'
@@ -242,7 +243,8 @@ function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
     values.claude_beta_query ||
     values.upstream_model_update_check_enabled ||
     values.upstream_model_update_auto_sync_enabled ||
-    values.upstream_model_update_ignored_models?.trim()
+    values.upstream_model_update_ignored_models?.trim() ||
+    values.client_restriction_enabled
   )
 }
 
@@ -290,6 +292,15 @@ function SubHeading({ title, icon }: { title: string; icon?: ReactNode }) {
     </div>
   )
 }
+
+// Preset client identifiers for the channel client-restriction feature.
+// Values must match the backend builtin keywords in service/client_detector.go.
+const CLIENT_RESTRICTION_PRESET_OPTIONS = [
+  { label: 'Claude Code', value: 'claude-code' },
+  { label: 'Codex CLI', value: 'codex-cli' },
+  { label: 'Gemini CLI', value: 'gemini-cli' },
+  { label: 'Factory CLI', value: 'factory-cli' },
+]
 
 export function ChannelMutateDrawer({
   open,
@@ -398,6 +409,7 @@ export function ChannelMutateDrawer({
   const upstreamModelUpdateCheckEnabled = form.watch(
     'upstream_model_update_check_enabled'
   )
+  const clientRestrictionEnabled = form.watch('client_restriction_enabled')
   const currentSettings = form.watch('settings')
   const {
     unlocked: doubaoApiEditUnlocked,
@@ -3217,6 +3229,94 @@ export function ChannelMutateDrawer({
                         </FormItem>
                       )}
                     />
+
+                    <div className='space-y-3 rounded-lg border p-4'>
+                      <SubHeading
+                        title={t('Client Restriction')}
+                        icon={<ShieldCheck className='h-3.5 w-3.5' />}
+                      />
+                      <FormField
+                        control={form.control}
+                        name='client_restriction_enabled'
+                        render={({ field }) => (
+                          <FormItem className='flex items-center justify-between'>
+                            <div className='space-y-0.5'>
+                              <FormLabel>
+                                {t('Enable Client Restriction')}
+                              </FormLabel>
+                              <FormDescription>
+                                {t(
+                                  'Restrict which clients (e.g. Claude Code) are allowed to use this channel'
+                                )}
+                              </FormDescription>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                      {clientRestrictionEnabled && (
+                        <>
+                          <FormField
+                            control={form.control}
+                            name='client_restriction_mode'
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>{t('Restriction Mode')}</FormLabel>
+                                <Select
+                                  value={field.value || 'allow'}
+                                  onValueChange={field.onChange}
+                                >
+                                  <FormControl>
+                                    <SelectTrigger>
+                                      <SelectValue />
+                                    </SelectTrigger>
+                                  </FormControl>
+                                  <SelectContent>
+                                    <SelectItem value='allow'>
+                                      {t('Allowlist (only listed clients)')}
+                                    </SelectItem>
+                                    <SelectItem value='block'>
+                                      {t('Blocklist (listed clients denied)')}
+                                    </SelectItem>
+                                  </SelectContent>
+                                </Select>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name='client_restriction_clients'
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>{t('Clients')}</FormLabel>
+                                <FormControl>
+                                  <MultiSelect
+                                    options={CLIENT_RESTRICTION_PRESET_OPTIONS}
+                                    selected={field.value || []}
+                                    onChange={field.onChange}
+                                    placeholder={t(
+                                      'Select clients or add custom User-Agent keywords'
+                                    )}
+                                  />
+                                </FormControl>
+                                <FormDescription>
+                                  {t(
+                                    'Preset clients are matched by request signals; custom entries match the User-Agent (supports * wildcard)'
+                                  )}
+                                </FormDescription>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        </>
+                      )}
+                    </div>
 
                     {MODEL_FETCHABLE_TYPES.has(currentType) && (
                       <div className='space-y-3 rounded-lg border p-4'>

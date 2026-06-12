@@ -42,7 +42,19 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastDetectedModels []string      `json:"upstream_model_update_last_detected_models,omitempty"` // 上次检测到的可加入模型
 	UpstreamModelUpdateLastRemovedModels  []string      `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string      `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
+
+	// 客户端限制：限制只有特定客户端（如 Claude Code CLI）才能使用该渠道
+	ClientRestrictionEnabled bool                  `json:"client_restriction_enabled,omitempty"` // 是否开启客户端限制
+	ClientRestrictionMode    ClientRestrictionMode `json:"client_restriction_mode,omitempty"`    // "allow"=白名单（仅列出的客户端可用）/ "block"=黑名单（列出的客户端禁用）
+	ClientRestrictionClients []string              `json:"client_restriction_clients,omitempty"` // 客户端标识列表，如 "claude-code"、"codex-cli"、"gemini-cli" 或自定义 UA 关键词
 }
+
+type ClientRestrictionMode string
+
+const (
+	ClientRestrictionModeAllow ClientRestrictionMode = "allow" // 白名单模式
+	ClientRestrictionModeBlock ClientRestrictionMode = "block" // 黑名单模式
+)
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {
 	if s == nil || s.OpenRouterEnterprise == nil {

@@ -78,6 +78,10 @@ export const channelFormSchema = z.object({
   upstream_model_update_check_enabled: z.boolean().optional(),
   upstream_model_update_auto_sync_enabled: z.boolean().optional(),
   upstream_model_update_ignored_models: z.string().optional(),
+  // Client restriction settings (stored in settings JSON)
+  client_restriction_enabled: z.boolean().optional(),
+  client_restriction_mode: z.enum(['allow', 'block']).optional(),
+  client_restriction_clients: z.array(z.string()).optional(),
 })
 
 export type ChannelFormValues = z.infer<typeof channelFormSchema>
@@ -135,6 +139,10 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   upstream_model_update_check_enabled: false,
   upstream_model_update_auto_sync_enabled: false,
   upstream_model_update_ignored_models: '',
+  // Client restriction settings
+  client_restriction_enabled: false,
+  client_restriction_mode: 'allow',
+  client_restriction_clients: [],
 }
 
 // ============================================================================
@@ -189,6 +197,9 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateCheckEnabled = false
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
+  let clientRestrictionEnabled = false
+  let clientRestrictionMode: 'allow' | 'block' = 'allow'
+  let clientRestrictionClients: string[] = []
 
   if (channel.settings) {
     try {
@@ -213,6 +224,16 @@ export function transformChannelToFormDefaults(
       )
         ? parsed.upstream_model_update_ignored_models.join(',')
         : ''
+      clientRestrictionEnabled = parsed.client_restriction_enabled === true
+      clientRestrictionMode =
+        parsed.client_restriction_mode === 'block' ? 'block' : 'allow'
+      clientRestrictionClients = Array.isArray(
+        parsed.client_restriction_clients
+      )
+        ? parsed.client_restriction_clients.filter(
+            (c: unknown): c is string => typeof c === 'string'
+          )
+        : []
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('Failed to parse channel settings:', error)
@@ -262,6 +283,9 @@ export function transformChannelToFormDefaults(
     upstream_model_update_check_enabled: upstreamModelUpdateCheckEnabled,
     upstream_model_update_auto_sync_enabled: upstreamModelUpdateAutoSyncEnabled,
     upstream_model_update_ignored_models: upstreamModelUpdateIgnoredModels,
+    client_restriction_enabled: clientRestrictionEnabled,
+    client_restriction_mode: clientRestrictionMode,
+    client_restriction_clients: clientRestrictionClients,
   }
 }
 
@@ -384,6 +408,27 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     if (typeof settingsObj.upstream_model_update_last_check_time !== 'number') {
       settingsObj.upstream_model_update_last_check_time = 0
     }
+  }
+
+  // Client restriction settings (applies to all channel types)
+  if (formData.client_restriction_enabled) {
+    settingsObj.client_restriction_enabled = true
+    settingsObj.client_restriction_mode =
+      formData.client_restriction_mode === 'block' ? 'block' : 'allow'
+    settingsObj.client_restriction_clients = Array.from(
+      new Set(
+        (formData.client_restriction_clients || [])
+          .map((c) => c.trim())
+          .filter(Boolean)
+      )
+    )
+  } else {
+    if ('client_restriction_enabled' in settingsObj)
+      delete settingsObj.client_restriction_enabled
+    if ('client_restriction_mode' in settingsObj)
+      delete settingsObj.client_restriction_mode
+    if ('client_restriction_clients' in settingsObj)
+      delete settingsObj.client_restriction_clients
   }
 
   return JSON.stringify(settingsObj)

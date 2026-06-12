@@ -157,6 +157,15 @@ func Distribute() func(c *gin.Context) {
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		// 渠道级客户端限制：判断当前请求的客户端是否被该渠道允许
+		if channel != nil {
+			if allowed, detected := service.IsClientAllowedByChannel(c, channel.GetOtherSettings()); !allowed {
+				abortWithOpenAiMessage(c, http.StatusForbidden,
+					i18n.T(c, i18n.MsgDistributorClientRestricted, map[string]any{"Client": detected}),
+					types.ErrorCodeChannelClientRestricted)
+				return
+			}
+		}
 		c.Next()
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
