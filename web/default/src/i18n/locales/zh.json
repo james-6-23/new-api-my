@@ -4486,6 +4486,11 @@
     "Blocklist (listed clients denied)": "黑名单（禁用列出的客户端）",
     "Clients": "客户端",
     "Select clients or add custom User-Agent keywords": "选择客户端或添加自定义 User-Agent 关键词",
-    "Preset clients are matched by request signals; custom entries match the User-Agent (supports * wildcard)": "预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）"
+    "Preset clients are matched by request signals; custom entries match the User-Agent (supports * wildcard)": "预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）",
+    "Claude Code Anti-Spoofing": "Claude Code 防伪装",
+    "Require Strong Signal": "要求强信号",
+    "Require a hard-to-forge signal (the Claude Code system prompt or the full x-stainless-* header suite). Strongly recommended; blocks header-only spoofing.": "要求命中难以伪造的强信号（Claude Code system prompt 或完整 x-stainless-* 请求头）。强烈建议开启，可拦截仅靠伪造请求头的冒充。",
+    "Detection Score Threshold": "识别打分阈值",
+    "Weighted score required to be recognized as Claude Code (default 4, range 1-13). Higher = stricter. Signals: system prompt +4, x-stainless suite +3, valid anthropic-beta +2, metadata.user_id +2, UA +1, x-app +1.": "认定为 Claude Code 所需的加权总分（默认 4，范围 1-13），越高越严格。信号分值：system prompt +4、x-stainless 全套 +3、合法 anthropic-beta +2、metadata.user_id +2、UA +1、x-app +1。"
   }
 }

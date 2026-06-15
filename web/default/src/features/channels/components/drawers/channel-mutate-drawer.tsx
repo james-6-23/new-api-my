@@ -410,6 +410,10 @@ export function ChannelMutateDrawer({
     'upstream_model_update_check_enabled'
   )
   const clientRestrictionEnabled = form.watch('client_restriction_enabled')
+  const clientRestrictionClients = form.watch('client_restriction_clients')
+  const claudeCodeRestrictionSelected = (
+    clientRestrictionClients || []
+  ).includes('claude-code')
   const currentSettings = form.watch('settings')
   const {
     unlocked: doubaoApiEditUnlocked,
@@ -3314,6 +3318,68 @@ export function ChannelMutateDrawer({
                               </FormItem>
                             )}
                           />
+                          {claudeCodeRestrictionSelected && (
+                            <div className='space-y-3 rounded-md border border-dashed p-3'>
+                              <FormLabel className='text-xs font-medium text-muted-foreground'>
+                                {t('Claude Code Anti-Spoofing')}
+                              </FormLabel>
+                              <FormField
+                                control={form.control}
+                                name='client_restriction_claude_code_require_strong'
+                                render={({ field }) => (
+                                  <FormItem className='flex items-center justify-between'>
+                                    <div className='space-y-0.5'>
+                                      <FormLabel>
+                                        {t('Require Strong Signal')}
+                                      </FormLabel>
+                                      <FormDescription>
+                                        {t(
+                                          'Require a hard-to-forge signal (the Claude Code system prompt or the full x-stainless-* header suite). Strongly recommended; blocks header-only spoofing.'
+                                        )}
+                                      </FormDescription>
+                                    </div>
+                                    <FormControl>
+                                      <Switch
+                                        checked={field.value !== false}
+                                        onCheckedChange={field.onChange}
+                                      />
+                                    </FormControl>
+                                  </FormItem>
+                                )}
+                              />
+                              <FormField
+                                control={form.control}
+                                name='client_restriction_claude_code_min_score'
+                                render={({ field }) => (
+                                  <FormItem>
+                                    <FormLabel>
+                                      {t('Detection Score Threshold')}
+                                    </FormLabel>
+                                    <FormControl>
+                                      <Input
+                                        type='number'
+                                        min={1}
+                                        max={13}
+                                        value={field.value ?? 4}
+                                        onChange={(e) => {
+                                          const v = Number(e.target.value)
+                                          field.onChange(
+                                            Number.isFinite(v) ? v : 4
+                                          )
+                                        }}
+                                      />
+                                    </FormControl>
+                                    <FormDescription>
+                                      {t(
+                                        'Weighted score required to be recognized as Claude Code (default 4, range 1-13). Higher = stricter. Signals: system prompt +4, x-stainless suite +3, valid anthropic-beta +2, metadata.user_id +2, UA +1, x-app +1.'
+                                      )}
+                                    </FormDescription>
+                                    <FormMessage />
+                                  </FormItem>
+                                )}
+                              />
+                            </div>
+                          )}
                         </>
                       )}
                     </div>

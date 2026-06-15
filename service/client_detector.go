@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/json"
+	"regexp"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,6 +17,11 @@ import (
 // 设计参考自 claude-code-hub：对内置的 claude-code 系列客户端不仅看 User-Agent，
 // 还结合 x-app、anthropic-beta、metadata.user_id 等信号做多重确认以防伪造；
 // 其它客户端（codex/gemini 等）及自定义关键词则直接按 User-Agent 子串/通配匹配。
+//
+// 针对 Claude Code 的强化（最严档）：采用「加权打分 + 强信号门控」。
+// 仅靠伪造若干 HTTP 头无法通过——必须命中至少一个难以伪造的强信号
+// （标志性 system prompt 或 Anthropic SDK 的 x-stainless-* 全套头），且加权总分达标。
+// 这能有效拦截「换个请求头假装 Claude Code 发常规聊天」的场景。
 
 // 内置客户端预设关键词 -> 用于匹配的 UA 子串（均为小写、已去除连字符/下划线）
 var builtinClientKeywords = map[string]struct{}{
@@ -66,50 +73,212 @@ func globMatch(pattern, text string) bool {
 	return pi == len(lp)
 }
 
-// confirmClaudeCodeSignals 统计 Claude Code 的特征信号数量
-// 信号：x-app:cli、UA 以 claude-cli/ 开头、存在 anthropic-beta、metadata.user_id 为非空字符串
-func confirmClaudeCodeSignals(c *gin.Context) int {
-	signals := 0
-	if strings.EqualFold(c.Request.Header.Get("x-app"), "cli") {
-		signals++
+// ===== Claude Code 强化识别 =====
+
+const (
+	// Claude Code 注入的标志性 system prompt 开头（强信号，常规聊天伪装几乎不会带）
+	claudeCodeSystemMarker = "You are Claude Code, Anthropic's official CLI for Claude."
+
+	// 加权打分阈值默认值：命中强信号的前提下，总分需达到此值才认定为真 Claude Code。
+	// 可被渠道配置 ClientRestrictionClaudeCodeMinScore 覆盖。
+	claudeCodeScoreThreshold = 4
+)
+
+// claudeCodeMinScore 返回生效的打分阈值（渠道未配置或配置非正数时回退默认值）
+func claudeCodeMinScore(settings dto.ChannelOtherSettings) int {
+	if settings.ClientRestrictionClaudeCodeMinScore != nil && *settings.ClientRestrictionClaudeCodeMinScore > 0 {
+		return *settings.ClientRestrictionClaudeCodeMinScore
 	}
-	ua := c.Request.Header.Get("User-Agent")
-	if strings.HasPrefix(strings.ToLower(ua), "claude-cli/") {
-		signals++
-	}
-	if c.Request.Header.Get("anthropic-beta") != "" {
-		signals++
-	}
-	if claudeCodeMetadataUserID(c) != "" {
-		signals++
-	}
-	return signals
+	return claudeCodeScoreThreshold
 }
 
-// claudeCodeMetadataUserID 从请求体中读取 metadata.user_id（兼容 OpenAI / Claude 两种请求格式）
-func claudeCodeMetadataUserID(c *gin.Context) string {
-	var body struct {
-		Metadata struct {
-			UserId string `json:"user_id"`
-		} `json:"metadata"`
+// claudeCodeRequireStrong 返回是否必须命中强信号（渠道未配置时默认 true）
+func claudeCodeRequireStrong(settings dto.ChannelOtherSettings) bool {
+	if settings.ClientRestrictionClaudeCodeRequireStrong != nil {
+		return *settings.ClientRestrictionClaudeCodeRequireStrong
 	}
-	// UnmarshalBodyReusable 会缓存并重置 body，不影响后续读取
-	if err := common.UnmarshalBodyReusable(c, &body); err != nil {
-		return ""
+	return true
+}
+
+// claudeCodeUAPattern 完整 UA 格式：claude-cli/<x.y.z> ...，前缀匹配过松，这里要求带语义化版本号
+var claudeCodeUAPattern = regexp.MustCompile(`(?i)^claude-cli/\d+\.\d+\.\d+`)
+
+// claudeCodeBetaPattern 形如 xxx-2025-04-20 的日期版本 beta flag
+var claudeCodeBetaPattern = regexp.MustCompile(`[a-z0-9-]+-\d{4}-\d{2}-\d{2}`)
+
+// claudeCodeKnownBetaFlags 已知的 Claude Code 相关 anthropic-beta flag（子串命中即可）
+var claudeCodeKnownBetaFlags = []string{
+	"claude-code",
+	"oauth-2025",
+	"interleaved-thinking",
+	"fine-grained-tool-streaming",
+	"context-1m",
+	"token-efficient-tools",
+	"prompt-caching",
+	"output-128k",
+}
+
+// claudeCodeBody 用于从请求体提取 Claude Code 特征（兼容 Claude 原生 / OpenAI 两种格式）
+type claudeCodeBody struct {
+	System   json.RawMessage `json:"system"`
+	Metadata struct {
+		UserId string `json:"user_id"`
+	} `json:"metadata"`
+	Messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	} `json:"messages"`
+}
+
+// extractSystemText 提取 system 文本：兼容 string、[]{type,text} 两种结构，并兜底扫描 OpenAI 的 system message
+func extractSystemText(body *claudeCodeBody) string {
+	var sb strings.Builder
+
+	appendBlocks := func(raw json.RawMessage) {
+		if len(raw) == 0 {
+			return
+		}
+		// 优先按字符串解析
+		var s string
+		if err := common.Unmarshal(raw, &s); err == nil {
+			sb.WriteString(s)
+			sb.WriteByte('\n')
+			return
+		}
+		// 再按 content block 数组解析
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := common.Unmarshal(raw, &blocks); err == nil {
+			for _, b := range blocks {
+				sb.WriteString(b.Text)
+				sb.WriteByte('\n')
+			}
+		}
 	}
-	return body.Metadata.UserId
+
+	// Claude 原生格式：顶层 system 字段
+	appendBlocks(body.System)
+
+	// OpenAI 格式兜底：messages 中 role==system 的内容
+	for _, m := range body.Messages {
+		if strings.EqualFold(m.Role, "system") {
+			appendBlocks(m.Content)
+		}
+	}
+
+	return sb.String()
+}
+
+// isClaudeCodeUserID 校验 metadata.user_id 是否符合 Claude Code 的格式特征
+// 真实形如：user_<hash>_account__session_<uuid>
+func isClaudeCodeUserID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	return strings.HasPrefix(id, "user_") && strings.Contains(id, "session_")
+}
+
+// hasStainlessSuite 判断是否带有 Anthropic SDK 自动注入的 x-stainless-* 全套头
+// （强信号：基于官方 SDK 的客户端会自动携带，手工伪造者通常不知道要补齐）
+func hasStainlessSuite(c *gin.Context) bool {
+	count := 0
+	hasLangOrRuntime := false
+	for k := range c.Request.Header {
+		lk := strings.ToLower(k)
+		if !strings.HasPrefix(lk, "x-stainless-") {
+			continue
+		}
+		count++
+		if lk == "x-stainless-lang" || lk == "x-stainless-runtime" {
+			hasLangOrRuntime = true
+		}
+	}
+	// 需同时满足：至少 3 个 stainless 头，且包含 lang/runtime 之一
+	return count >= 3 && hasLangOrRuntime
+}
+
+// hasValidClaudeBeta 判断 anthropic-beta 是否含合法 flag（而非任意非空值）
+func hasValidClaudeBeta(c *gin.Context) bool {
+	beta := strings.ToLower(strings.TrimSpace(c.Request.Header.Get("anthropic-beta")))
+	if beta == "" {
+		return false
+	}
+	for _, f := range claudeCodeKnownBetaFlags {
+		if strings.Contains(beta, f) {
+			return true
+		}
+	}
+	// 兜底：符合日期版本格式的 flag 也视为合法
+	return claudeCodeBetaPattern.MatchString(beta)
+}
+
+// detectClaudeCode 对当前请求做 Claude Code 加权打分
+// 返回 (score, hasStrongSignal)：hasStrongSignal 为是否命中难以伪造的强信号
+func detectClaudeCode(c *gin.Context) (int, bool) {
+	score := 0
+	strong := false
+
+	// 解析请求体（UnmarshalBodyReusable 会缓存并重置 body，不影响后续读取）
+	var body claudeCodeBody
+	_ = common.UnmarshalBodyReusable(c, &body)
+
+	// 强信号 1：标志性 system prompt（+4）
+	if strings.Contains(extractSystemText(&body), claudeCodeSystemMarker) {
+		score += 4
+		strong = true
+	}
+
+	// 强信号 2：Anthropic SDK 的 x-stainless-* 全套头（+3）
+	if hasStainlessSuite(c) {
+		score += 3
+		strong = true
+	}
+
+	// 中信号 1：合法的 anthropic-beta flag（+2）
+	if hasValidClaudeBeta(c) {
+		score += 2
+	}
+
+	// 中信号 2：符合格式的 metadata.user_id（+2）
+	if isClaudeCodeUserID(body.Metadata.UserId) {
+		score += 2
+	}
+
+	// 弱信号 1：完整 UA 格式 claude-cli/x.y.z（+1）
+	if claudeCodeUAPattern.MatchString(strings.TrimSpace(c.Request.Header.Get("User-Agent"))) {
+		score++
+	}
+
+	// 弱信号 2：x-app: cli（+1）
+	if strings.EqualFold(c.Request.Header.Get("x-app"), "cli") {
+		score++
+	}
+
+	return score, strong
+}
+
+// isClaudeCode 综合判定：可配置「是否必须命中强信号」与「打分阈值」
+func isClaudeCode(c *gin.Context, settings dto.ChannelOtherSettings) bool {
+	score, strong := detectClaudeCode(c)
+	if claudeCodeRequireStrong(settings) && !strong {
+		return false
+	}
+	return score >= claudeCodeMinScore(settings)
 }
 
 // matchClientPattern 判断请求是否匹配单个客户端标识 pattern
-func matchClientPattern(c *gin.Context, pattern string) bool {
+func matchClientPattern(c *gin.Context, pattern string, settings dto.ChannelOtherSettings) bool {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
 		return false
 	}
 
-	// 内置 claude-code：需要至少满足两个特征信号才认定为真正的 Claude Code，避免伪造
+	// 内置 claude-code：采用加权打分 + 强信号门控，仅靠伪造请求头无法通过
 	if pattern == "claude-code" {
-		return confirmClaudeCodeSignals(c) >= 2
+		return isClaudeCode(c, settings)
 	}
 
 	ua := strings.TrimSpace(c.Request.Header.Get("User-Agent"))
@@ -157,7 +326,7 @@ func IsClientAllowedByChannel(c *gin.Context, settings dto.ChannelOtherSettings)
 
 	matched := false
 	for _, pattern := range clients {
-		if matchClientPattern(c, pattern) {
+		if matchClientPattern(c, pattern, settings) {
 			matched = true
 			break
 		}

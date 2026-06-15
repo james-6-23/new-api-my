@@ -47,6 +47,11 @@ type ChannelOtherSettings struct {
 	ClientRestrictionEnabled bool                  `json:"client_restriction_enabled,omitempty"` // 是否开启客户端限制
 	ClientRestrictionMode    ClientRestrictionMode `json:"client_restriction_mode,omitempty"`    // "allow"=白名单（仅列出的客户端可用）/ "block"=黑名单（列出的客户端禁用）
 	ClientRestrictionClients []string              `json:"client_restriction_clients,omitempty"` // 客户端标识列表，如 "claude-code"、"codex-cli"、"gemini-cli" 或自定义 UA 关键词
+
+	// Claude Code 防伪装识别参数（仅对内置 "claude-code" 标识生效）。
+	// 使用指针以区分「未配置」(nil，回退默认值) 与「显式设置」；避免非指针 0 值被当作阈值=0 而放行一切。
+	ClientRestrictionClaudeCodeMinScore      *int  `json:"client_restriction_claude_code_min_score,omitempty"`      // 加权打分阈值，nil 时回退默认 4；范围约 1~13
+	ClientRestrictionClaudeCodeRequireStrong *bool `json:"client_restriction_claude_code_require_strong,omitempty"` // 是否必须命中强信号(system prompt / x-stainless 全套头)，nil 时回退默认 true
 }
 
 type ClientRestrictionMode string

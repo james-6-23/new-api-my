@@ -82,6 +82,9 @@ export const channelFormSchema = z.object({
   client_restriction_enabled: z.boolean().optional(),
   client_restriction_mode: z.enum(['allow', 'block']).optional(),
   client_restriction_clients: z.array(z.string()).optional(),
+  // Claude Code anti-spoofing tuning (only affects the built-in "claude-code" identifier)
+  client_restriction_claude_code_min_score: z.number().optional(),
+  client_restriction_claude_code_require_strong: z.boolean().optional(),
 })
 
 export type ChannelFormValues = z.infer<typeof channelFormSchema>
@@ -143,6 +146,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   client_restriction_enabled: false,
   client_restriction_mode: 'allow',
   client_restriction_clients: [],
+  client_restriction_claude_code_min_score: 4,
+  client_restriction_claude_code_require_strong: true,
 }
 
 // ============================================================================
@@ -200,6 +205,8 @@ export function transformChannelToFormDefaults(
   let clientRestrictionEnabled = false
   let clientRestrictionMode: 'allow' | 'block' = 'allow'
   let clientRestrictionClients: string[] = []
+  let clientRestrictionClaudeCodeMinScore = 4
+  let clientRestrictionClaudeCodeRequireStrong = true
 
   if (channel.settings) {
     try {
@@ -234,6 +241,20 @@ export function transformChannelToFormDefaults(
             (c: unknown): c is string => typeof c === 'string'
           )
         : []
+      if (
+        typeof parsed.client_restriction_claude_code_min_score === 'number' &&
+        parsed.client_restriction_claude_code_min_score > 0
+      ) {
+        clientRestrictionClaudeCodeMinScore =
+          parsed.client_restriction_claude_code_min_score
+      }
+      if (
+        typeof parsed.client_restriction_claude_code_require_strong ===
+        'boolean'
+      ) {
+        clientRestrictionClaudeCodeRequireStrong =
+          parsed.client_restriction_claude_code_require_strong
+      }
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('Failed to parse channel settings:', error)
@@ -286,6 +307,10 @@ export function transformChannelToFormDefaults(
     client_restriction_enabled: clientRestrictionEnabled,
     client_restriction_mode: clientRestrictionMode,
     client_restriction_clients: clientRestrictionClients,
+    client_restriction_claude_code_min_score:
+      clientRestrictionClaudeCodeMinScore,
+    client_restriction_claude_code_require_strong:
+      clientRestrictionClaudeCodeRequireStrong,
   }
 }
 
@@ -415,13 +440,31 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     settingsObj.client_restriction_enabled = true
     settingsObj.client_restriction_mode =
       formData.client_restriction_mode === 'block' ? 'block' : 'allow'
-    settingsObj.client_restriction_clients = Array.from(
+    const clients = Array.from(
       new Set(
         (formData.client_restriction_clients || [])
           .map((c) => c.trim())
           .filter(Boolean)
       )
     )
+    settingsObj.client_restriction_clients = clients
+
+    // Claude Code anti-spoofing tuning: only persist when claude-code is selected
+    if (clients.includes('claude-code')) {
+      const minScore = Number(formData.client_restriction_claude_code_min_score)
+      if (Number.isFinite(minScore) && minScore > 0) {
+        settingsObj.client_restriction_claude_code_min_score = minScore
+      } else if ('client_restriction_claude_code_min_score' in settingsObj) {
+        delete settingsObj.client_restriction_claude_code_min_score
+      }
+      settingsObj.client_restriction_claude_code_require_strong =
+        formData.client_restriction_claude_code_require_strong !== false
+    } else {
+      if ('client_restriction_claude_code_min_score' in settingsObj)
+        delete settingsObj.client_restriction_claude_code_min_score
+      if ('client_restriction_claude_code_require_strong' in settingsObj)
+        delete settingsObj.client_restriction_claude_code_require_strong
+    }
   } else {
     if ('client_restriction_enabled' in settingsObj)
       delete settingsObj.client_restriction_enabled
@@ -429,6 +472,10 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
       delete settingsObj.client_restriction_mode
     if ('client_restriction_clients' in settingsObj)
       delete settingsObj.client_restriction_clients
+    if ('client_restriction_claude_code_min_score' in settingsObj)
+      delete settingsObj.client_restriction_claude_code_min_score
+    if ('client_restriction_claude_code_require_strong' in settingsObj)
+      delete settingsObj.client_restriction_claude_code_require_strong
   }
 
   return JSON.stringify(settingsObj)

@@ -21,6 +21,10 @@ func newTestContext(method, body string, headers map[string]string) *gin.Context
 		reader = strings.NewReader("")
 	}
 	c.Request = httptest.NewRequest(method, "/v1/messages", reader)
+	// 有请求体时默认按 JSON 处理（UnmarshalBodyReusable 仅在 application/json 时解析 body）
+	if body != "" {
+		c.Request.Header.Set("Content-Type", "application/json")
+	}
 	for k, v := range headers {
 		c.Request.Header.Set(k, v)
 	}
@@ -35,6 +39,11 @@ func TestIsClientAllowedByChannel_Disabled(t *testing.T) {
 	}
 }
 
+// claudeCodeSystemBody 构造带标志性 system prompt 的真实 Claude Code 请求体
+func claudeCodeSystemBody() string {
+	return `{"system":"` + claudeCodeSystemMarker + ` You are an interactive CLI tool.","metadata":{"user_id":"user_abc123_account__session_de305d54-75b4-431b-adb2-eb6b9e546014"},"messages":[{"role":"user","content":"hi"}]}`
+}
+
 func TestIsClientAllowedByChannel_AllowlistClaudeCode(t *testing.T) {
 	settings := dto.ChannelOtherSettings{
 		ClientRestrictionEnabled: true,
@@ -42,14 +51,28 @@ func TestIsClientAllowedByChannel_AllowlistClaudeCode(t *testing.T) {
 		ClientRestrictionClients: []string{"claude-code"},
 	}
 
-	// 满足多个 Claude Code 信号 -> 允许
-	cc := newTestContext(http.MethodPost, `{"metadata":{"user_id":"user_abc"}}`, map[string]string{
-		"User-Agent":     "claude-cli/1.0.0 (external, cli)",
+	// 真实 Claude Code：标志性 system prompt（强信号）+ 合法 beta + 合法 user_id + 完整 UA -> 允许
+	cc := newTestContext(http.MethodPost, claudeCodeSystemBody(), map[string]string{
+		"User-Agent":     "claude-cli/1.0.30 (external, cli)",
 		"x-app":          "cli",
-		"anthropic-beta": "messages-2023-12-15",
+		"anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
 	})
 	if allowed, _ := IsClientAllowedByChannel(cc, settings); !allowed {
-		t.Fatalf("expected claude-code request to be allowed")
+		t.Fatalf("expected genuine claude-code request to be allowed")
+	}
+
+	// 真实 Claude Code：携带 Anthropic SDK 的 x-stainless-* 全套头（强信号）+ 合法 beta -> 允许
+	ccSdk := newTestContext(http.MethodPost, `{"messages":[{"role":"user","content":"hi"}]}`, map[string]string{
+		"User-Agent":                  "claude-cli/1.0.30 (external, cli)",
+		"x-app":                       "cli",
+		"anthropic-beta":              "fine-grained-tool-streaming-2025-05-14",
+		"x-stainless-lang":            "js",
+		"x-stainless-runtime":         "node",
+		"x-stainless-os":              "MacOS",
+		"x-stainless-package-version": "0.30.1",
+	})
+	if allowed, _ := IsClientAllowedByChannel(ccSdk, settings); !allowed {
+		t.Fatalf("expected claude-code request with stainless suite to be allowed")
 	}
 
 	// 普通客户端 -> 拒绝
@@ -69,6 +92,84 @@ func TestIsClientAllowedByChannel_AllowlistInsufficientSignals(t *testing.T) {
 	c := newTestContext(http.MethodPost, "", map[string]string{"User-Agent": "claude-cli/1.0.0"})
 	if allowed, _ := IsClientAllowedByChannel(c, settings); allowed {
 		t.Fatalf("expected single-signal request to be blocked")
+	}
+}
+
+// TestIsClientAllowedByChannel_SpoofBlocked 验证「只伪造请求头假装 Claude Code 发常规聊天」会被拦截
+func TestIsClientAllowedByChannel_SpoofBlocked(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		ClientRestrictionEnabled: true,
+		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
+		ClientRestrictionClients: []string{"claude-code"},
+	}
+
+	// 伪造场景 1：抄了所有弱信号头，但请求体是普通聊天、缺少强信号 -> 拒绝
+	// 弱信号：UA(+1) + x-app(+1)；中信号：合法 beta(+2)；无强信号 -> 总分 4 但 strong=false
+	spoof := newTestContext(http.MethodPost, `{"messages":[{"role":"user","content":"讲个笑话"}]}`, map[string]string{
+		"User-Agent":     "claude-cli/1.0.30 (external, cli)",
+		"x-app":          "cli",
+		"anthropic-beta": "claude-code-20250219",
+	})
+	if allowed, _ := IsClientAllowedByChannel(spoof, settings); allowed {
+		t.Fatalf("expected spoofed claude-code (no strong signal) to be blocked")
+	}
+
+	// 伪造场景 2：连 user_id 也伪造，但仍无标志性 system prompt / stainless 全套头 -> 拒绝
+	spoof2 := newTestContext(http.MethodPost, `{"metadata":{"user_id":"user_x_session_y"},"messages":[{"role":"user","content":"hi"}]}`, map[string]string{
+		"User-Agent":     "claude-cli/1.0.30 (external, cli)",
+		"x-app":          "cli",
+		"anthropic-beta": "claude-code-20250219",
+	})
+	if allowed, _ := IsClientAllowedByChannel(spoof2, settings); allowed {
+		t.Fatalf("expected spoofed claude-code (no strong signal) to be blocked even with faked user_id")
+	}
+}
+
+// TestIsClientAllowedByChannel_ConfigurableClaudeCode 验证可配置的打分阈值与强信号开关
+func TestIsClientAllowedByChannel_ConfigurableClaudeCode(t *testing.T) {
+	intPtr := func(i int) *int { return &i }
+	boolPtr := func(b bool) *bool { return &b }
+
+	// 伪装请求：UA(+1) + x-app(+1) + 合法 beta(+2) = 4 分，但无强信号
+	newSpoof := func() *gin.Context {
+		return newTestContext(http.MethodPost, `{"messages":[{"role":"user","content":"hi"}]}`, map[string]string{
+			"User-Agent":     "claude-cli/1.0.30 (external, cli)",
+			"x-app":          "cli",
+			"anthropic-beta": "claude-code-20250219",
+		})
+	}
+
+	// 默认配置（require strong）：伪装请求被拒绝
+	def := dto.ChannelOtherSettings{
+		ClientRestrictionEnabled: true,
+		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
+		ClientRestrictionClients: []string{"claude-code"},
+	}
+	if allowed, _ := IsClientAllowedByChannel(newSpoof(), def); allowed {
+		t.Fatalf("expected spoof blocked under default (require strong)")
+	}
+
+	// 关闭强信号要求 + 阈值设为 4：伪装请求（4 分）此时被放行（运营者主动放宽）
+	relaxed := def
+	relaxed.ClientRestrictionClaudeCodeRequireStrong = boolPtr(false)
+	relaxed.ClientRestrictionClaudeCodeMinScore = intPtr(4)
+	if allowed, _ := IsClientAllowedByChannel(newSpoof(), relaxed); !allowed {
+		t.Fatalf("expected spoof allowed when require-strong disabled and threshold=4")
+	}
+
+	// 关闭强信号但把阈值提到 5：4 分的伪装请求仍被拒绝
+	strictScore := def
+	strictScore.ClientRestrictionClaudeCodeRequireStrong = boolPtr(false)
+	strictScore.ClientRestrictionClaudeCodeMinScore = intPtr(5)
+	if allowed, _ := IsClientAllowedByChannel(newSpoof(), strictScore); allowed {
+		t.Fatalf("expected spoof blocked when threshold raised to 5")
+	}
+
+	// 阈值配置为非正数（0）应回退默认值，不会放行一切
+	zeroScore := def
+	zeroScore.ClientRestrictionClaudeCodeMinScore = intPtr(0)
+	if allowed, _ := IsClientAllowedByChannel(newTestContext(http.MethodPost, "", map[string]string{"User-Agent": "curl/8.0"}), zeroScore); allowed {
+		t.Fatalf("expected zero threshold to fall back to default and block curl")
 	}
 }
 

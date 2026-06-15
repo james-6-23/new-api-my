@@ -219,6 +219,8 @@ const EditChannelModal = (props) => {
     client_restriction_enabled: false,
     client_restriction_mode: 'allow',
     client_restriction_clients: [],
+    client_restriction_claude_code_min_score: 4,
+    client_restriction_claude_code_require_strong: true,
     upstream_model_update_check_enabled: false,
     upstream_model_update_auto_sync_enabled: false,
     upstream_model_update_last_check_time: 0,
@@ -937,6 +939,17 @@ const EditChannelModal = (props) => {
                 (c) => typeof c === 'string',
               )
             : [];
+          data.client_restriction_claude_code_min_score =
+            typeof parsedSettings.client_restriction_claude_code_min_score ===
+              'number' &&
+            parsedSettings.client_restriction_claude_code_min_score > 0
+              ? parsedSettings.client_restriction_claude_code_min_score
+              : 4;
+          data.client_restriction_claude_code_require_strong =
+            typeof parsedSettings.client_restriction_claude_code_require_strong ===
+            'boolean'
+              ? parsedSettings.client_restriction_claude_code_require_strong
+              : true;
           data.upstream_model_update_check_enabled =
             parsedSettings.upstream_model_update_check_enabled === true;
           data.upstream_model_update_auto_sync_enabled =
@@ -971,6 +984,8 @@ const EditChannelModal = (props) => {
           data.client_restriction_enabled = false;
           data.client_restriction_mode = 'allow';
           data.client_restriction_clients = [];
+          data.client_restriction_claude_code_min_score = 4;
+          data.client_restriction_claude_code_require_strong = true;
           data.upstream_model_update_check_enabled = false;
           data.upstream_model_update_auto_sync_enabled = false;
           data.upstream_model_update_last_check_time = 0;
@@ -993,6 +1008,8 @@ const EditChannelModal = (props) => {
         data.client_restriction_enabled = false;
         data.client_restriction_mode = 'allow';
         data.client_restriction_clients = [];
+        data.client_restriction_claude_code_min_score = 4;
+        data.client_restriction_claude_code_require_strong = true;
         data.upstream_model_update_check_enabled = false;
         data.upstream_model_update_auto_sync_enabled = false;
         data.upstream_model_update_last_check_time = 0;
@@ -1911,7 +1928,7 @@ const EditChannelModal = (props) => {
       settings.client_restriction_enabled = true;
       settings.client_restriction_mode =
         localInputs.client_restriction_mode === 'block' ? 'block' : 'allow';
-      settings.client_restriction_clients = Array.from(
+      const restrictionClients = Array.from(
         new Set(
           (Array.isArray(localInputs.client_restriction_clients)
             ? localInputs.client_restriction_clients
@@ -1921,10 +1938,30 @@ const EditChannelModal = (props) => {
             .filter(Boolean),
         ),
       );
+      settings.client_restriction_clients = restrictionClients;
+
+      // Claude Code 防伪装参数：仅在选中 claude-code 时写入
+      if (restrictionClients.includes('claude-code')) {
+        const minScore = Number(
+          localInputs.client_restriction_claude_code_min_score,
+        );
+        if (Number.isFinite(minScore) && minScore > 0) {
+          settings.client_restriction_claude_code_min_score = minScore;
+        } else {
+          delete settings.client_restriction_claude_code_min_score;
+        }
+        settings.client_restriction_claude_code_require_strong =
+          localInputs.client_restriction_claude_code_require_strong !== false;
+      } else {
+        delete settings.client_restriction_claude_code_min_score;
+        delete settings.client_restriction_claude_code_require_strong;
+      }
     } else {
       delete settings.client_restriction_enabled;
       delete settings.client_restriction_mode;
       delete settings.client_restriction_clients;
+      delete settings.client_restriction_claude_code_min_score;
+      delete settings.client_restriction_claude_code_require_strong;
     }
 
     localInputs.settings = JSON.stringify(settings);
@@ -1953,6 +1990,8 @@ const EditChannelModal = (props) => {
     delete localInputs.client_restriction_enabled;
     delete localInputs.client_restriction_mode;
     delete localInputs.client_restriction_clients;
+    delete localInputs.client_restriction_claude_code_min_score;
+    delete localInputs.client_restriction_claude_code_require_strong;
     delete localInputs.upstream_model_update_check_enabled;
     delete localInputs.upstream_model_update_auto_sync_enabled;
     delete localInputs.upstream_model_update_last_check_time;
@@ -2481,6 +2520,45 @@ const EditChannelModal = (props) => {
                           '预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）',
                         )}
                       />
+                      {Array.isArray(inputs.client_restriction_clients) &&
+                        inputs.client_restriction_clients.includes(
+                          'claude-code',
+                        ) && (
+                          <>
+                            <Form.Switch
+                              field='client_restriction_claude_code_require_strong'
+                              label={t('要求强信号')}
+                              checkedText={t('开')}
+                              uncheckedText={t('关')}
+                              onChange={(value) =>
+                                handleChannelOtherSettingsChange(
+                                  'client_restriction_claude_code_require_strong',
+                                  value,
+                                )
+                              }
+                              extraText={t(
+                                '要求命中难以伪造的强信号（Claude Code system prompt 或完整 x-stainless-* 请求头）。强烈建议开启，可拦截仅靠伪造请求头的冒充。',
+                              )}
+                            />
+                            <Form.InputNumber
+                              field='client_restriction_claude_code_min_score'
+                              label={t('识别打分阈值')}
+                              min={1}
+                              max={13}
+                              step={1}
+                              style={{ width: '100%' }}
+                              onChange={(value) =>
+                                handleChannelOtherSettingsChange(
+                                  'client_restriction_claude_code_min_score',
+                                  value,
+                                )
+                              }
+                              extraText={t(
+                                '认定为 Claude Code 所需的加权总分（默认 4，范围 1-13），越高越严格。信号分值：system prompt +4、x-stainless 全套 +3、合法 anthropic-beta +2、metadata.user_id +2、UA +1、x-app +1。',
+                              )}
+                            />
+                          </>
+                        )}
                     </>
                   )}
                 </div>
