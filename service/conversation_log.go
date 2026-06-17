@@ -242,9 +242,16 @@ func conversationCapturePausedByDisk(setting conversation_log_setting.Conversati
 	return true
 }
 
+// isConversationLogRelayFormat reports whether a relay format may be captured
+// and persisted at all. Conversation logging is restricted to the two API
+// entrypoints the export pipeline keeps — the Responses API (responses) and the
+// Claude messages API (messages). OpenAI chat-completions and Gemini traffic is
+// never stored, so we skip capturing it up front to avoid spending the capture
+// budget on records that would only be dropped before the DB write. This must
+// stay in sync with conversationLogStorableKind, the write-time gate.
 func isConversationLogRelayFormat(format types.RelayFormat) bool {
 	switch format {
-	case types.RelayFormatOpenAI, types.RelayFormatClaude, types.RelayFormatGemini,
+	case types.RelayFormatClaude,
 		types.RelayFormatOpenAIResponses, types.RelayFormatOpenAIResponsesCompaction:
 		return true
 	default:
@@ -403,6 +410,15 @@ func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.
 		len(log.ResponseBody) +
 		len(log.UsageJSON) +
 		len(log.InvalidReason))
+
+	// Storage is restricted to the responses/messages entrypoints the export
+	// pipeline keeps. Drop completions and unclassifiable ("mixed") traffic here
+	// so it is never persisted — capture is normally skipped for these formats by
+	// isConversationLogRelayFormat, but the final-request format can resolve to a
+	// non-storable kind even when the client format was eligible.
+	if !conversationLogStorable(log) {
+		return
+	}
 
 	recordConversationLog(ctx, log)
 }
@@ -1092,7 +1108,12 @@ func reconstructOpenAIChatStream(chunks []string) (string, []string) {
 func reconstructOpenAIResponsesStream(chunks []string) (string, []string) {
 	var finalResponse map[string]interface{}
 	outputText := ""
-	outputItems := make([]interface{}, 0)
+	// itemsByIndex keeps the terminal (output_item.done) snapshot of each
+	// structured output item, keyed by output_index so we can rebuild output[]
+	// in upstream order. Using a map de-dups the added/done event pair (the
+	// same item arrives first via output_item.added then output_item.done).
+	itemsByIndex := map[int]map[string]interface{}{}
+	fallbackItems := make([]interface{}, 0)
 	usage := interface{}(nil)
 	parsed := 0
 	for _, payload := range chunks {
@@ -1110,7 +1131,18 @@ func reconstructOpenAIResponsesStream(chunks []string) (string, []string) {
 		outputText += asString(obj["delta"])
 		outputText += asString(obj["output_text"])
 		if item, ok := asMap(obj["item"]); ok {
-			outputItems = append(outputItems, item)
+			eventType := asString(obj["type"])
+			// Only collect terminal item snapshots; output_item.added carries a
+			// not-yet-complete item (e.g. function_call without arguments) that
+			// output_item.done supersedes. Index by output_index when present so
+			// done overwrites added at the same position.
+			if eventType == "" || eventType == dto.ResponsesOutputTypeItemDone || eventType == dto.ResponsesOutputTypeItemAdded {
+				if idx, ok := obj["output_index"]; ok {
+					itemsByIndex[int(asFloat(idx))] = item
+				} else {
+					fallbackItems = append(fallbackItems, item)
+				}
+			}
 		}
 		if obj["usage"] != nil {
 			usage = obj["usage"]
@@ -1119,12 +1151,22 @@ func reconstructOpenAIResponsesStream(chunks []string) (string, []string) {
 	if parsed == 0 {
 		return "", []string{"stream_reconstruction_invalid_json"}
 	}
+	outputItems := orderedResponsesItems(itemsByIndex, fallbackItems)
 	if finalResponse != nil {
 		if outputText != "" && finalResponse["output_text"] == nil {
 			finalResponse["output_text"] = outputText
 		}
 		if usage != nil && finalResponse["usage"] == nil {
 			finalResponse["usage"] = usage
+		}
+		// Bug fix: the response object delivered by response.completed can carry
+		// an empty output[] when the structured items (message / function_call)
+		// were streamed separately via response.output_item.done events. Without
+		// this backfill we persist output:[] + output_text:"...", silently
+		// dropping every tool call. Rebuild output[] from the collected items so
+		// structured tool calls survive reconstruction.
+		if len(outputItems) > 0 && len(asSlice(finalResponse["output"])) == 0 {
+			finalResponse["output"] = outputItems
 		}
 		return mustJSONString(finalResponse), nil
 	}
@@ -1146,6 +1188,24 @@ func reconstructOpenAIResponsesStream(chunks []string) (string, []string) {
 		body["usage"] = usage
 	}
 	return mustJSONString(body), nil
+}
+
+// orderedResponsesItems flattens the index-keyed item snapshots (ascending by
+// output_index) followed by any items that arrived without an output_index.
+func orderedResponsesItems(itemsByIndex map[int]map[string]interface{}, fallbackItems []interface{}) []interface{} {
+	out := make([]interface{}, 0, len(itemsByIndex)+len(fallbackItems))
+	if len(itemsByIndex) > 0 {
+		indices := make([]int, 0, len(itemsByIndex))
+		for idx := range itemsByIndex {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+		for _, idx := range indices {
+			out = append(out, itemsByIndex[idx])
+		}
+	}
+	out = append(out, fallbackItems...)
+	return out
 }
 
 func reconstructClaudeStream(chunks []string) (string, []string) {

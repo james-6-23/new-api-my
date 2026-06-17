@@ -12,11 +12,24 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/conversation_log_setting"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/stretchr/testify/require"
 )
+
+// TestIsConversationLogRelayFormat pins the capture-time pre-filter: only the
+// Claude messages API and the Responses API are captured. OpenAI chat
+// completions and Gemini are never stored, so they are not captured at all.
+func TestIsConversationLogRelayFormat(t *testing.T) {
+	require.True(t, isConversationLogRelayFormat(types.RelayFormatClaude))
+	require.True(t, isConversationLogRelayFormat(types.RelayFormatOpenAIResponses))
+	require.True(t, isConversationLogRelayFormat(types.RelayFormatOpenAIResponsesCompaction))
+	require.False(t, isConversationLogRelayFormat(types.RelayFormatOpenAI))
+	require.False(t, isConversationLogRelayFormat(types.RelayFormatGemini))
+	require.False(t, isConversationLogRelayFormat(types.RelayFormat("")))
+}
 
 func updateConversationLogTestSettings(t *testing.T, values map[string]string) {
 	t.Helper()
@@ -201,6 +214,62 @@ func TestReconstructGeminiStreamProducesGenerateContentJSON(t *testing.T) {
 	parts := content["parts"].([]interface{})
 	require.Len(t, parts, 2)
 	require.NotNil(t, parsed["usageMetadata"])
+}
+
+// TestReconstructOpenAIResponsesStreamBackfillsEmptyOutput reproduces the
+// gateway defect where response.completed carries an empty output[] while the
+// structured items (message + function_call) were streamed separately via
+// response.output_item.done events. Before the fix this persisted output:[]
+// (dropping the tool call); after the fix output[] is rebuilt from those items.
+func TestReconstructOpenAIResponsesStreamBackfillsEmptyOutput(t *testing.T) {
+	raw := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"sure, running it\"}\n\n" +
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"sure, running it\"}]}}\n\n" +
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"shell_command\",\"call_id\":\"call_abc\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n" +
+		"data: [DONE]\n\n"
+
+	body, reasons := reconstructResponseBody("openai", []byte(raw), true)
+	require.Empty(t, reasons)
+
+	var parsed map[string]interface{}
+	require.NoError(t, common.Unmarshal([]byte(body), &parsed))
+
+	require.Equal(t, "completed", parsed["status"])
+	require.Equal(t, "sure, running it", parsed["output_text"])
+
+	output, ok := parsed["output"].([]interface{})
+	require.True(t, ok, "output[] must be rebuilt, not empty")
+	require.Len(t, output, 2, "both the message and the function_call must survive")
+
+	// output_index ordering preserved: message first, function_call second.
+	msg := output[0].(map[string]interface{})
+	require.Equal(t, "message", msg["type"])
+
+	fc := output[1].(map[string]interface{})
+	require.Equal(t, "function_call", fc["type"])
+	require.Equal(t, "shell_command", fc["name"])
+	require.Equal(t, "call_abc", fc["call_id"])
+
+	require.NotNil(t, parsed["usage"])
+}
+
+// TestReconstructOpenAIResponsesStreamKeepsPopulatedOutput guards the
+// non-regression case: when response.completed already carries a populated
+// output[], the backfill must not overwrite or duplicate it.
+func TestReconstructOpenAIResponsesStreamKeepsPopulatedOutput(t *testing.T) {
+	raw := "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"shell_command\",\"call_id\":\"call_xyz\",\"arguments\":\"{}\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"name\":\"shell_command\",\"call_id\":\"call_xyz\",\"arguments\":\"{}\"}]}}\n\n" +
+		"data: [DONE]\n\n"
+
+	body, reasons := reconstructResponseBody("openai", []byte(raw), true)
+	require.Empty(t, reasons)
+
+	var parsed map[string]interface{}
+	require.NoError(t, common.Unmarshal([]byte(body), &parsed))
+	output := parsed["output"].([]interface{})
+	require.Len(t, output, 1, "populated output[] must be kept as-is, not duplicated")
 }
 
 func TestBuildSessionCandidatePassesQualityGate(t *testing.T) {

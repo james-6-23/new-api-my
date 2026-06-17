@@ -766,7 +766,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		Mode:             job.Mode,
 		PackageFormat:    "jsonl.gz",
 		DataFilePath:     "conversation-logs-{mode}-{trigger}-{timestamp}-{job}-shard000N.jsonl.gz",
-		PathDescription:  "Each shard is one gzip-compressed JSONL file. Decompress it to read one API-format record per line.",
+		PathDescription:  "Each shard is one gzip-compressed JSONL file holding a single API entrypoint (responses or messages). Decompress it to read one API-format record per line; the shard's kind and data filename are listed in shards[].data_files.",
 		CreatedAt:        job.CreatedAt,
 		FinishedAt:       common.GetTimestamp(),
 		ShardTargetBytes: job.ShardTargetBytes,
@@ -1213,24 +1213,40 @@ func (s *shardWriterState) ensureDataWriter(kind string) (*shardDataWriter, erro
 	if err := s.ensureCurrentShard(); err != nil {
 		return nil, err
 	}
-	if existing := s.currentDataWriters[conversationDataKindData]; existing != nil {
+	// Route the record into a per-kind writer. Because appendLine seals the
+	// shard whenever the kind changes, a shard only ever has one writer; the
+	// kind is still part of the temp filename so the emitted *-data.jsonl is
+	// named after its API entrypoint (responses / messages). An empty kind
+	// falls back to the "mixed" bucket.
+	kind = normalizeConversationDataKind(kind)
+	if existing := s.currentDataWriters[kind]; existing != nil {
 		return existing, nil
 	}
-	tmpName := fmt.Sprintf("shard-pending-%04d-data.jsonl", s.currentIndex+1)
+	tmpName := fmt.Sprintf("shard-pending-%04d-%s-data.jsonl", s.currentIndex+1, kind)
 	path := filepath.Join(s.tmpDir, tmpName)
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	writer := &shardDataWriter{
-		kind:   conversationDataKindData,
+		kind:   kind,
 		path:   path,
 		file:   file,
 		buf:    bufio.NewWriterSize(file, 1<<20),
 		hasher: sha256.New(),
 	}
-	s.currentDataWriters[conversationDataKindData] = writer
+	s.currentDataWriters[kind] = writer
 	return writer, nil
+}
+
+// currentShardKind returns the data kind the in-progress shard already holds,
+// or "" if no record has been written to the current shard yet. Because each
+// shard is restricted to a single kind, there is at most one entry.
+func (s *shardWriterState) currentShardKind() string {
+	for kind := range s.currentDataWriters {
+		return kind
+	}
+	return ""
 }
 
 // wouldOverflowMax reports whether appending lineBytes to the current shard
@@ -1247,7 +1263,20 @@ func (s *shardWriterState) shouldRotateAfter() bool {
 
 // appendLine streams one JSONL line into the current shard temp file.
 // Caller must ensure overflow checks have been done.
-func (s *shardWriterState) appendLine(line []byte, recordIDs []int, sessionCount int64, timeMin, timeMax int64, dataKind string) error {
+func (s *shardWriterState) appendLine(ctx context.Context, line []byte, recordIDs []int, sessionCount int64, timeMin, timeMax int64, dataKind string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Each shard holds exactly one data kind so it always packages as a flat
+	// .jsonl.gz (responses-* / messages-*), never a multi-file .tar.gz. When the
+	// incoming record's kind differs from what the in-progress shard already
+	// holds, seal that shard first and start a fresh one for the new kind.
+	dataKind = normalizeConversationDataKind(dataKind)
+	if current := s.currentShardKind(); current != "" && current != dataKind {
+		if err := s.closeCurrentShard(ctx); err != nil {
+			return err
+		}
+	}
 	writer, err := s.ensureDataWriter(dataKind)
 	if err != nil {
 		return err
@@ -1397,7 +1426,7 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 		if err := writer.file.Close(); err != nil {
 			return err
 		}
-		fileName := "data.jsonl"
+		fileName := fmt.Sprintf("%s-data-%d.jsonl", normalizeConversationDataKind(writer.kind), s.currentIndex+1)
 		dataPayloads = append(dataPayloads, shardDataFilePayload{
 			ShardDataFile: ShardDataFile{
 				Path:              "", // filled after innerName is known
@@ -1415,7 +1444,6 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 
 	s.currentIndex++
 	fileBase := buildShardFilename(s.jobID, s.mode, s.trigger, s.createdAt, s.currentIndex)
-	outputPath := filepath.Join(s.outputDir, fileBase+".jsonl.gz")
 
 	uncompressed := s.currentSize
 	dataFiles := shardDataFilesFromPayloads(dataPayloads)
@@ -1424,7 +1452,11 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 		legacySHA = dataFiles[0].SHA256
 	}
 
+	// Each shard holds a single data kind (responses or messages), so it is
+	// always delivered as a flat .jsonl.gz — never a multi-file .tar.gz.
+	outputPath := filepath.Join(s.outputDir, fileBase+".jsonl.gz")
 	tmpPath := filepath.Join(s.tmpDir, fileBase+".jsonl.gz")
+
 	idsPath := ""
 	if s.currentIDCount > 0 {
 		idsPath = s.currentIDsPath
@@ -1622,17 +1654,6 @@ func orderedShardDataWriterKinds(writers map[string]*shardDataWriter) []string {
 	return kinds
 }
 
-func digestShardDataFiles(files []ShardDataFile) string {
-	h := sha256.New()
-	for _, file := range files {
-		_, _ = h.Write([]byte(file.Path))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write([]byte(file.SHA256))
-		_, _ = h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 func orderedConversationDataKinds() []string {
 	return []string{
 		conversationDataKindResponses,
@@ -1653,6 +1674,30 @@ func normalizeConversationDataKind(kind string) string {
 	default:
 		return conversationDataKindMixed
 	}
+}
+
+// conversationDataKindExportable reports whether a record/session of this kind
+// should be written to the export at all. Exports are currently restricted to
+// the responses (/v1/responses) and messages (/v1/messages) API entrypoints;
+// completions and unclassifiable ("mixed") traffic is dropped before it reaches
+// a shard data file.
+func conversationDataKindExportable(kind string) bool {
+	switch normalizeConversationDataKind(kind) {
+	case conversationDataKindResponses, conversationDataKindMessages:
+		return true
+	default:
+		return false
+	}
+}
+
+// conversationLogStorable reports whether a freshly built log should be written
+// to the database at all. Storage is restricted to the same responses/messages
+// entrypoints the export pipeline keeps, so completions and unclassifiable
+// ("mixed") traffic is dropped at write time and never persisted. This is the
+// authoritative write-time gate; isConversationLogRelayFormat is the cheaper
+// capture-time pre-filter that must stay consistent with it.
+func conversationLogStorable(log *model.ConversationLog) bool {
+	return conversationDataKindExportable(conversationDataKindForLog(log))
 }
 
 func conversationDataKindLabel(kind string) string {
@@ -1822,47 +1867,6 @@ func (s *shardWriterState) markProcessedSourceRecordsExported(ctx context.Contex
 	return nil
 }
 
-func buildShardPathManifest(shardName string, dataFiles []ShardDataFile) ShardPathManifest {
-	entries := make([]ShardPathManifestEntry, 0, len(dataFiles)+2)
-	for _, file := range dataFiles {
-		description := fmt.Sprintf("%s API category delivery data. Each line is one valid JSON record in the selected export mode.", file.Kind)
-		if file.Kind == conversationDataKindResponses {
-			description = "responses API category delivery data (OpenAI Responses API). Each line is one valid JSON record; request_body uses the Responses schema where the conversation is carried in `input`/`instructions` (typed items: message/reasoning/function_call/function_call_output) instead of a top-level `messages` array."
-		}
-		entries = append(entries, ShardPathManifestEntry{
-			Path:        file.Path,
-			Required:    true,
-			Description: description,
-		})
-	}
-	entries = append(entries,
-		ShardPathManifestEntry{
-			Path:        shardName + "/shard-manifest.json",
-			Required:    true,
-			Description: "Shard-level counts, time range, record id range, per-data-file counts, and SHA-256 checksums.",
-		},
-		ShardPathManifestEntry{
-			Path:        shardName + "/path-manifest.json",
-			Required:    true,
-			Description: "This path description file for the tar.gz package.",
-		},
-	)
-	return ShardPathManifest{
-		FormatVersion: "1",
-		PackageFormat: "tar.gz",
-		DataFormat:    "jsonl",
-		Encoding:      "UTF-8",
-		ShardRoot:     shardName + "/",
-		Entries:       entries,
-		Notes: []string{
-			"Use every *-data-*.jsonl file in this shard as the canonical dataset payload.",
-			"responses-data-N.jsonl, messages-data-N.jsonl, completions-data-N.jsonl, and mixed-data-N.jsonl are split by the request API entrypoint while preserving whole sessions.",
-			"The SHA-256 checksums in shard-manifest.json are computed over raw JSONL bytes before compression. The per-data-file `sha256` values hash the raw JSONL bytes; `sha256_of_data_files` is a digest over the ordered (path, per-file sha256) pairs.",
-			"In session_jsonl mode, a reconstructed session is kept within one shard.",
-		},
-	}
-}
-
 // streamShardJSONLGz writes a gzip-compressed JSONL payload. Source JSONL files
 // are streamed directly so large shards are never held in memory.
 func streamShardJSONLGz(gzPath string, dataFiles []shardDataFilePayload, gzipLevel int) error {
@@ -1918,6 +1922,12 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 			if !prepared.validation.Exportable {
 				continue
 			}
+			// Exports are restricted to the responses/messages entrypoints;
+			// drop completions and unclassifiable records before they reach a shard.
+			dataKind := conversationDataKindForLog(item)
+			if !conversationDataKindExportable(dataKind) {
+				continue
+			}
 			rec := StrictAPIRecord{
 				SessionID:    item.SessionId,
 				Provider:     item.Provider,
@@ -1936,7 +1946,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 					return err
 				}
 			}
-			if err := state.appendLine(line, []int{item.Id}, 0, item.RequestTime, item.ResponseTime, conversationDataKindForLog(item)); err != nil {
+			if err := state.appendLine(ctx, line, []int{item.Id}, 0, item.RequestTime, item.ResponseTime, conversationDataKindForLog(item)); err != nil {
 				return err
 			}
 			if state.shouldRotateAfter() {
@@ -2419,7 +2429,7 @@ func streamSessionSpoolToShards(ctx context.Context, spool *sessionExportSpool, 
 			if lineLen > state.shardMaxBytes {
 				common.SysLog(fmt.Sprintf("export job: session spool line %d exceeds shard_max_bytes (%d > %d), shard will be oversize", lineNo, lineLen, state.shardMaxBytes))
 			}
-			if err := state.appendLine(dataLine, meta.RecordIDs, 1, meta.RequestTimeMin, meta.ResponseTimeMax, meta.DataKind); err != nil {
+			if err := state.appendLine(ctx, dataLine, meta.RecordIDs, 1, meta.RequestTimeMin, meta.ResponseTimeMax, meta.DataKind); err != nil {
 				return err
 			}
 			if state.shouldRotateAfter() {
@@ -2591,6 +2601,15 @@ func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spo
 			kind := normalizeConversationDataKind(group.dataKind)
 			if summaryByKind != nil {
 				ensureSessionExportSummaryByKind(summaryByKind, kind).TotalSessions++
+			}
+			// Exports are restricted to the responses/messages entrypoints; drop
+			// whole sessions whose aggregated kind is completions or mixed.
+			if !conversationDataKindExportable(kind) {
+				summary.RejectedSessionsByReason["filtered_by_data_kind"]++
+				if summaryByKind != nil {
+					ensureSessionExportSummaryByKind(summaryByKind, kind).RejectedSessionsByReason["filtered_by_data_kind"]++
+				}
+				continue
 			}
 			if group.overflow {
 				summary.RejectedSessionsByReason["session_payload_too_large"]++

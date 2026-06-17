@@ -142,10 +142,9 @@ func TestShardWriterStateWritesSingleJSONLGz(t *testing.T) {
 		shardTargetBytes: 1 << 20,
 		shardMaxBytes:    1 << 20,
 	}
-	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"resp"}`), []int{1, 2}, 1, 100, 110, conversationDataKindResponses))
-	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"msg"}`), []int{3}, 1, 120, 130, conversationDataKindMessages))
-	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"chat"}`), []int{4}, 1, 140, 150, conversationDataKindCompletions))
-	require.NoError(t, state.appendLine([]byte(`{"trajectory_id":"mixed"}`), []int{5}, 1, 160, 170, "unknown"))
+	// A single-endpoint shard keeps the flat .jsonl.gz form.
+	require.NoError(t, state.appendLine(context.Background(), []byte(`{"trajectory_id":"resp1"}`), []int{1, 2}, 1, 100, 110, conversationDataKindResponses))
+	require.NoError(t, state.appendLine(context.Background(), []byte(`{"trajectory_id":"resp2"}`), []int{3}, 1, 120, 130, conversationDataKindResponses))
 	require.NoError(t, state.closeCurrentShard(context.Background()))
 	require.NoError(t, state.waitForShardCompression(context.Background()))
 
@@ -153,16 +152,56 @@ func TestShardWriterStateWritesSingleJSONLGz(t *testing.T) {
 	require.True(t, strings.HasSuffix(state.shards[0].File, ".jsonl.gz"))
 	data := readGzipBytes(t, filepath.Join(outputDir, state.shards[0].File))
 	require.Equal(t, []byte(
-		"{\"trajectory_id\":\"resp\"}\n"+
-			"{\"trajectory_id\":\"msg\"}\n"+
-			"{\"trajectory_id\":\"chat\"}\n"+
-			"{\"trajectory_id\":\"mixed\"}\n",
+		"{\"trajectory_id\":\"resp1\"}\n"+
+			"{\"trajectory_id\":\"resp2\"}\n",
 	), data)
-	require.EqualValues(t, 5, state.shards[0].RecordCount)
-	require.EqualValues(t, 4, state.shards[0].SessionCount)
+	require.EqualValues(t, 3, state.shards[0].RecordCount)
+	require.EqualValues(t, 2, state.shards[0].SessionCount)
 	require.Len(t, state.shards[0].DataFiles, 1)
-	require.Equal(t, "data.jsonl", state.shards[0].DataFiles[0].Path)
-	require.Equal(t, conversationDataKindData, state.shards[0].DataFiles[0].Kind)
+	require.Equal(t, "responses-data-1.jsonl", state.shards[0].DataFiles[0].Path)
+	require.Equal(t, conversationDataKindResponses, state.shards[0].DataFiles[0].Kind)
+}
+
+// TestShardWriterStateSplitsEndpointsIntoSeparateShards verifies that records
+// of different API entrypoints never share a shard: each kind is sealed into
+// its own flat .jsonl.gz shard (no .tar.gz is ever produced), so every shard
+// holds exactly one *-data-1.jsonl file.
+func TestShardWriterStateSplitsEndpointsIntoSeparateShards(t *testing.T) {
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "out")
+	tmpDir := filepath.Join(dir, "tmp")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+	state := &shardWriterState{
+		mode:             "api_hijack_jsonl",
+		outputDir:        outputDir,
+		tmpDir:           tmpDir,
+		createdAt:        1710000000,
+		shardTargetBytes: 1 << 20,
+		shardMaxBytes:    1 << 20,
+	}
+	ctx := context.Background()
+	require.NoError(t, state.appendLine(ctx, []byte(`{"id":"resp"}`), []int{1}, 1, 100, 110, conversationDataKindResponses))
+	require.NoError(t, state.appendLine(ctx, []byte(`{"id":"msg"}`), []int{2}, 1, 120, 130, conversationDataKindMessages))
+	// A second responses record after a kind switch lands in yet another shard.
+	require.NoError(t, state.appendLine(ctx, []byte(`{"id":"resp2"}`), []int{3}, 1, 140, 150, conversationDataKindResponses))
+	require.NoError(t, state.closeCurrentShard(ctx))
+	require.NoError(t, state.waitForShardCompression(ctx))
+
+	// Each kind switch sealed the prior shard: resp / msg / resp2 => 3 shards.
+	require.Len(t, state.shards, 3)
+	for _, shard := range state.shards {
+		require.True(t, strings.HasSuffix(shard.File, ".jsonl.gz"), "every shard must be jsonl.gz, got %s", shard.File)
+		require.Len(t, shard.DataFiles, 1, "each shard holds exactly one kind")
+	}
+
+	require.Equal(t, "{\"id\":\"resp\"}\n", string(readGzipBytes(t, filepath.Join(outputDir, state.shards[0].File))))
+	require.Equal(t, conversationDataKindResponses, state.shards[0].DataFiles[0].Kind)
+	require.Equal(t, "{\"id\":\"msg\"}\n", string(readGzipBytes(t, filepath.Join(outputDir, state.shards[1].File))))
+	require.Equal(t, conversationDataKindMessages, state.shards[1].DataFiles[0].Kind)
+	require.Equal(t, "{\"id\":\"resp2\"}\n", string(readGzipBytes(t, filepath.Join(outputDir, state.shards[2].File))))
+	require.Equal(t, conversationDataKindResponses, state.shards[2].DataFiles[0].Kind)
 }
 
 func TestShardWriterStateWaitsForQueuedShardCompression(t *testing.T) {
@@ -180,9 +219,9 @@ func TestShardWriterStateWaitsForQueuedShardCompression(t *testing.T) {
 		shardTargetBytes: 1 << 20,
 		shardMaxBytes:    1 << 20,
 	}
-	require.NoError(t, state.appendLine([]byte(`{"id":1}`), []int{1}, 0, 100, 110, conversationDataKindResponses))
+	require.NoError(t, state.appendLine(context.Background(), []byte(`{"id":1}`), []int{1}, 0, 100, 110, conversationDataKindResponses))
 	require.NoError(t, state.closeCurrentShard(context.Background()))
-	require.NoError(t, state.appendLine([]byte(`{"id":2}`), []int{2}, 0, 120, 130, conversationDataKindMessages))
+	require.NoError(t, state.appendLine(context.Background(), []byte(`{"id":2}`), []int{2}, 0, 120, 130, conversationDataKindMessages))
 	require.NoError(t, state.closeCurrentShard(context.Background()))
 
 	require.EqualValues(t, 2, state.totalRecordCount)
@@ -251,7 +290,7 @@ func TestShardWriterStateUploadsShardAsCompressionCompletes(t *testing.T) {
 	}
 	defer state.abortShardCompression()
 
-	require.NoError(t, state.appendLine([]byte(`{"id":1}`), []int{1}, 0, 100, 110, conversationDataKindResponses))
+	require.NoError(t, state.appendLine(context.Background(), []byte(`{"id":1}`), []int{1}, 0, 100, 110, conversationDataKindResponses))
 	require.NoError(t, state.closeCurrentShard(context.Background()))
 
 	require.Eventually(t, func() bool {
@@ -364,6 +403,35 @@ func TestConversationDataKindForRecordsPreservesSessionIntegrity(t *testing.T) {
 	require.Equal(t, conversationDataKindMixed, conversationDataKindForRecords([]*model.ConversationLog{
 		{RequestPath: "/v1/unknown"},
 	}))
+}
+
+// TestConversationDataKindExportable pins the export-scope policy: only the
+// responses and messages entrypoints are exportable; completions and
+// unclassifiable ("mixed") traffic is dropped before reaching a shard.
+func TestConversationDataKindExportable(t *testing.T) {
+	require.True(t, conversationDataKindExportable(conversationDataKindResponses))
+	require.True(t, conversationDataKindExportable(conversationDataKindMessages))
+	require.False(t, conversationDataKindExportable(conversationDataKindCompletions))
+	require.False(t, conversationDataKindExportable(conversationDataKindMixed))
+	require.False(t, conversationDataKindExportable("unknown"))
+	require.False(t, conversationDataKindExportable(""))
+}
+
+// TestConversationLogStorable pins the write-time storage gate: only records
+// classified as responses or messages may be persisted. Completions and
+// unclassifiable ("mixed") traffic is dropped before the DB write, so it never
+// reaches the database.
+func TestConversationLogStorable(t *testing.T) {
+	require.True(t, conversationLogStorable(&model.ConversationLog{RequestPath: "/v1/responses"}))
+	require.True(t, conversationLogStorable(&model.ConversationLog{RequestPath: "/v1/messages"}))
+	require.True(t, conversationLogStorable(&model.ConversationLog{RelayFormat: "openai_responses"}))
+	require.True(t, conversationLogStorable(&model.ConversationLog{RelayFormat: "claude"}))
+	// completions (chat) and Gemini both classify outside the export scope.
+	require.False(t, conversationLogStorable(&model.ConversationLog{RequestPath: "/v1/chat/completions"}))
+	require.False(t, conversationLogStorable(&model.ConversationLog{RelayFormat: "openai"}))
+	require.False(t, conversationLogStorable(&model.ConversationLog{RelayFormat: "gemini"}))
+	require.False(t, conversationLogStorable(&model.ConversationLog{}))
+	require.False(t, conversationLogStorable(nil))
 }
 
 func TestSessionProcessedSourceIDsAllowDeletingRejectedSessionRows(t *testing.T) {
@@ -954,9 +1022,9 @@ func TestSessionBucketRebuildKeepsInterleavedSessionComplete(t *testing.T) {
 	}`
 	responseBody := `{"choices":[{"message":{"role":"assistant","content":"It is a Go entrypoint."},"finish_reason":"stop"}],"usage":{"total_tokens":10}}`
 	for _, record := range []sessionBucketRecord{
-		{ID: 1, SessionID: "sess_interleaved", Provider: "openai", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 100, ResponseTime: 110},
-		{ID: 2, SessionID: "sess_other", Provider: "openai", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 120, ResponseTime: 130},
-		{ID: 3, SessionID: "sess_interleaved", Provider: "openai", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 1000000, ResponseTime: 1000010},
+		{ID: 1, SessionID: "sess_interleaved", Provider: "openai", RequestPath: "/v1/responses", RelayFormat: "openai_responses", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 100, ResponseTime: 110},
+		{ID: 2, SessionID: "sess_other", Provider: "openai", RequestPath: "/v1/responses", RelayFormat: "openai_responses", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 120, ResponseTime: 130},
+		{ID: 3, SessionID: "sess_interleaved", Provider: "openai", RequestPath: "/v1/responses", RelayFormat: "openai_responses", RequestBody: requestBody, ResponseBody: responseBody, RequestTime: 1000000, ResponseTime: 1000010},
 	} {
 		require.NoError(t, manager.append(record))
 	}
