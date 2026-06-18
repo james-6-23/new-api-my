@@ -1909,7 +1909,20 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	// non_compliant records are already excluded by conversationExportValidQuery,
 	// so the export scan only sees admitted `valid` records — no per-record
 	// re-evaluation needed here.
-	return forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
+	//
+	// The scan walks records in id order, so the two exportable kinds (responses,
+	// messages) arrive interleaved. Feeding that straight into appendLine would
+	// seal a shard on almost every record (each shard holds a single kind) and
+	// emit thousands of tiny *-data.jsonl.gz files. Instead we spool each record
+	// into a per-kind temp file during the single scan, then replay each kind
+	// contiguously so shards only roll over on the size thresholds.
+	spool, err := newAPIHijackKindSpool(state.tmpDir)
+	if err != nil {
+		return err
+	}
+	defer spool.cleanup()
+
+	err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1940,24 +1953,197 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 			if err != nil {
 				return err
 			}
-			lineLen := int64(len(line) + 1) // include trailing newline
-			if state.wouldOverflowMax(lineLen) {
-				if err := state.closeCurrentShard(ctx); err != nil {
-					return err
-				}
-			}
-			if err := state.appendLine(ctx, line, []int{item.Id}, 0, item.RequestTime, item.ResponseTime, conversationDataKindForLog(item)); err != nil {
+			if err := spool.append(dataKind, line, item.Id, item.RequestTime, item.ResponseTime); err != nil {
 				return err
-			}
-			if state.shouldRotateAfter() {
-				if err := state.closeCurrentShard(ctx); err != nil {
-					return err
-				}
 			}
 		}
 		state.maybePushProgress(false)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if err := spool.flush(); err != nil {
+		return err
+	}
+	return replayAPIHijackKindSpool(ctx, spool, state)
+}
+
+// apiHijackKindSpool buffers exported records on disk, one temp file per data
+// kind, so that a single id-ordered DB scan can be replayed kind-by-kind. Each
+// record is written as a meta line ({id,request_time,response_time}) followed by
+// the StrictAPIRecord data line, mirroring the session spool's two-line layout.
+type apiHijackKindSpool struct {
+	dir   string
+	files map[string]*apiHijackKindWriter
+}
+
+type apiHijackKindWriter struct {
+	kind string
+	path string
+	file *os.File
+	buf  *bufio.Writer
+}
+
+type apiHijackSpoolMeta struct {
+	ID              int   `json:"id"`
+	RequestTimeMin  int64 `json:"request_time_min"`
+	ResponseTimeMax int64 `json:"response_time_max"`
+}
+
+func newAPIHijackKindSpool(tmpDir string) (*apiHijackKindSpool, error) {
+	dir := filepath.Join(tmpDir, "api-kind-spool")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return &apiHijackKindSpool{dir: dir, files: make(map[string]*apiHijackKindWriter)}, nil
+}
+
+func (s *apiHijackKindSpool) writerFor(kind string) (*apiHijackKindWriter, error) {
+	kind = normalizeConversationDataKind(kind)
+	if w := s.files[kind]; w != nil {
+		return w, nil
+	}
+	path := filepath.Join(s.dir, kind+".jsonl")
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	w := &apiHijackKindWriter{
+		kind: kind,
+		path: path,
+		file: file,
+		buf:  bufio.NewWriterSize(file, 1<<20),
+	}
+	s.files[kind] = w
+	return w, nil
+}
+
+func (s *apiHijackKindSpool) append(kind string, line []byte, id int, requestTime, responseTime int64) error {
+	w, err := s.writerFor(kind)
+	if err != nil {
+		return err
+	}
+	meta := apiHijackSpoolMeta{ID: id, RequestTimeMin: requestTime, ResponseTimeMax: responseTime}
+	metaLine, err := common.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	if _, err := w.buf.Write(metaLine); err != nil {
+		return err
+	}
+	if err := w.buf.WriteByte('\n'); err != nil {
+		return err
+	}
+	if _, err := w.buf.Write(line); err != nil {
+		return err
+	}
+	return w.buf.WriteByte('\n')
+}
+
+func (s *apiHijackKindSpool) flush() error {
+	for _, w := range s.files {
+		if w.buf != nil {
+			if err := w.buf.Flush(); err != nil {
+				return err
+			}
+			w.buf = nil
+		}
+		if w.file != nil {
+			if err := w.file.Close(); err != nil {
+				return err
+			}
+			w.file = nil
+		}
+	}
+	return nil
+}
+
+func (s *apiHijackKindSpool) cleanup() {
+	if s == nil {
+		return
+	}
+	for _, w := range s.files {
+		if w.buf != nil {
+			_ = w.buf.Flush()
+		}
+		if w.file != nil {
+			_ = w.file.Close()
+		}
+	}
+	_ = os.RemoveAll(s.dir)
+}
+
+// replayAPIHijackKindSpool streams each kind's spooled records into shards in a
+// fixed kind order, sealing the in-progress shard at each kind boundary so a
+// shard never mixes kinds.
+func replayAPIHijackKindSpool(ctx context.Context, spool *apiHijackKindSpool, state *shardWriterState) error {
+	for _, kind := range orderedConversationDataKinds() {
+		w := spool.files[kind]
+		if w == nil {
+			continue
+		}
+		wrote, err := replayAPIHijackKind(ctx, w.path, kind, state)
+		if err != nil {
+			return err
+		}
+		if wrote {
+			if err := state.closeCurrentShard(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWriterState) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 1<<20)
+	wrote := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return wrote, err
+		}
+		metaLine, metaErr := readJSONLLine(reader)
+		if metaErr == io.EOF {
+			break
+		}
+		if metaErr != nil {
+			return wrote, metaErr
+		}
+		dataLine, dataErr := readJSONLLine(reader)
+		if dataErr != nil {
+			return wrote, dataErr
+		}
+		var meta apiHijackSpoolMeta
+		if err := common.Unmarshal(metaLine, &meta); err != nil {
+			return wrote, err
+		}
+		if err := state.compressionErr(); err != nil {
+			return wrote, err
+		}
+		lineLen := int64(len(dataLine) + 1)
+		if state.wouldOverflowMax(lineLen) {
+			if err := state.closeCurrentShard(ctx); err != nil {
+				return wrote, err
+			}
+		}
+		if err := state.appendLine(ctx, dataLine, []int{meta.ID}, 0, meta.RequestTimeMin, meta.ResponseTimeMax, kind); err != nil {
+			return wrote, err
+		}
+		wrote = true
+		if state.shouldRotateAfter() {
+			if err := state.closeCurrentShard(ctx); err != nil {
+				return wrote, err
+			}
+		}
+		state.maybePushProgress(false)
+	}
+	return wrote, nil
 }
 
 type sessionExportSpool struct {
@@ -2383,65 +2569,100 @@ func dedupeSessionSpool(ctx context.Context, metaPath string, summary *Conversat
 }
 
 func streamSessionSpoolToShards(ctx context.Context, spool *sessionExportSpool, keep map[int64]struct{}, state *shardWriterState) error {
+	// Stream one data kind at a time so that all sessions of a given entrypoint
+	// (responses, then messages) land in contiguous shards. The spool is ordered
+	// by session_id hash, so the two kinds are interleaved record-by-record; if we
+	// fed that order straight into appendLine, its "seal the shard whenever the
+	// kind changes" rule (each shard holds a single kind) would close a shard on
+	// almost every record and emit thousands of tiny *-data.jsonl.gz files. Doing
+	// a separate pass per kind keeps the kind constant within a pass, so shards
+	// only roll over on the size thresholds — back to a few large jsonl.gz files.
+	for _, kind := range orderedConversationDataKinds() {
+		if !conversationDataKindExportable(kind) {
+			continue
+		}
+		wrote, err := streamSessionSpoolKind(ctx, spool, keep, state, kind)
+		if err != nil {
+			return err
+		}
+		// Seal the in-progress shard at the kind boundary so the next kind starts
+		// in a fresh shard. closeCurrentShard is a no-op when nothing was written
+		// for this kind, so empty passes don't emit empty shards.
+		if wrote {
+			if err := state.closeCurrentShard(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// streamSessionSpoolKind streams only the kept spool lines whose data kind matches
+// `kind` into the current shard writer. It reports whether any line was written.
+func streamSessionSpoolKind(ctx context.Context, spool *sessionExportSpool, keep map[int64]struct{}, state *shardWriterState, kind string) (bool, error) {
 	dataFile, err := os.Open(spool.dataPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer dataFile.Close()
 	metaFile, err := os.Open(spool.metaPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer metaFile.Close()
 
 	dataReader := bufio.NewReaderSize(dataFile, 1<<20)
 	metaReader := bufio.NewReaderSize(metaFile, 1<<20)
 	lineNo := int64(0)
+	wrote := false
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return wrote, err
 		}
 		dataLine, dataErr := readJSONLLine(dataReader)
 		if dataErr == io.EOF {
 			break
 		}
 		if dataErr != nil {
-			return dataErr
+			return wrote, dataErr
 		}
 		metaLine, metaErr := readJSONLLine(metaReader)
 		if metaErr != nil {
-			return metaErr
+			return wrote, metaErr
 		}
 		if _, ok := keep[lineNo]; ok {
 			var meta sessionSpoolMeta
 			if err := common.Unmarshal(metaLine, &meta); err != nil {
-				return err
+				return wrote, err
 			}
-			lineLen := int64(len(dataLine) + 1)
-			if err := state.compressionErr(); err != nil {
-				return err
-			}
-			if state.wouldOverflowMax(lineLen) {
-				if err := state.closeCurrentShard(ctx); err != nil {
-					return err
+			if normalizeConversationDataKind(meta.DataKind) == kind {
+				lineLen := int64(len(dataLine) + 1)
+				if err := state.compressionErr(); err != nil {
+					return wrote, err
 				}
-			}
-			if lineLen > state.shardMaxBytes {
-				common.SysLog(fmt.Sprintf("export job: session spool line %d exceeds shard_max_bytes (%d > %d), shard will be oversize", lineNo, lineLen, state.shardMaxBytes))
-			}
-			if err := state.appendLine(ctx, dataLine, meta.RecordIDs, 1, meta.RequestTimeMin, meta.ResponseTimeMax, meta.DataKind); err != nil {
-				return err
-			}
-			if state.shouldRotateAfter() {
-				if err := state.closeCurrentShard(ctx); err != nil {
-					return err
+				if state.wouldOverflowMax(lineLen) {
+					if err := state.closeCurrentShard(ctx); err != nil {
+						return wrote, err
+					}
 				}
+				if lineLen > state.shardMaxBytes {
+					common.SysLog(fmt.Sprintf("export job: session spool line %d exceeds shard_max_bytes (%d > %d), shard will be oversize", lineNo, lineLen, state.shardMaxBytes))
+				}
+				if err := state.appendLine(ctx, dataLine, meta.RecordIDs, 1, meta.RequestTimeMin, meta.ResponseTimeMax, meta.DataKind); err != nil {
+					return wrote, err
+				}
+				wrote = true
+				if state.shouldRotateAfter() {
+					if err := state.closeCurrentShard(ctx); err != nil {
+						return wrote, err
+					}
+				}
+				state.maybePushProgress(false)
 			}
-			state.maybePushProgress(false)
 		}
 		lineNo++
 	}
-	return nil
+	return wrote, nil
 }
 
 func findSessionSubsequenceDuplicates(entries []sessionSeqEntry, minSeqLen int) map[int64]struct{} {

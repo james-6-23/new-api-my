@@ -204,6 +204,158 @@ func TestShardWriterStateSplitsEndpointsIntoSeparateShards(t *testing.T) {
 	require.Equal(t, conversationDataKindResponses, state.shards[2].DataFiles[0].Kind)
 }
 
+// TestReplayAPIHijackKindSpoolGroupsInterleavedKindsContiguously proves the fix
+// for the tiny-shard explosion: when records arrive interleaved by kind (the
+// natural id-ordered scan order), spooling per kind and replaying kind-by-kind
+// must produce contiguous shards (one per kind under the size threshold), not a
+// fresh shard on every kind switch.
+func TestReplayAPIHijackKindSpoolGroupsInterleavedKindsContiguously(t *testing.T) {
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "out")
+	tmpDir := filepath.Join(dir, "tmp")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+	state := &shardWriterState{
+		mode:             "api_hijack_jsonl",
+		outputDir:        outputDir,
+		tmpDir:           tmpDir,
+		createdAt:        1710000000,
+		shardTargetBytes: 1 << 20,
+		shardMaxBytes:    1 << 20,
+	}
+	ctx := context.Background()
+
+	spool, err := newAPIHijackKindSpool(tmpDir)
+	require.NoError(t, err)
+	defer spool.cleanup()
+
+	// Interleave the two kinds exactly as an id-ordered DB scan would deliver them.
+	require.NoError(t, spool.append(conversationDataKindResponses, []byte(`{"id":"resp1"}`), 1, 100, 110))
+	require.NoError(t, spool.append(conversationDataKindMessages, []byte(`{"id":"msg1"}`), 2, 120, 130))
+	require.NoError(t, spool.append(conversationDataKindResponses, []byte(`{"id":"resp2"}`), 3, 140, 150))
+	require.NoError(t, spool.append(conversationDataKindMessages, []byte(`{"id":"msg2"}`), 4, 160, 170))
+	require.NoError(t, spool.append(conversationDataKindResponses, []byte(`{"id":"resp3"}`), 5, 180, 190))
+	require.NoError(t, spool.flush())
+
+	require.NoError(t, replayAPIHijackKindSpool(ctx, spool, state))
+	require.NoError(t, state.waitForShardCompression(ctx))
+
+	// Despite 4 kind switches in scan order, replay yields exactly 2 shards:
+	// one responses shard and one messages shard.
+	require.Len(t, state.shards, 2)
+	for _, shard := range state.shards {
+		require.True(t, strings.HasSuffix(shard.File, ".jsonl.gz"), "every shard must be jsonl.gz, got %s", shard.File)
+		require.Len(t, shard.DataFiles, 1, "each shard holds exactly one kind")
+	}
+
+	require.Equal(t, conversationDataKindResponses, state.shards[0].DataFiles[0].Kind)
+	require.Equal(t,
+		"{\"id\":\"resp1\"}\n{\"id\":\"resp2\"}\n{\"id\":\"resp3\"}\n",
+		string(readGzipBytes(t, filepath.Join(outputDir, state.shards[0].File))),
+	)
+	require.EqualValues(t, 3, state.shards[0].RecordCount)
+
+	require.Equal(t, conversationDataKindMessages, state.shards[1].DataFiles[0].Kind)
+	require.Equal(t,
+		"{\"id\":\"msg1\"}\n{\"id\":\"msg2\"}\n",
+		string(readGzipBytes(t, filepath.Join(outputDir, state.shards[1].File))),
+	)
+	require.EqualValues(t, 2, state.shards[1].RecordCount)
+}
+
+// TestAPIHijackExportGroupsInterleavedKindsIntoContiguousShards is the
+// end-to-end proof of the tiny-shard fix: it seeds a DB with responses and
+// messages records INTERLEAVED by id (exactly how the id-ordered scan delivers
+// them), runs the real api_hijack export job, and asserts the output is a small
+// number of contiguous single-kind shards — not one shard per kind switch.
+func TestAPIHijackExportGroupsInterleavedKindsIntoContiguousShards(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	now := int64(1710000000)
+
+	respReq := `{"model":"gpt-5","input":"hi"}`
+	respResp := `{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"total_tokens":3}}`
+	msgReq := `{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}`
+	msgResp := `{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`
+
+	// 6 records, kinds interleaved by insertion (id) order: R M R M R M.
+	seed := []struct {
+		path, relay, req, resp string
+	}{
+		{"/v1/responses", "openai_responses", respReq, respResp},
+		{"/v1/messages", "claude", msgReq, msgResp},
+		{"/v1/responses", "openai_responses", respReq, respResp},
+		{"/v1/messages", "claude", msgReq, msgResp},
+		{"/v1/responses", "openai_responses", respReq, respResp},
+		{"/v1/messages", "claude", msgReq, msgResp},
+	}
+	for i, s := range seed {
+		require.NoError(t, model.CreateConversationLog(&model.ConversationLog{
+			CreatedAt:        now + int64(i),
+			SessionId:        "sess_" + strconv.Itoa(i),
+			Provider:         "test",
+			RequestPath:      s.path,
+			RelayFormat:      s.relay,
+			RequestBody:      s.req,
+			ResponseBody:     s.resp,
+			RequestTime:      now + int64(i),
+			ResponseTime:     now + int64(i) + 1,
+			ValidationStatus: ConversationValidationValid,
+		}))
+	}
+
+	filter := model.ConversationLogQuery{StartTime: now, EndTime: now + 100}
+	filterJSON, err := common.Marshal(filter)
+	require.NoError(t, err)
+	outputDir := filepath.Join(t.TempDir(), "export")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	job := &model.ConversationExportJob{
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		JobId:            "job-api-interleaved",
+		Mode:             conversation_log_setting.ExportModeAPIHijackJSONL,
+		FilterJSON:       string(filterJSON),
+		ShardTargetBytes: 1 << 30, // large target: each kind collapses to one shard
+		ShardMaxBytes:    1 << 30,
+		Status:           model.ConversationExportJobStatusRunning,
+		OutputDirectory:  outputDir,
+		Trigger:          "manual",
+	}
+	require.NoError(t, model.CreateConversationExportJob(job))
+
+	require.NoError(t, executeExportJob(context.Background(), job))
+
+	fresh, err := model.GetConversationExportJobByJobID(job.JobId)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, fresh.ShardCount, "interleaved kinds must collapse to one shard per kind")
+
+	// The shard list lives in manifest.json on disk.
+	manifestBytes, err := os.ReadFile(filepath.Join(outputDir, "manifest.json"))
+	require.NoError(t, err)
+	var manifest TopManifest
+	require.NoError(t, common.Unmarshal(manifestBytes, &manifest))
+
+	// Exactly 2 shards despite 5 kind switches in scan order.
+	require.Len(t, manifest.Shards, 2, "interleaved kinds must collapse to one shard per kind")
+
+	byKind := map[string]TopManifestShard{}
+	for _, shard := range manifest.Shards {
+		require.True(t, strings.HasSuffix(shard.File, ".jsonl.gz"), "every shard is flat jsonl.gz, got %s", shard.File)
+		require.Len(t, shard.DataFiles, 1, "each shard holds exactly one kind")
+		byKind[shard.DataFiles[0].Kind] = shard
+	}
+
+	respShard, ok := byKind[conversationDataKindResponses]
+	require.True(t, ok, "a responses shard must exist")
+	require.EqualValues(t, 3, respShard.RecordCount)
+	respLines := strings.Count(strings.TrimSpace(string(readGzipBytes(t, filepath.Join(outputDir, respShard.File)))), "\n") + 1
+	require.Equal(t, 3, respLines)
+
+	msgShard, ok := byKind[conversationDataKindMessages]
+	require.True(t, ok, "a messages shard must exist")
+	require.EqualValues(t, 3, msgShard.RecordCount)
+}
+
 func TestShardWriterStateWaitsForQueuedShardCompression(t *testing.T) {
 	dir := t.TempDir()
 	outputDir := filepath.Join(dir, "out")
