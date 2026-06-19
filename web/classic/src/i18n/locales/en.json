@@ -4127,7 +4127,7 @@
     "客户端": "Clients",
     "选择客户端或输入自定义 User-Agent 关键词": "Select clients or enter custom User-Agent keywords",
     "预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）": "Preset clients are matched by request signals; custom entries match the User-Agent (supports * wildcard)",
-    "预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）。Codex CLI/TUI 与 Codex VS Code 分开匹配：CLI 专用渠道请勿勾选 VS Code。": "Preset clients are matched by request signals; custom entries match the User-Agent (supports * wildcard). Codex CLI/TUI and Codex VS Code are matched separately: do not select VS Code for CLI-only channels.",
+    "预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）。Codex 预设统一覆盖 CLI/TUI、Desktop、VS Code 等官方客户端。": "Preset clients are matched by request signals; custom entries match the User-Agent (supports * wildcard). The Codex preset covers all official clients: CLI/TUI, Desktop, and VS Code.",
     "客户端限制 · 白名单({{count}})": "Client restriction · Allowlist ({{count}})",
     "客户端限制 · 黑名单({{count}})": "Client restriction · Blocklist ({{count}})",
     "白名单模式": "Allowlist mode",

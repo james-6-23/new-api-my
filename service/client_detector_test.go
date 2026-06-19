@@ -203,38 +203,118 @@ func TestIsClientAllowedByChannel_CodexTUI(t *testing.T) {
 	}
 }
 
-func TestIsClientAllowedByChannel_CodexVSCode(t *testing.T) {
-	allowVSCode := dto.ChannelOtherSettings{
-		ClientRestrictionEnabled: true,
-		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
-		ClientRestrictionClients: []string{"codex-vscode"},
-	}
-	allowCLI := dto.ChannelOtherSettings{
+func TestIsClientAllowedByChannel_CodexUnified(t *testing.T) {
+	allowCodex := dto.ChannelOtherSettings{
 		ClientRestrictionEnabled: true,
 		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
 		ClientRestrictionClients: []string{"codex-cli"},
 	}
 
-	vscode := newTestContext(http.MethodPost, "", map[string]string{
-		"User-Agent": "codex_vscode/0.78.0 (darwin; arm64)",
-		"originator": "codex_vscode",
-	})
-	if allowed, _ := IsClientAllowedByChannel(vscode, allowVSCode); !allowed {
-		t.Fatalf("expected codex vscode to match codex-vscode allowlist")
-	}
-	if allowed, _ := IsClientAllowedByChannel(vscode, allowCLI); allowed {
-		t.Fatalf("expected codex vscode to be blocked on codex-cli-only allowlist")
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{
+			name: "codex-tui",
+			headers: map[string]string{
+				"User-Agent": "codex-tui/0.141.0 (external, cli)",
+				"originator": "codex_cli_rs",
+			},
+		},
+		{
+			name: "codex-vscode",
+			headers: map[string]string{
+				"User-Agent": "codex_vscode/0.78.0 (darwin; arm64)",
+				"originator": "codex_vscode",
+			},
+		},
+		{
+			name: "codex-desktop-ua",
+			headers: map[string]string{
+				"User-Agent": "Codex Desktop/0.133.0 (Mac OS 26.4.0; arm64)",
+			},
+		},
+		{
+			name: "codex-chatgpt-desktop-originator",
+			headers: map[string]string{
+				"originator": "codex_chatgpt_desktop",
+			},
+		},
+		{
+			name: "codex-alias-preset",
+			headers: map[string]string{
+				"User-Agent": "codex-tui/0.141.0",
+			},
+		},
 	}
 
-	cli := newTestContext(http.MethodPost, "", map[string]string{
-		"User-Agent": "codex-tui/0.141.0 (external, cli)",
-		"originator": "codex_cli_rs",
-	})
-	if allowed, _ := IsClientAllowedByChannel(cli, allowCLI); !allowed {
-		t.Fatalf("expected codex cli to match codex-cli allowlist")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestContext(http.MethodPost, "", tc.headers)
+			if allowed, _ := IsClientAllowedByChannel(c, allowCodex); !allowed {
+				t.Fatalf("expected %s to match unified codex allowlist", tc.name)
+			}
+		})
 	}
-	if allowed, _ := IsClientAllowedByChannel(cli, allowVSCode); allowed {
-		t.Fatalf("expected codex cli to be blocked on codex-vscode-only allowlist")
+
+	// 历史别名 codex-vscode / codex-desktop 配置仍指向同一识别逻辑
+	for _, legacyPattern := range []string{"codex-vscode", "codex-desktop", "codex"} {
+		settings := dto.ChannelOtherSettings{
+			ClientRestrictionEnabled: true,
+			ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
+			ClientRestrictionClients: []string{legacyPattern},
+		}
+		c := newTestContext(http.MethodPost, "", map[string]string{
+			"User-Agent": "Codex Desktop/0.133.0 (Mac OS 26.4.0; arm64)",
+		})
+		if allowed, _ := IsClientAllowedByChannel(c, settings); !allowed {
+			t.Fatalf("expected desktop to match legacy pattern %s", legacyPattern)
+		}
+	}
+
+	other := newTestContext(http.MethodPost, "", map[string]string{"User-Agent": "curl/8.0"})
+	if allowed, _ := IsClientAllowedByChannel(other, allowCodex); allowed {
+		t.Fatalf("expected non-codex client to be blocked")
+	}
+}
+
+func TestHasCodexDesktopUA(t *testing.T) {
+	if !hasCodexDesktopUA("Codex Desktop/0.133.0 (Mac OS 26.4.0; arm64)") {
+		t.Fatalf("expected official Codex Desktop UA prefix to match")
+	}
+	if !hasCodexDesktopUA("Codex Desktop/0.140.0-alpha.19 (Windows 10.0.19045; x86_64)") {
+		t.Fatalf("expected Codex Desktop alpha UA prefix to match")
+	}
+	if hasCodexDesktopUA("codex-tui/0.141.0 (external, cli)") {
+		t.Fatalf("codex-tui UA must not match desktop prefix")
+	}
+	if hasCodexDesktopUA("codex_vscode/0.78.0") {
+		t.Fatalf("codex_vscode UA must not match desktop prefix")
+	}
+	if hasCodexDesktopUA("Codex Desktop") {
+		t.Fatalf("desktop UA without semver should not match")
+	}
+}
+
+// TestIsClientAllowedByChannel_CodexProductionUAs 覆盖线上真实 UA 样本（含 alpha 版本）
+func TestIsClientAllowedByChannel_CodexProductionUAs(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		ClientRestrictionEnabled: true,
+		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
+		ClientRestrictionClients: []string{"codex-cli"},
+	}
+	uas := []string{
+		"codex_vscode/0.140.0-alpha.2 (Mac OS 26.5.0; arm64)",
+		"codex_vscode/0.142.0-alpha.1 (Mac OS 26.2.0; arm64)",
+		"codex_vscode/0.140.0-alpha.2 (Windows 10.0.26200; x86_64)",
+		"Codex Desktop/0.140.0-alpha.19 (Windows 10.0.19045; x86_64)",
+		"codex-tui/0.140.0 (Windows 10.0.19045; x86_64)",
+	}
+	for _, ua := range uas {
+		c := newTestContext(http.MethodPost, "", map[string]string{"User-Agent": ua})
+		if allowed, _ := IsClientAllowedByChannel(c, settings); !allowed {
+			t.Fatalf("expected production UA to match codex allowlist: %s", ua)
+		}
 	}
 }
 

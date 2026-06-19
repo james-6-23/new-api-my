@@ -19,9 +19,11 @@ For commercial licensing, please contact support@quantumnous.com
 
 const CLIENT_RESTRICTION_PRESET_LABELS = {
   'claude-code': 'Claude Code',
-  'codex-cli': 'Codex CLI / TUI',
-  'codex-tui': 'Codex CLI / TUI',
-  'codex-vscode': 'Codex VS Code',
+  codex: 'Codex',
+  'codex-cli': 'Codex',
+  'codex-tui': 'Codex',
+  'codex-vscode': 'Codex',
+  'codex-desktop': 'Codex',
   'gemini-cli': 'Gemini CLI',
   'factory-cli': 'Factory CLI',
 };

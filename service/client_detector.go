@@ -16,7 +16,8 @@ import (
 //
 // 设计参考自 claude-code-hub：对内置的 claude-code 系列客户端不仅看 User-Agent，
 // 还结合 x-app、anthropic-beta、metadata.user_id 等信号做多重确认以防伪造；
-// 其它客户端（codex/gemini 等）及自定义关键词则直接按 User-Agent 子串/通配匹配。
+// Codex 全系客户端（CLI/TUI、Desktop、VS Code）通过 originator + UA 多形态统一识别；
+// 其它客户端（gemini 等）及自定义关键词则按 User-Agent 子串/通配匹配。
 //
 // 针对 Claude Code 的强化（最严档）：采用「加权打分 + 强信号门控」。
 // 仅靠伪造若干 HTTP 头无法通过——必须命中至少一个难以伪造的强信号
@@ -26,37 +27,44 @@ import (
 // 内置客户端预设关键词 -> 用于匹配的 UA 子串（均为小写、已去除连字符/下划线）
 var builtinClientKeywords = map[string]struct{}{
 	"claude-code": {},
+	"codex":         {}, // Codex 全系客户端（CLI/TUI、Desktop、VS Code 等）
+	"codex-cli":     {}, // 与 codex 等价，保留兼容历史配置
+	"codex-tui":     {}, // 历史别名
+	"codex-vscode":  {}, // 历史别名
+	"codex-desktop": {}, // 历史别名
+	"gemini-cli":    {},
+	"factory-cli":   {},
+}
+
+// codexClientPatterns 统一走 isCodexClient 识别的预设标识（含历史别名）
+var codexClientPatterns = map[string]struct{}{
+	"codex":         {},
 	"codex-cli":     {},
-	"codex-tui":     {}, // Codex CLI 新版 UA 前缀（与 codex-cli 共用识别逻辑）
-	"codex-vscode":  {}, // Codex VS Code 扩展（与 codex-cli 独立，不互相匹配）
-	"gemini-cli":  {},
-	"factory-cli": {},
+	"codex-tui":     {},
+	"codex-vscode":  {},
+	"codex-desktop": {},
 }
 
-// codexCLIUATokens 归一化后的 Codex CLI/TUI 常见 UA 子串。
-// 官方客户端 UA 前缀已从 codex_cli_rs / codex-cli 演进为 codex-tui，不能仅靠单一子串匹配。
-var codexCLIUATokens = []string{
-	"codextui",    // codex-tui（当前主流）
-	"codexcli",    // codex-cli
-	"codexclirs",  // codex_cli_rs（originator 默认名也会出现在 UA 中）
-	"codexclicore", // 旧版/内部标识
-}
-
-// codexCLIOriginators Codex CLI/TUI 会携带的 originator 请求头取值（大小写不敏感）
-var codexCLIOriginators = []string{
+// codexClientOriginators 官方 Codex 客户端 originator 取值（大小写不敏感、忽略连字符/下划线）
+var codexClientOriginators = []string{
 	"codex_cli_rs",
 	"codex-tui",
-}
-
-// codexVSCodeOriginators Codex VS Code 扩展的 originator 取值
-var codexVSCodeOriginators = []string{
 	"codex_vscode",
+	"codex_chatgpt_desktop",
+	"codex_atlas",
 }
 
-// codexVSCodeUATokens 归一化后的 Codex VS Code UA 子串
-var codexVSCodeUATokens = []string{
+// codexClientUATokens 归一化 UA 子串（已去空格/连字符/下划线后匹配；不含 Desktop，Desktop 走专用 UA 前缀）
+var codexClientUATokens = []string{
+	"codextui",
+	"codexcli",
+	"codexclirs",
+	"codexclicore",
 	"codexvscode",
 }
+
+// codexDesktopUAPattern 桌面版官方 UA 前缀：Codex Desktop/x.y.z（注意中间有空格）
+var codexDesktopUAPattern = regexp.MustCompile(`(?i)^codex desktop/\d+\.\d+\.\d+`)
 
 // IsBuiltinClientKeyword 判断给定的客户端标识是否为内置预设
 func IsBuiltinClientKeyword(pattern string) bool {
@@ -296,12 +304,34 @@ func isClaudeCode(c *gin.Context, settings dto.ChannelOtherSettings) bool {
 	return score >= claudeCodeMinScore(settings)
 }
 
-// isCodexVSCode 识别 OpenAI Codex VS Code 扩展客户端（不含 CLI/TUI）。
-func isCodexVSCode(c *gin.Context) bool {
+func isCodexClientPattern(pattern string) bool {
+	_, ok := codexClientPatterns[pattern]
+	return ok
+}
+
+// normalizeCodexUA 归一化 UA：小写并移除空格、连字符、下划线，便于跨端匹配
+func normalizeCodexUA(s string) string {
+	s = normalizeClientToken(s)
+	return strings.ReplaceAll(s, " ", "")
+}
+
+// hasCodexDesktopUA 桌面版通过 UA 前缀 "Codex Desktop/" 识别（非 codex-tui / codex_vscode 形态）。
+func hasCodexDesktopUA(ua string) bool {
+	ua = strings.TrimSpace(ua)
+	return ua != "" && codexDesktopUAPattern.MatchString(ua)
+}
+
+// isCodexClient 识别 OpenAI Codex 全系官方客户端（CLI/TUI、Desktop、VS Code 等）。
+func isCodexClient(c *gin.Context) bool {
+	ua := strings.TrimSpace(c.Request.Header.Get("User-Agent"))
+	if hasCodexDesktopUA(ua) {
+		return true
+	}
+
 	originator := strings.TrimSpace(c.Request.Header.Get("originator"))
 	if originator != "" {
 		no := normalizeClientToken(originator)
-		for _, o := range codexVSCodeOriginators {
+		for _, o := range codexClientOriginators {
 			if no == normalizeClientToken(o) {
 				return true
 			}
@@ -312,38 +342,11 @@ func isCodexVSCode(c *gin.Context) bool {
 		}
 	}
 
-	ua := strings.TrimSpace(c.Request.Header.Get("User-Agent"))
 	if ua == "" {
 		return false
 	}
-	nu := normalizeClientToken(ua)
-	for _, token := range codexVSCodeUATokens {
-		if strings.Contains(nu, token) {
-			return true
-		}
-	}
-	return false
-}
-
-// isCodexCLI 识别 OpenAI Codex CLI/TUI 客户端。
-// 除 UA 外也校验 originator 头（官方 SDK 自动注入，比单纯伪造 UA 更可靠）。
-func isCodexCLI(c *gin.Context) bool {
-	originator := strings.TrimSpace(c.Request.Header.Get("originator"))
-	if originator != "" {
-		no := normalizeClientToken(originator)
-		for _, o := range codexCLIOriginators {
-			if no == normalizeClientToken(o) {
-				return true
-			}
-		}
-	}
-
-	ua := strings.TrimSpace(c.Request.Header.Get("User-Agent"))
-	if ua == "" {
-		return false
-	}
-	nu := normalizeClientToken(ua)
-	for _, token := range codexCLIUATokens {
+	nu := normalizeCodexUA(ua)
+	for _, token := range codexClientUATokens {
 		if strings.Contains(nu, token) {
 			return true
 		}
@@ -363,14 +366,9 @@ func matchClientPattern(c *gin.Context, pattern string, settings dto.ChannelOthe
 		return isClaudeCode(c, settings)
 	}
 
-	// Codex CLI/TUI：覆盖 codex-tui、codex_cli_rs 等多种官方 UA 形态
-	if pattern == "codex-cli" || pattern == "codex-tui" {
-		return isCodexCLI(c)
-	}
-
-	// Codex VS Code 扩展：与 CLI/TUI 分开配置，避免专用 CLI 渠道误放行 IDE 插件
-	if pattern == "codex-vscode" {
-		return isCodexVSCode(c)
+	// Codex 全系：CLI/TUI、Desktop、VS Code 及历史别名预设统一识别
+	if isCodexClientPattern(pattern) {
+		return isCodexClient(c)
 	}
 
 	ua := strings.TrimSpace(c.Request.Header.Get("User-Agent"))
