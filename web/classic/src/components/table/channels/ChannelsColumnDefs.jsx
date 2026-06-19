@@ -45,6 +45,11 @@ import {
 } from '../../../constants';
 import { parseUpstreamUpdateMeta } from '../../../hooks/channels/upstreamUpdateUtils';
 import {
+  getClientRestrictionBadgeText,
+  getClientRestrictionTooltip,
+  parseClientRestrictionMeta,
+} from '../../../hooks/channels/clientRestrictionUtils';
+import {
   IconTreeTriangleDown,
   IconMore,
   IconAlertTriangle,
@@ -348,6 +353,20 @@ export const getChannelsColumns = ({
           upstreamUpdateMeta.supported &&
           upstreamUpdateMeta.enabled &&
           (pendingAddCount > 0 || pendingRemoveCount > 0);
+        const clientRestrictionMeta =
+          record?.clientRestrictionMeta &&
+          typeof record.clientRestrictionMeta === 'object'
+            ? record.clientRestrictionMeta
+            : parseClientRestrictionMeta(record?.settings);
+        const showClientRestrictionTag = clientRestrictionMeta.enabled === true;
+        const clientRestrictionBadgeText = getClientRestrictionBadgeText(
+          clientRestrictionMeta,
+          t,
+        );
+        const clientRestrictionTooltip = getClientRestrictionTooltip(
+          clientRestrictionMeta,
+          t,
+        );
         const nameNode =
           record.remark && record.remark.trim() !== '' ? (
             <Tooltip
@@ -383,13 +402,32 @@ export const getChannelsColumns = ({
             <span>{text}</span>
           );
 
-        if (!passThroughEnabled && !showUpstreamUpdateTag) {
+        if (
+          !passThroughEnabled &&
+          !showUpstreamUpdateTag &&
+          !showClientRestrictionTag
+        ) {
           return nameNode;
         }
 
         return (
           <Space spacing={6} align='center'>
             {nameNode}
+            {showClientRestrictionTag && (
+              <Tooltip
+                content={
+                  <div className='max-w-xs whitespace-pre-wrap'>
+                    {clientRestrictionTooltip}
+                  </div>
+                }
+                trigger='hover'
+                position='topLeft'
+              >
+                <Tag color='purple' type='light' size='small' shape='circle'>
+                  {clientRestrictionBadgeText}
+                </Tag>
+              </Tooltip>
+            )}
             {passThroughEnabled && (
               <Tooltip
                 content={t(

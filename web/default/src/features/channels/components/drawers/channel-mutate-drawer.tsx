@@ -297,7 +297,7 @@ function SubHeading({ title, icon }: { title: string; icon?: ReactNode }) {
 // Values must match the backend builtin keywords in service/client_detector.go.
 const CLIENT_RESTRICTION_PRESET_OPTIONS = [
   { label: 'Claude Code', value: 'claude-code' },
-  { label: 'Codex CLI', value: 'codex-cli' },
+  { label: 'Codex CLI / TUI', value: 'codex-cli' },
   { label: 'Gemini CLI', value: 'gemini-cli' },
   { label: 'Factory CLI', value: 'factory-cli' },
 ]

@@ -173,6 +173,71 @@ func TestIsClientAllowedByChannel_ConfigurableClaudeCode(t *testing.T) {
 	}
 }
 
+func TestIsClientAllowedByChannel_CodexTUI(t *testing.T) {
+	settings := dto.ChannelOtherSettings{
+		ClientRestrictionEnabled: true,
+		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
+		ClientRestrictionClients: []string{"codex-cli"},
+	}
+	// Codex 新版 UA 前缀为 codex-tui，白名单仅选 codex-cli 时也应放行
+	codexTUI := newTestContext(http.MethodPost, "", map[string]string{
+		"User-Agent": "codex-tui/0.141.0 (Mac OS 26.5.1; arm64) Apple_Terminal/470.2 (codex-tui; 0.141.0)",
+		"originator": "codex_cli_rs",
+	})
+	if allowed, _ := IsClientAllowedByChannel(codexTUI, settings); !allowed {
+		t.Fatalf("expected codex-tui UA to match codex-cli allowlist")
+	}
+
+	// 仅 originator 也能识别（UA 缺失时的兜底）
+	originatorOnly := newTestContext(http.MethodPost, "", map[string]string{
+		"originator": "codex_cli_rs",
+	})
+	if allowed, _ := IsClientAllowedByChannel(originatorOnly, settings); !allowed {
+		t.Fatalf("expected codex originator header to match codex-cli allowlist")
+	}
+
+	// 普通客户端仍拒绝
+	other := newTestContext(http.MethodPost, "", map[string]string{"User-Agent": "curl/8.0"})
+	if allowed, _ := IsClientAllowedByChannel(other, settings); allowed {
+		t.Fatalf("expected non-codex client to be blocked")
+	}
+}
+
+func TestIsClientAllowedByChannel_CodexVSCode(t *testing.T) {
+	allowVSCode := dto.ChannelOtherSettings{
+		ClientRestrictionEnabled: true,
+		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
+		ClientRestrictionClients: []string{"codex-vscode"},
+	}
+	allowCLI := dto.ChannelOtherSettings{
+		ClientRestrictionEnabled: true,
+		ClientRestrictionMode:    dto.ClientRestrictionModeAllow,
+		ClientRestrictionClients: []string{"codex-cli"},
+	}
+
+	vscode := newTestContext(http.MethodPost, "", map[string]string{
+		"User-Agent": "codex_vscode/0.78.0 (darwin; arm64)",
+		"originator": "codex_vscode",
+	})
+	if allowed, _ := IsClientAllowedByChannel(vscode, allowVSCode); !allowed {
+		t.Fatalf("expected codex vscode to match codex-vscode allowlist")
+	}
+	if allowed, _ := IsClientAllowedByChannel(vscode, allowCLI); allowed {
+		t.Fatalf("expected codex vscode to be blocked on codex-cli-only allowlist")
+	}
+
+	cli := newTestContext(http.MethodPost, "", map[string]string{
+		"User-Agent": "codex-tui/0.141.0 (external, cli)",
+		"originator": "codex_cli_rs",
+	})
+	if allowed, _ := IsClientAllowedByChannel(cli, allowCLI); !allowed {
+		t.Fatalf("expected codex cli to match codex-cli allowlist")
+	}
+	if allowed, _ := IsClientAllowedByChannel(cli, allowVSCode); allowed {
+		t.Fatalf("expected codex cli to be blocked on codex-vscode-only allowlist")
+	}
+}
+
 func TestIsClientAllowedByChannel_Blocklist(t *testing.T) {
 	settings := dto.ChannelOtherSettings{
 		ClientRestrictionEnabled: true,

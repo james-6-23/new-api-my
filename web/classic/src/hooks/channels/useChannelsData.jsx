@@ -37,6 +37,7 @@ import { useIsMobile } from '../common/useIsMobile';
 import { useTableCompactMode } from '../common/useTableCompactMode';
 import { useChannelUpstreamUpdates } from './useChannelUpstreamUpdates';
 import { parseUpstreamUpdateMeta } from './upstreamUpdateUtils';
+import { parseClientRestrictionMeta } from './clientRestrictionUtils';
 import { Modal, Button } from '@douyinfe/semi-ui';
 import { openCodexUsageModal } from '../../components/table/channels/modals/CodexUsageModal';
 
@@ -238,6 +239,9 @@ export const useChannelsData = () => {
 
     for (let i = 0; i < channels.length; i++) {
       channels[i].upstreamUpdateMeta = parseUpstreamUpdateMeta(
+        channels[i].settings,
+      );
+      channels[i].clientRestrictionMeta = parseClientRestrictionMeta(
         channels[i].settings,
       );
       channels[i].key = '' + channels[i].id;

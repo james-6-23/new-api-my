@@ -46,7 +46,7 @@ type ChannelOtherSettings struct {
 	// 客户端限制：限制只有特定客户端（如 Claude Code CLI）才能使用该渠道
 	ClientRestrictionEnabled bool                  `json:"client_restriction_enabled,omitempty"` // 是否开启客户端限制
 	ClientRestrictionMode    ClientRestrictionMode `json:"client_restriction_mode,omitempty"`    // "allow"=白名单（仅列出的客户端可用）/ "block"=黑名单（列出的客户端禁用）
-	ClientRestrictionClients []string              `json:"client_restriction_clients,omitempty"` // 客户端标识列表，如 "claude-code"、"codex-cli"、"gemini-cli" 或自定义 UA 关键词
+	ClientRestrictionClients []string              `json:"client_restriction_clients,omitempty"` // 客户端标识列表，如 "claude-code"、"codex-cli"、"codex-vscode"、"gemini-cli" 或自定义 UA 关键词
 
 	// Claude Code 防伪装识别参数（仅对内置 "claude-code" 标识生效）。
 	// 使用指针以区分「未配置」(nil，回退默认值) 与「显式设置」；避免非指针 0 值被当作阈值=0 而放行一切。

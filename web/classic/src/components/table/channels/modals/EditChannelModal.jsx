@@ -2506,7 +2506,8 @@ const EditChannelModal = (props) => {
                         style={{ width: '100%' }}
                         optionList={[
                           { label: 'Claude Code', value: 'claude-code' },
-                          { label: 'Codex CLI', value: 'codex-cli' },
+                          { label: 'Codex CLI / TUI', value: 'codex-cli' },
+                          { label: 'Codex VS Code', value: 'codex-vscode' },
                           { label: 'Gemini CLI', value: 'gemini-cli' },
                           { label: 'Factory CLI', value: 'factory-cli' },
                         ]}
@@ -2517,7 +2518,7 @@ const EditChannelModal = (props) => {
                           )
                         }
                         extraText={t(
-                          '预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）',
+                          '预设客户端通过请求特征识别；自定义项按 User-Agent 匹配（支持 * 通配符）。Codex CLI/TUI 与 Codex VS Code 分开匹配：CLI 专用渠道请勿勾选 VS Code。',
                         )}
                       />
                       {Array.isArray(inputs.client_restriction_clients) &&
