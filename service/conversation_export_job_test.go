@@ -238,7 +238,7 @@ func TestReplayAPIHijackKindSpoolGroupsInterleavedKindsContiguously(t *testing.T
 	require.NoError(t, spool.append(conversationDataKindResponses, []byte(`{"id":"resp3"}`), 5, 180, 190))
 	require.NoError(t, spool.flush())
 
-	require.NoError(t, replayAPIHijackKindSpool(ctx, spool, state))
+	require.NoError(t, replayAPIHijackKindSpool(ctx, spool, state, nil))
 	require.NoError(t, state.waitForShardCompression(ctx))
 
 	// Despite 4 kind switches in scan order, replay yields exactly 2 shards:

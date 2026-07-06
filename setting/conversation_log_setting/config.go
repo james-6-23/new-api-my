@@ -211,6 +211,20 @@ type ConversationLogSetting struct {
 	// per-request dump (every structurally-valid record exported).
 	APIHijackEnforceSessionRules bool `json:"api_hijack_enforce_session_rules"`
 
+	// CrossSessionToolFill fills a tool_call's missing tool definition from
+	// another session's tools list within the SAME export batch. H3 (tool
+	// attribution) only checks that every called tool name is declared in the
+	// session's tools array; it does not check schema correctness. So when
+	// session A calls tool T without declaring it but session B in the same
+	// batch DID declare T (with a real upstream schema), copying B's definition
+	// into A is lossless — it uses a genuine definition the provider actually
+	// emitted, never a reverse-constructed guess. This lifts H3 on sessions
+	// whose client happened to omit the tools array on some turns. Default true;
+	// set false to disable and fall back to per-session + standard-table fill
+	// only. Distinct from reverse-constructing a schema from tool_call arguments,
+	// which is intentionally NOT done (risk of an incorrect definition).
+	CrossSessionToolFill bool `json:"cross_session_tool_fill"`
+
 	DefaultShardTargetBytes    int64 `json:"default_shard_target_bytes"`
 	DefaultShardMaxBytes       int64 `json:"default_shard_max_bytes"`
 	ExportJobConcurrency       int   `json:"export_job_concurrency"`
@@ -328,6 +342,7 @@ var conversationLogSetting = ConversationLogSetting{
 	ExportDirectory:              filepath.Join("data", "conversation_exports"),
 	DefaultExportMode:            ExportModeAPIHijackJSONL,
 	APIHijackEnforceSessionRules: true,
+	CrossSessionToolFill:         true,
 	DefaultShardTargetBytes:      defaultShardTargetBytes,
 	DefaultShardMaxBytes:         defaultShardMaxBytes,
 	ExportJobConcurrency:         1,

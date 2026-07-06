@@ -227,6 +227,7 @@ func UpdateConversationLogSettings(c *gin.Context) {
 
 		// High-volume / data-quality knobs added for the partitioned pipeline.
 		RetainOriginalBodies                *bool  `json:"retain_original_bodies"`
+		CrossSessionToolFill                *bool  `json:"cross_session_tool_fill"`
 		RetentionDeleteUnexported           *bool  `json:"retention_delete_unexported"`
 		CaptureMaxBytesPerRequest           *int64 `json:"capture_max_bytes_per_request"`
 		CaptureGlobalMaxBytes               *int64 `json:"capture_global_max_bytes"`
@@ -482,6 +483,12 @@ func UpdateConversationLogSettings(c *gin.Context) {
 	}
 	if req.RetainOriginalBodies != nil {
 		if err := model.UpdateOption("conversation_log_setting.retain_original_bodies", strconv.FormatBool(*req.RetainOriginalBodies)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+	if req.CrossSessionToolFill != nil {
+		if err := model.UpdateOption("conversation_log_setting.cross_session_tool_fill", strconv.FormatBool(*req.CrossSessionToolFill)); err != nil {
 			common.ApiError(c, err)
 			return
 		}

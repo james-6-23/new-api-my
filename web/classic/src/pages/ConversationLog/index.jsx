@@ -118,6 +118,7 @@ const defaultSettings = {
   write_batch_max_bytes: 32 * MiB,
   write_flush_interval_ms: 1000,
   retain_original_bodies: false,
+  cross_session_tool_fill: true,
   retention_delete_unexported: false,
   capture_max_bytes_per_request: 16 * MiB,
   capture_global_max_bytes: 4096 * MiB,
@@ -1996,6 +1997,23 @@ const ConversationLog = () => {
                           setSettings({
                             ...settings,
                             retain_original_bodies: value === true,
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} sm={12} lg={8}>
+                      <Form.Switch
+                        field='cross_session_tool_fill'
+                        label={t('跨会话工具定义补全')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        extraText={t(
+                          '默认开：同批导出内，某会话调用了未声明的工具时，借用同批其他会话已声明的真实定义补全，提升 H3 工具归属通过率。仅复用真实定义，不反推 schema',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            cross_session_tool_fill: value === true,
                           })
                         }
                       />

@@ -1922,6 +1922,11 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	}
 	defer spool.cleanup()
 
+	// Step 2: accumulate the cross-session tool pool during the single scan so
+	// the replay phase can borrow real tool definitions declared by other
+	// sessions in this batch. nil when CrossSessionToolFill is disabled.
+	pool := newEmptyBatchSessionToolPool()
+
 	err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1941,10 +1946,12 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 			if !conversationDataKindExportable(dataKind) {
 				continue
 			}
+			requestBody := prepared.EffectiveRequestBody()
+			pool.addRequestBody(item.Provider, requestBody)
 			rec := StrictAPIRecord{
 				SessionID:    item.SessionId,
 				Provider:     item.Provider,
-				RequestBody:  prepared.EffectiveRequestBody(),
+				RequestBody:  requestBody,
 				ResponseBody: item.ResponseBody,
 				RequestTime:  item.RequestTime,
 				ResponseTime: item.ResponseTime,
@@ -1966,7 +1973,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	if err := spool.flush(); err != nil {
 		return err
 	}
-	return replayAPIHijackKindSpool(ctx, spool, state)
+	return replayAPIHijackKindSpool(ctx, spool, state, pool)
 }
 
 // apiHijackKindSpool buffers exported records on disk, one temp file per data
@@ -2077,13 +2084,13 @@ func (s *apiHijackKindSpool) cleanup() {
 // replayAPIHijackKindSpool streams each kind's spooled records into shards in a
 // fixed kind order, sealing the in-progress shard at each kind boundary so a
 // shard never mixes kinds.
-func replayAPIHijackKindSpool(ctx context.Context, spool *apiHijackKindSpool, state *shardWriterState) error {
+func replayAPIHijackKindSpool(ctx context.Context, spool *apiHijackKindSpool, state *shardWriterState, pool *sessionToolPool) error {
 	for _, kind := range orderedConversationDataKinds() {
 		w := spool.files[kind]
 		if w == nil {
 			continue
 		}
-		wrote, err := replayAPIHijackKind(ctx, w.path, kind, state)
+		wrote, err := replayAPIHijackKind(ctx, w.path, kind, state, pool)
 		if err != nil {
 			return err
 		}
@@ -2096,7 +2103,7 @@ func replayAPIHijackKindSpool(ctx context.Context, spool *apiHijackKindSpool, st
 	return nil
 }
 
-func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWriterState) (bool, error) {
+func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWriterState, pool *sessionToolPool) (bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return false, err
@@ -2119,6 +2126,10 @@ func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWri
 		if dataErr != nil {
 			return wrote, dataErr
 		}
+		// Step 2: borrow cross-session tool definitions for tools this record
+		// called but did not declare, using the batch pool built during the scan.
+		// No-op when the pool is nil/empty or nothing needs borrowing.
+		dataLine = applyCrossSessionToolFillToStrictRecordLine(dataLine, pool)
 		var meta apiHijackSpoolMeta
 		if err := common.Unmarshal(metaLine, &meta); err != nil {
 			return wrote, err
@@ -2144,6 +2155,33 @@ func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWri
 		state.maybePushProgress(false)
 	}
 	return wrote, nil
+}
+
+// applyCrossSessionToolFillToStrictRecordLine parses a spooled StrictAPIRecord
+// JSON line, injects any borrowable cross-session tool definitions into its
+// request_body, and re-marshals. Returns the input unchanged on a nil/empty
+// pool or any parse/marshal issue, so it is safe to call unconditionally in the
+// replay hot path.
+func applyCrossSessionToolFillToStrictRecordLine(line []byte, pool *sessionToolPool) []byte {
+	if pool.empty() || len(line) == 0 {
+		return line
+	}
+	var rec StrictAPIRecord
+	if err := common.Unmarshal(line, &rec); err != nil {
+		return line
+	}
+	var response map[string]interface{}
+	_ = common.Unmarshal([]byte(rec.ResponseBody), &response)
+	filled := applyCrossSessionToolFill(rec.Provider, rec.RequestBody, response, pool)
+	if filled == rec.RequestBody {
+		return line
+	}
+	rec.RequestBody = filled
+	out, err := common.Marshal(rec)
+	if err != nil {
+		return line
+	}
+	return out
 }
 
 type sessionExportSpool struct {
@@ -2806,6 +2844,14 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 }
 
 func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spool *sessionExportSpool, summary *ConversationExportSummary, state *shardWriterState, qualityAcc *qualityPreflightAccumulator, qualityAccByKind map[string]*qualityPreflightAccumulator, summaryByKind map[string]*ConversationExportSummary) (int64, error) {
+	// Step 2: build the batch-wide tool pool in a pre-pass over all buckets so a
+	// session can borrow a real tool definition declared by any other session in
+	// the batch, regardless of which bucket it landed in. nil (and thus inert)
+	// when CrossSessionToolFill is disabled.
+	pool, err := buildCrossSessionToolPoolFromBuckets(ctx, bucketPaths)
+	if err != nil {
+		return 0, err
+	}
 	var totalSessions int64
 	for bucketIndex, path := range bucketPaths {
 		if err := ctx.Err(); err != nil {
@@ -2845,7 +2891,7 @@ func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spo
 				}
 				continue
 			}
-			candidate := buildSessionCandidate(sessionID, group.records)
+			candidate := buildSessionCandidateWithPool(sessionID, group.records, pool)
 			kind = normalizeConversationDataKind(candidate.DataKind)
 			if qualityAcc != nil {
 				qualityAcc.addSession(sessionID, candidate)
@@ -2874,6 +2920,53 @@ func buildSessionSpoolFromBuckets(ctx context.Context, bucketPaths []string, spo
 		}
 	}
 	return totalSessions, nil
+}
+
+// buildCrossSessionToolPoolFromBuckets streams every bucket record and harvests
+// the real tool definitions sessions declared, into a batch-wide pool for step-2
+// cross-session fill. Returns nil (inert) when CrossSessionToolFill is disabled.
+// It only parses tools arrays, so it is far cheaper than a full session rebuild.
+func buildCrossSessionToolPoolFromBuckets(ctx context.Context, bucketPaths []string) (*sessionToolPool, error) {
+	pool := newEmptyBatchSessionToolPool()
+	if pool == nil {
+		return nil, nil
+	}
+	for _, path := range bucketPaths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := harvestBucketToolPool(path, pool); err != nil {
+			return nil, err
+		}
+	}
+	return pool, nil
+}
+
+func harvestBucketToolPool(path string, pool *sessionToolPool) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 1<<20)
+	for {
+		line, err := readJSONLLine(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var record sessionBucketRecord
+		if err := common.Unmarshal(line, &record); err != nil {
+			return err
+		}
+		pool.addRequestBody(record.Provider, record.RequestBody)
+	}
+	return nil
 }
 
 func readSessionBucketGroups(path string) (map[string]*sessionBucketGroup, error) {

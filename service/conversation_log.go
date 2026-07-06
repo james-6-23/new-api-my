@@ -785,35 +785,101 @@ func ExportConversationLogsJSONL(ctx context.Context, writer io.Writer, query mo
 		}
 		// Admission is settled at write time; the `valid` filter already excludes
 		// non_compliant records, so no per-record re-check here.
+		//
+		// Step 2 cross-session tool fill needs every session's declared tools
+		// before emitting, so when it is enabled we buffer the eligible records
+		// first (bounded by the same in-memory caps the session path uses), build
+		// the batch pool, then emit with borrowed definitions applied. When the
+		// kill-switch is off we keep the original uncapped streaming path.
+		pool := newEmptyBatchSessionToolPool()
+		if pool == nil {
+			err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
+				for _, item := range logs {
+					prepared := prepareConversationExportLog(item)
+					if !prepared.validation.Exportable {
+						continue
+					}
+					record := StrictAPIRecord{
+						SessionID:    item.SessionId,
+						Provider:     item.Provider,
+						RequestBody:  prepared.EffectiveRequestBody(),
+						ResponseBody: item.ResponseBody,
+						RequestTime:  item.RequestTime,
+						ResponseTime: item.ResponseTime,
+					}
+					data, err := common.Marshal(record)
+					if err != nil {
+						return err
+					}
+					if _, err := buffered.Write(data); err != nil {
+						return err
+					}
+					if _, err := buffered.WriteString("\n"); err != nil {
+						return err
+					}
+					exportedIDs = append(exportedIDs, item.Id)
+				}
+				return nil
+			})
+			return exportedIDs, summary, err
+		}
+
+		type apiHijackDirectRecord struct {
+			record StrictAPIRecord
+			id     int
+		}
+		bufferedRecords := make([]apiHijackDirectRecord, 0)
+		bufferedBytes := int64(0)
 		err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 			for _, item := range logs {
 				prepared := prepareConversationExportLog(item)
 				if !prepared.validation.Exportable {
 					continue
 				}
-				record := StrictAPIRecord{
-					SessionID:    item.SessionId,
-					Provider:     item.Provider,
-					RequestBody:  prepared.EffectiveRequestBody(),
-					ResponseBody: item.ResponseBody,
-					RequestTime:  item.RequestTime,
-					ResponseTime: item.ResponseTime,
+				requestBody := prepared.EffectiveRequestBody()
+				pool.addRequestBody(item.Provider, requestBody)
+				itemBytes := estimateConversationLogMemoryBytes(item)
+				if int64(len(bufferedRecords)) >= summaryInMemoryRecordCap || bufferedBytes+itemBytes > summaryInMemoryBytesCap {
+					return fmt.Errorf("api_hijack_jsonl direct export is limited to %d eligible records / %s retained payload bytes; use sharded export jobs for large exports", summaryInMemoryRecordCap, formatBytesForError(summaryInMemoryBytesCap))
 				}
-				data, err := common.Marshal(record)
-				if err != nil {
-					return err
-				}
-				if _, err := buffered.Write(data); err != nil {
-					return err
-				}
-				if _, err := buffered.WriteString("\n"); err != nil {
-					return err
-				}
-				exportedIDs = append(exportedIDs, item.Id)
+				bufferedBytes += itemBytes
+				bufferedRecords = append(bufferedRecords, apiHijackDirectRecord{
+					record: StrictAPIRecord{
+						SessionID:    item.SessionId,
+						Provider:     item.Provider,
+						RequestBody:  requestBody,
+						ResponseBody: item.ResponseBody,
+						RequestTime:  item.RequestTime,
+						ResponseTime: item.ResponseTime,
+					},
+					id: item.Id,
+				})
 			}
 			return nil
 		})
-		return exportedIDs, summary, err
+		if err != nil {
+			return exportedIDs, summary, err
+		}
+		for _, entry := range bufferedRecords {
+			record := entry.record
+			if !pool.empty() {
+				var response map[string]interface{}
+				_ = common.Unmarshal([]byte(record.ResponseBody), &response)
+				record.RequestBody = applyCrossSessionToolFill(record.Provider, record.RequestBody, response, pool)
+			}
+			data, err := common.Marshal(record)
+			if err != nil {
+				return exportedIDs, summary, err
+			}
+			if _, err := buffered.Write(data); err != nil {
+				return exportedIDs, summary, err
+			}
+			if _, err := buffered.WriteString("\n"); err != nil {
+				return exportedIDs, summary, err
+			}
+			exportedIDs = append(exportedIDs, entry.id)
+		}
+		return exportedIDs, summary, nil
 	}
 
 	if summary.APIExportableRecords > summaryInMemoryRecordCap {
@@ -1351,6 +1417,11 @@ func buildSessionCandidates(records []*model.ConversationLog) []sessionCandidate
 		}
 		grouped[record.SessionId] = append(grouped[record.SessionId], record)
 	}
+	// Step 2: harvest a batch-wide pool of real, declared tool definitions across
+	// every session first, so a session that called a tool without declaring it
+	// can borrow another session's genuine definition. Disabled (nil pool) via
+	// the CrossSessionToolFill kill-switch.
+	pool := newBatchSessionToolPool(records)
 	candidates := make([]sessionCandidate, 0, len(grouped))
 	for sessionID, items := range grouped {
 		sort.SliceStable(items, func(i, j int) bool {
@@ -1359,13 +1430,43 @@ func buildSessionCandidates(records []*model.ConversationLog) []sessionCandidate
 			}
 			return items[i].RequestTime < items[j].RequestTime
 		})
-		candidate := buildSessionCandidate(sessionID, items)
+		candidate := buildSessionCandidateWithPool(sessionID, items, pool)
 		candidates = append(candidates, candidate)
 	}
 	return candidates
 }
 
+// newBatchSessionToolPool builds the cross-session tool pool for a set of
+// records, or returns nil when CrossSessionToolFill is disabled.
+func newBatchSessionToolPool(records []*model.ConversationLog) *sessionToolPool {
+	if !conversation_log_setting.GetSetting().CrossSessionToolFill {
+		return nil
+	}
+	pool := newSessionToolPool()
+	for _, record := range records {
+		if record == nil {
+			continue
+		}
+		pool.addRequestBody(record.Provider, effectiveConversationRequestBody(record))
+	}
+	return pool
+}
+
+// newEmptyBatchSessionToolPool returns a fresh, empty pool when CrossSessionToolFill
+// is enabled (nil otherwise), for callers that accumulate the pool incrementally
+// during a scan rather than from an in-memory record slice.
+func newEmptyBatchSessionToolPool() *sessionToolPool {
+	if !conversation_log_setting.GetSetting().CrossSessionToolFill {
+		return nil
+	}
+	return newSessionToolPool()
+}
+
 func buildSessionCandidate(sessionID string, records []*model.ConversationLog) sessionCandidate {
+	return buildSessionCandidateWithPool(sessionID, records, nil)
+}
+
+func buildSessionCandidateWithPool(sessionID string, records []*model.ConversationLog, pool *sessionToolPool) sessionCandidate {
 	records = sortedConversationRecords(records)
 	toolsByName := make(map[string]SessionTool)
 	messages := make([]SessionMessage, 0)
@@ -1410,6 +1511,7 @@ func buildSessionCandidate(sessionID string, records []*model.ConversationLog) s
 	messages = dedupeAdjacentMessages(messages)
 	messages = normalizeSessionToolPairingIDs(messages)
 	fillMissingSessionToolDefinitions(toolsByName, messages)
+	fillMissingSessionToolDefinitionsFromPool(toolsByName, messages, pool)
 	tools := make([]SessionTool, 0, len(toolsByName))
 	for _, tool := range toolsByName {
 		tools = append(tools, tool)
