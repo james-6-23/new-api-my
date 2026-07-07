@@ -31,6 +31,14 @@ type ConversationExportJob struct {
 	DeleteAfterExport   bool   `json:"delete_after_export" gorm:"default:false"`
 	S3Upload            bool   `json:"s3_upload" gorm:"default:false"`
 	LocalExportDisabled bool   `json:"local_export_disabled" gorm:"default:false"`
+	// LimitRecords caps how many records this job exports (0 = unlimited).
+	// When the cap is reached the scan stops, the job completes normally with
+	// Truncated=true, and the remaining backlog stays pending (exported_at = 0)
+	// for the next chunked job to pick up.
+	LimitRecords int64 `json:"limit_records" gorm:"bigint;default:0"`
+	// Truncated marks a completed job that stopped at LimitRecords with backlog
+	// remaining; the auto-export watcher chains the next chunk off this flag.
+	Truncated bool `json:"truncated" gorm:"default:false"`
 
 	Status       string `json:"status" gorm:"type:varchar(16);index;default:'pending'"`
 	Progress     string `json:"progress" gorm:"type:varchar(255);default:''"`

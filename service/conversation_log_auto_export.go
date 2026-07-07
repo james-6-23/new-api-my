@@ -40,13 +40,13 @@ func autoExportLoop() {
 			interval = 5 * time.Minute
 		}
 		if settings.AutoExportEnabled {
-			runAutoExportCheck(context.Background(), settings)
+			runAutoExportCheck(context.Background(), settings, false)
 		}
 		time.Sleep(interval)
 	}
 }
 
-func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.ConversationLogSetting) {
+func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.ConversationLogSetting, chunkContinuation bool) {
 	if !autoExportInFlight.TryLock() {
 		return
 	}
@@ -67,9 +67,12 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		common.SysError("auto export: pending backlog lookup failed: " + err.Error())
 		return
 	}
-	// Two triggers (OR):
+	// Three triggers (OR):
 	//   1. byte threshold  — enough has accumulated to be worth a batch (high traffic).
-	//   2. backlog-age fallback — the oldest pending record is older than
+	//   2. chunk continuation — the previous auto job stopped at its record cap
+	//      (truncated) with backlog remaining; drain the rest immediately instead
+	//      of waiting for the thresholds to re-fire.
+	//   3. backlog-age fallback — the oldest pending record is older than
 	//      AutoExportMaxBacklogAgeSeconds. Without this, a low-traffic window whose
 	//      backlog never reaches the byte threshold would leave valid records
 	//      un-exported, which in turn pins their partition past retention (the
@@ -78,6 +81,8 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 	reason := ""
 	if pendingBytes >= threshold {
 		reason = "byte_threshold"
+	} else if chunkContinuation && pendingBytes > 0 {
+		reason = "chunk_continuation"
 	} else if maxAge := settings.AutoExportMaxBacklogAgeSeconds; maxAge > 0 && oldestPendingAt > 0 {
 		if age := common.GetTimestamp() - oldestPendingAt; age >= maxAge {
 			reason = "backlog_age"
@@ -108,10 +113,14 @@ func runAutoExportCheck(ctx context.Context, settings conversation_log_setting.C
 		// Incremental: only export records not yet exported (exported_at = 0).
 		// Without this the job re-scans every valid record (including ones
 		// already exported) on every run, re-uploading the same data to S3.
-		Filter:             model.ConversationLogQuery{Exported: common.GetPointer(false)},
-		ShardTargetBytes:   shardMax,
-		ShardMaxBytes:      shardMax,
-		DeleteAfterExport:  settings.AutoExportDeleteAfter,
+		Filter:            model.ConversationLogQuery{Exported: common.GetPointer(false)},
+		ShardTargetBytes:  shardMax,
+		ShardMaxBytes:     shardMax,
+		DeleteAfterExport: settings.AutoExportDeleteAfter,
+		// Chunked export: cap each job at AutoExportChunkRecords so the per-job
+		// temp spool stays bounded; a truncated job chains the next chunk via
+		// NotifyAutoExportJobFinished until the backlog drains. 0 = no cap.
+		LimitRecords:       settings.AutoExportChunkRecords,
 		S3Upload:           settings.S3.Enabled,
 		LocalExportEnabled: common.GetPointer(autoExportLocalExportEnabled(settings)),
 		Trigger:            "auto",
@@ -136,4 +145,29 @@ func autoExportLocalExportEnabled(settings conversation_log_setting.Conversation
 		return false
 	}
 	return true
+}
+
+// NotifyAutoExportJobFinished is called by the export worker when an
+// auto-triggered job completes. When the job stopped at its record cap
+// (truncated) it immediately re-runs the backlog check so the next chunk starts
+// right away instead of idling until the next watcher tick. Master-node only,
+// mirroring the watcher itself.
+func NotifyAutoExportJobFinished(jobID string) {
+	if !common.IsMasterNode {
+		return
+	}
+	fresh, err := model.GetConversationExportJobByJobID(jobID)
+	if err != nil {
+		common.SysError("auto export: chunk chain lookup failed: " + err.Error())
+		return
+	}
+	if !fresh.Truncated {
+		return
+	}
+	settings := conversation_log_setting.GetSetting()
+	if !settings.AutoExportEnabled {
+		return
+	}
+	common.SysLog("auto export: job " + jobID + " hit its chunk record limit; starting next chunk")
+	go runAutoExportCheck(context.Background(), settings, true)
 }

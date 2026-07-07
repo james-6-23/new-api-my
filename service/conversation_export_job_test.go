@@ -955,6 +955,83 @@ func setConversationExportRecommendationDBFlags(sqlite, mysql, postgres bool) fu
 	}
 }
 
+// TestExportJobLimitRecordsChunksBacklog verifies chunked export: a job with
+// LimitRecords stops at the cap, completes truncated with only the capped
+// records marked exported, and a follow-up incremental job (Exported=false)
+// drains the remainder and finishes un-truncated — the chain terminates.
+func TestExportJobLimitRecordsChunksBacklog(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	now := int64(1710000000)
+
+	respReq := `{"model":"gpt-5","input":"hi"}`
+	respResp := `{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"total_tokens":3}}`
+	for i := 0; i < 6; i++ {
+		require.NoError(t, model.CreateConversationLog(&model.ConversationLog{
+			CreatedAt:        now + int64(i),
+			SessionId:        "sess_" + strconv.Itoa(i),
+			Provider:         "test",
+			RequestPath:      "/v1/responses",
+			RelayFormat:      "openai_responses",
+			RequestBody:      respReq,
+			ResponseBody:     respResp,
+			RequestTime:      now + int64(i),
+			ResponseTime:     now + int64(i) + 1,
+			ValidationStatus: ConversationValidationValid,
+		}))
+	}
+
+	runChunk := func(jobID string, limit int64) *model.ConversationExportJob {
+		t.Helper()
+		filter := model.ConversationLogQuery{Exported: common.GetPointer(false)}
+		filterJSON, err := common.Marshal(filter)
+		require.NoError(t, err)
+		outputDir := filepath.Join(t.TempDir(), jobID)
+		require.NoError(t, os.MkdirAll(outputDir, 0o755))
+		job := &model.ConversationExportJob{
+			CreatedAt:        now,
+			UpdatedAt:        now,
+			JobId:            jobID,
+			Mode:             conversation_log_setting.ExportModeAPIHijackJSONL,
+			FilterJSON:       string(filterJSON),
+			ShardTargetBytes: 1 << 30,
+			ShardMaxBytes:    1 << 30,
+			LimitRecords:     limit,
+			Status:           model.ConversationExportJobStatusRunning,
+			OutputDirectory:  outputDir,
+			Trigger:          "auto",
+			BatchId:          jobID,
+		}
+		require.NoError(t, model.CreateConversationExportJob(job))
+		require.NoError(t, executeExportJob(context.Background(), job))
+		fresh, err := model.GetConversationExportJobByJobID(jobID)
+		require.NoError(t, err)
+		return fresh
+	}
+
+	countExported := func() (exported, pending int64) {
+		t.Helper()
+		require.NoError(t, model.LOG_DB.Model(&model.ConversationLog{}).Where("exported_at > 0").Count(&exported).Error)
+		require.NoError(t, model.LOG_DB.Model(&model.ConversationLog{}).Where("exported_at = 0").Count(&pending).Error)
+		return exported, pending
+	}
+
+	// Chunk 1: cap 4 → truncated, 4 exported, 2 still pending.
+	first := runChunk("job-chunk-1", 4)
+	require.True(t, first.Truncated, "job hitting its record cap must be marked truncated")
+	require.EqualValues(t, 4, first.ExportedRecords)
+	exported, pending := countExported()
+	require.EqualValues(t, 4, exported)
+	require.EqualValues(t, 2, pending)
+
+	// Chunk 2: same cap, only 2 records remain → drains and ends un-truncated.
+	second := runChunk("job-chunk-2", 4)
+	require.False(t, second.Truncated, "job that drains the backlog must not be truncated")
+	require.EqualValues(t, 2, second.ExportedRecords)
+	exported, pending = countExported()
+	require.EqualValues(t, 6, exported)
+	require.EqualValues(t, 0, pending)
+}
+
 func setupConversationExportJobTestDB(t *testing.T) {
 	t.Helper()
 	previous := model.LOG_DB

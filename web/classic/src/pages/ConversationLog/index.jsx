@@ -104,6 +104,7 @@ const defaultSettings = {
   auto_export_check_interval_seconds: 300,
   auto_export_delete_after: true,
   auto_export_max_backlog_age_seconds: 1800,
+  auto_export_chunk_records: 10000,
   export_scan_batch_size: 5000,
   export_scan_batch_max_bytes: defaultExportScanBatchMaxBytes,
   export_mark_batch_size: 2000,
@@ -2607,6 +2608,25 @@ const ConversationLog = () => {
                             auto_export_max_backlog_age_seconds: Number(
                               value || 0,
                             ),
+                          })
+                        }
+                      />
+                    </Col>
+                    <Col xs={24} md={8}>
+                      <Form.InputNumber
+                        field='auto_export_chunk_records'
+                        label={t('单任务记录上限 (条)')}
+                        min={0}
+                        max={1000000}
+                        step={1000}
+                        suffix={t('条')}
+                        extraText={t(
+                          '每个自动导出任务最多处理的记录条数，达到后任务正常结束并立即接力下一个任务，直到积压清空。限制单任务临时磁盘占用，大积压不会撑爆磁盘。0 关闭分块（单任务导出全部积压），默认 10000',
+                        )}
+                        onChange={(value) =>
+                          setSettings({
+                            ...settings,
+                            auto_export_chunk_records: Number(value || 0),
                           })
                         }
                       />

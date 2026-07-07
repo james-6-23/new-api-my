@@ -399,6 +399,10 @@ type ExportJobCreateRequest struct {
 	DeleteAfterExport  bool                       `json:"delete_after_export"`
 	S3Upload           bool                       `json:"s3_upload"`
 	LocalExportEnabled *bool                      `json:"local_export_enabled,omitempty"`
+	// LimitRecords caps how many records this job exports (0 = unlimited).
+	// Hitting the cap ends the job normally with truncated=true; un-exported
+	// records stay pending for the next chunked job. api_hijack_jsonl mode only.
+	LimitRecords int64 `json:"limit_records,omitempty"`
 	// Trigger annotates how the job was started: "manual" (default) or "auto".
 	// Used for filename generation and audit/observability only.
 	Trigger string `json:"trigger,omitempty"`
@@ -411,6 +415,10 @@ type ExportJobCreateRequest struct {
 var (
 	exportJobMu          sync.Mutex
 	ErrJobAlreadyRunning = errors.New("another export job is already running")
+	// errExportScanLimitReached is the internal sentinel used to stop the export
+	// scan once the job's LimitRecords cap is hit. It never escapes to callers:
+	// the scan treats it as a clean early stop and the job completes truncated.
+	errExportScanLimitReached = errors.New("export scan record limit reached")
 )
 
 // CreateConversationExportJob persists a new job row and starts a goroutine
@@ -454,6 +462,10 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 	if !localExportEnabled && !req.S3Upload {
 		return nil, fmt.Errorf("local export is disabled; enable S3 upload or turn on local export")
 	}
+	limitRecords := req.LimitRecords
+	if limitRecords < 0 {
+		limitRecords = 0
+	}
 
 	filter, err := snapshotConversationExportQuery(ctx, req.Filter)
 	if err != nil {
@@ -485,6 +497,7 @@ func CreateConversationExportJob(ctx context.Context, userID int, req ExportJobC
 		DeleteAfterExport:   req.DeleteAfterExport,
 		S3Upload:            req.S3Upload,
 		LocalExportDisabled: !localExportEnabled,
+		LimitRecords:        limitRecords,
 		Status:              model.ConversationExportJobStatusPending,
 		BatchId:             jobID,
 		OutputDirectory:     outputDir,
@@ -573,6 +586,11 @@ func runConversationExportJob(jobID string) {
 		return
 	}
 	finishJob(jobID, model.ConversationExportJobStatusCompleted, "")
+	// Chunked auto-export: a truncated auto job chains the next chunk
+	// immediately so the backlog drains without waiting for the watcher tick.
+	if strings.TrimSpace(job.Trigger) == "auto" {
+		NotifyAutoExportJobFinished(jobID)
+	}
 }
 
 func finishJob(jobID, status, errMessage string) {
@@ -710,6 +728,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		shardTargetBytes: job.ShardTargetBytes,
 		shardMaxBytes:    job.ShardMaxBytes,
 		snapshotMaxID:    snapshotMaxID,
+		limitRecords:     job.LimitRecords,
 		s3Uploader:       s3Uploader,
 	}
 	defer func() {
@@ -868,6 +887,9 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	}
 
 	progress := fmt.Sprintf("done: %d shard(s), %d record(s)", len(state.shards), state.totalRecordCount)
+	if state.truncated {
+		progress += fmt.Sprintf(" (chunk limit %d reached, backlog remains)", job.LimitRecords)
+	}
 	if deletedInvalid > 0 {
 		progress += fmt.Sprintf(", %d invalid source record(s) deleted", deletedInvalid)
 	}
@@ -895,6 +917,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		"uncompressed_bytes":  state.totalUncompressed,
 		"compressed_bytes":    state.totalCompressed,
 		"shard_count":         len(state.shards),
+		"truncated":           state.truncated,
 		"quality_report_json": qualityReportJSON,
 		"progress":            progress,
 	})
@@ -922,6 +945,12 @@ type shardWriterState struct {
 	snapshotMaxID        int
 	scanPositionID       int
 	scannedSourceRecords int64
+	// limitRecords caps how many exportable records this job spools (0 = no
+	// cap); spooledExportableRecords tracks progress toward it and truncated
+	// records that the scan stopped early with backlog remaining.
+	limitRecords             int64
+	spooledExportableRecords int64
+	truncated                bool
 
 	// Current shard accumulator (streaming).
 	currentIndex       int
@@ -1936,6 +1965,14 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 		}
 		state.observeScannedBatch(logs)
 		for _, item := range logs {
+			// Chunked export: stop spooling once the job's record cap is hit.
+			// The remaining backlog keeps exported_at = 0, so the next chunked
+			// job picks it up. scanPositionID/scannedSourceRecords may slightly
+			// overshoot (they were advanced for the whole batch above) — both
+			// are progress hints only; exported marking uses the spooled ids.
+			if state.limitRecords > 0 && state.spooledExportableRecords >= state.limitRecords {
+				return errExportScanLimitReached
+			}
 			prepared := prepareConversationExportLog(item)
 			if !prepared.validation.Exportable {
 				continue
@@ -1963,10 +2000,15 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 			if err := spool.append(dataKind, line, item.Id, item.RequestTime, item.ResponseTime); err != nil {
 				return err
 			}
+			state.spooledExportableRecords++
 		}
 		state.maybePushProgress(false)
 		return nil
 	})
+	if errors.Is(err, errExportScanLimitReached) {
+		state.truncated = true
+		err = nil
+	}
 	if err != nil {
 		return err
 	}

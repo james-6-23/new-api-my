@@ -22,6 +22,12 @@ const (
 	defaultAutoExportShardMaxBytes  = int64(10) << 30
 	defaultAutoExportCheckInterval  = 300  // seconds (5 minutes)
 	defaultAutoExportMaxBacklogAge  = 1800 // seconds (30 minutes)
+	// Chunked auto-export: each job exports at most this many records, then the
+	// watcher immediately chains the next chunk until the backlog drains. Bounds
+	// the per-job .tmp spool (which holds an uncompressed copy of everything the
+	// job exports) so a large backlog can never exceed free disk in one job.
+	defaultAutoExportChunkRecords = int64(10000)
+	maxAutoExportChunkRecords     = int64(1000000)
 
 	// S3 rotation defaults. When rotation is enabled, export artifacts are
 	// uploaded flat (compressed shard files only, no per-job subdirectory and no manifest.json)
@@ -330,6 +336,14 @@ type ConversationLogSetting struct {
 	// Should be well below partition_retain_hours. 0 disables the fallback (byte
 	// threshold only). Default 1800s (30 min).
 	AutoExportMaxBacklogAgeSeconds int64 `json:"auto_export_max_backlog_age_seconds"`
+	// AutoExportChunkRecords caps how many records a single auto-export job
+	// processes. When the cap is hit the job finishes normally (truncated=true)
+	// and the watcher immediately starts the next chunk, repeating until the
+	// pending backlog is drained. This bounds peak temp-disk usage to roughly
+	// one chunk's uncompressed size instead of the whole backlog. 0 disables
+	// chunking (single job exports everything — legacy behaviour). Applies to
+	// api_hijack_jsonl mode.
+	AutoExportChunkRecords int64 `json:"auto_export_chunk_records"`
 }
 
 var conversationLogSetting = ConversationLogSetting{
@@ -381,6 +395,7 @@ var conversationLogSetting = ConversationLogSetting{
 	AutoExportCheckIntervalSeconds: defaultAutoExportCheckInterval,
 	AutoExportDeleteAfter:          true,
 	AutoExportMaxBacklogAgeSeconds: defaultAutoExportMaxBacklogAge,
+	AutoExportChunkRecords:         defaultAutoExportChunkRecords,
 	S3: S3Setting{
 		RotationMaxObjects:     defaultS3RotationMaxObjects,
 		UploadConcurrency:      defaultS3UploadConcurrency,
@@ -478,6 +493,11 @@ func GetSetting() ConversationLogSetting {
 	// "disable the backlog-age fallback" (byte threshold only).
 	if setting.AutoExportMaxBacklogAgeSeconds < 0 {
 		setting.AutoExportMaxBacklogAgeSeconds = defaultAutoExportMaxBacklogAge
+	}
+	// Negative → restore the default; 0 is a valid explicit "no chunking"
+	// (one job exports the entire backlog, legacy behaviour).
+	if setting.AutoExportChunkRecords < 0 || setting.AutoExportChunkRecords > maxAutoExportChunkRecords {
+		setting.AutoExportChunkRecords = defaultAutoExportChunkRecords
 	}
 
 	setting.S3.RotationMaxObjects = clampRotationMaxObjects(setting.S3.RotationMaxObjects)
