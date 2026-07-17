@@ -4188,6 +4188,7 @@
     "时间线": "Timeline",
     "当前筛选下无模型": "No models match this filter",
     "试试切换其他状态筛选，或清除筛选查看全部模型": "Try another status filter, or clear filters to see all models",
-    "查看全部模型": "View all models"
+    "查看全部模型": "View all models",
+    "全站今日汇总 · 自今日 00:00 起 · 无需登录": "Site-wide totals since 00:00 today · no login required"
   }
 }

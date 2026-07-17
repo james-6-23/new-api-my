@@ -136,3 +136,48 @@ func GetAllQuotaDates(startTime int64, endTime int64, username string) (quotaDat
 	err = DB.Table("quota_data").Select("model_name, sum(count) as count, sum(quota) as quota, sum(token_used) as token_used, created_at").Where("created_at >= ? and created_at <= ?", startTime, endTime).Group("model_name, created_at").Find(&quotaDatas).Error
 	return quotaDatas, err
 }
+
+// PublicTodayUsageSummary is a privacy-safe site-wide aggregate for the public
+// model-status page. It intentionally contains no user ids, usernames, or
+// per-model breakdown — only scalar totals for a single calendar day.
+type PublicTodayUsageSummary struct {
+	TotalTokens int64 `json:"total_tokens"`
+	TotalQuota  int64 `json:"total_quota"`
+	TotalCount  int64 `json:"total_count"`
+	StartTs     int64 `json:"start_ts"`
+	EndTs       int64 `json:"end_ts"`
+}
+
+// GetPublicTodayUsageSummary sums quota_data for [startTime, endTime].
+// Callers MUST keep the window short (e.g. one local day) — this function
+// does not authorize anything and returns only aggregates.
+func GetPublicTodayUsageSummary(startTime int64, endTime int64) (*PublicTodayUsageSummary, error) {
+	if endTime < startTime {
+		endTime = startTime
+	}
+	// Hard cap: refuse ranges longer than 48h to avoid bulk export abuse.
+	if endTime-startTime > 48*3600 {
+		endTime = startTime + 48*3600
+	}
+
+	type aggRow struct {
+		TotalTokens int64
+		TotalQuota  int64
+		TotalCount  int64
+	}
+	var row aggRow
+	err := DB.Table("quota_data").
+		Select("COALESCE(SUM(token_used), 0) as total_tokens, COALESCE(SUM(quota), 0) as total_quota, COALESCE(SUM(count), 0) as total_count").
+		Where("created_at >= ? AND created_at <= ?", startTime, endTime).
+		Scan(&row).Error
+	if err != nil {
+		return nil, err
+	}
+	return &PublicTodayUsageSummary{
+		TotalTokens: row.TotalTokens,
+		TotalQuota:  row.TotalQuota,
+		TotalCount:  row.TotalCount,
+		StartTs:     startTime,
+		EndTs:       endTime,
+	}, nil
+}

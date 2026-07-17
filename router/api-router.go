@@ -38,10 +38,13 @@ func SetApiRouter(router *gin.Engine) {
 			perfMetricsRoute.GET("", controller.GetPerfMetrics)
 		}
 		// Public model status board (classic 顶栏「模型状态」)
+		// Only HeaderNavModuleAuth — never AdminAuth. today-usage returns
+		// site-wide scalar aggregates only (no users/models/details).
 		modelStatusRoute := apiRouter.Group("/model-status")
 		modelStatusRoute.Use(middleware.HeaderNavModuleAuth("modelStatus"))
 		{
 			modelStatusRoute.GET("", controller.GetModelStatus)
+			modelStatusRoute.GET("/today-usage", controller.GetModelStatusTodayUsage)
 		}
 		apiRouter.GET("/rankings", middleware.HeaderNavModuleAuth("rankings"), controller.GetRankings)
 		apiRouter.GET("/verification", middleware.TurnstileCheck(), middleware.EmailVerificationRateLimit(), controller.SendRegistrationEmailVerification)

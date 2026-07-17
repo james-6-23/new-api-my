@@ -46,7 +46,6 @@ import {
   IconServer,
 } from '@douyinfe/semi-icons';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
 import {
   OpenAI,
   Claude,
@@ -64,38 +63,9 @@ import {
   Hunyuan,
   Spark,
 } from '@lobehub/icons';
-import {
-  API,
-  getDefaultTime,
-  isAdmin,
-  renderQuota,
-  showError,
-} from '../../helpers';
+import { API, renderQuota, showError } from '../../helpers';
 
 const { Text, Title } = Typography;
-
-/** Local day range: [00:00:00 today, now+1h] in unix seconds */
-function getTodayRangeUnix() {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const startTs = Math.floor(start.getTime() / 1000);
-  const endTs = Math.floor(Date.now() / 1000) + 3600;
-  return { startTs, endTs };
-}
-
-function aggregateTodayStats(rows) {
-  let totalTokens = 0;
-  let totalQuota = 0;
-  let totalTimes = 0;
-  const list = Array.isArray(rows) ? rows : [];
-  for (const item of list) {
-    if (!item || item.model_name === '无数据') continue;
-    totalTokens += Number(item.token_used) || 0;
-    totalQuota += Number(item.quota) || 0;
-    totalTimes += Number(item.count) || 0;
-  }
-  return { totalTokens, totalQuota, totalTimes };
-}
 
 const TIME_WINDOWS = [
   { value: 1, labelKey: '1小时' },
@@ -293,31 +263,7 @@ function MetricTile({ icon, label, value, loading, tone = 'default' }) {
   );
 }
 
-function TodayTokenStatsBar({ stats, loading, loggedIn, t, onLogin }) {
-  if (!loggedIn) {
-    return (
-      <section className='relative overflow-hidden rounded-2xl border border-dashed border-semi-color-border bg-semi-color-bg-1 px-5 py-5'>
-        <div className='absolute inset-0 bg-gradient-to-r from-semi-color-primary/5 via-transparent to-transparent' />
-        <div className='relative flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4'>
-          <div className='min-w-0'>
-            <div className='flex items-center gap-2 mb-1'>
-              <IconPulse className='text-semi-color-primary' />
-              <span className='text-sm font-semibold text-semi-color-text-0'>
-                {t('今日 Token 统计')}
-              </span>
-            </div>
-            <Text type='tertiary' size='small'>
-              {t('登录后可查看与控制台数据看板一致的今日用量')}
-            </Text>
-          </div>
-          <Button theme='solid' type='primary' onClick={onLogin}>
-            {t('登录')}
-          </Button>
-        </div>
-      </section>
-    );
-  }
-
+function TodayTokenStatsBar({ stats, loading, t }) {
   return (
     <section>
       <div className='mb-3 flex flex-wrap items-center justify-between gap-2'>
@@ -330,14 +276,12 @@ function TodayTokenStatsBar({ stats, loading, loggedIn, t, onLogin }) {
               <span className='text-sm font-semibold text-semi-color-text-0'>
                 {t('今日 Token 统计')}
               </span>
-              {stats.scopeLabel && (
-                <Tag size='small' color='blue' className='!rounded-full !px-2'>
-                  {stats.scopeLabel}
-                </Tag>
-              )}
+              <Tag size='small' color='blue' className='!rounded-full !px-2'>
+                {t('全站')}
+              </Tag>
             </div>
             <Text type='tertiary' size='small' className='!leading-snug'>
-              {t('数据来源与控制台「数据看板」相同 · 统计自今日 00:00 起')}
+              {t('全站今日汇总 · 自今日 00:00 起 · 无需登录')}
             </Text>
           </div>
         </div>
@@ -531,7 +475,6 @@ function ModelStatusCard({ model, t }) {
 
 const ModelStatusBoard = () => {
   const { t } = useTranslation();
-  const navigate = useNavigate();
   const [hours, setHours] = useState(24);
   const [refreshInterval, setRefreshInterval] = useState(60);
   const [statusFilter, setStatusFilter] = useState('all');
@@ -547,16 +490,8 @@ const ModelStatusBoard = () => {
     totalTimes: 0,
     avgRPM: '0',
     avgTPM: '0',
-    scopeLabel: '',
   });
   const [todayLoading, setTodayLoading] = useState(true);
-  const [loggedIn, setLoggedIn] = useState(() => {
-    try {
-      return !!localStorage.getItem('user');
-    } catch {
-      return false;
-    }
-  });
   const intervalRef = useRef(refreshInterval);
   const mountedRef = useRef(true);
 
@@ -565,74 +500,50 @@ const ModelStatusBoard = () => {
     setCountdown(refreshInterval > 0 ? refreshInterval : 0);
   }, [refreshInterval]);
 
+  // Public site-wide today usage — dedicated API, no admin session needed.
+  // Does NOT call /api/data/* (admin-only detailed series).
   const fetchTodayTokenStats = useCallback(async () => {
-    let user = null;
+    if (mountedRef.current) setTodayLoading(true);
     try {
-      const raw = localStorage.getItem('user');
-      user = raw ? JSON.parse(raw) : null;
-    } catch {
-      user = null;
-    }
-    if (!user) {
-      if (mountedRef.current) {
-        setLoggedIn(false);
-        setTodayLoading(false);
-      }
-      return;
-    }
-    if (mountedRef.current) {
-      setLoggedIn(true);
-      setTodayLoading(true);
-    }
-
-    try {
-      const { startTs, endTs } = getTodayRangeUnix();
-      const defaultTime = getDefaultTime() || 'hour';
-      const admin = isAdmin();
-      const url = admin
-        ? `/api/data/?username=&start_timestamp=${startTs}&end_timestamp=${endTs}&default_time=${defaultTime}`
-        : `/api/data/self/?start_timestamp=${startTs}&end_timestamp=${endTs}&default_time=${defaultTime}`;
-
-      const res = await API.get(url);
+      const res = await API.get('/api/model-status/today-usage');
       const { success, data } = res.data || {};
       if (!mountedRef.current) return;
-
-      if (!success) {
-        setTodayStats((prev) => ({
-          ...prev,
+      if (!success || !data) {
+        setTodayStats({
           totalTokens: 0,
           totalQuota: 0,
           totalTimes: 0,
           avgRPM: '0',
           avgTPM: '0',
-          scopeLabel: admin ? t('全站') : t('我的'),
-        }));
+        });
         return;
       }
-
-      const aggregated = aggregateTodayStats(data);
-      const minutesSinceStart = Math.max(
-        1,
-        (Date.now() / 1000 - getTodayRangeUnix().startTs) / 60,
-      );
-      const avgRPM = (aggregated.totalTimes / minutesSinceStart).toFixed(3);
-      const avgTPM = (aggregated.totalTokens / minutesSinceStart).toFixed(3);
-
       setTodayStats({
-        ...aggregated,
-        avgRPM: isNaN(Number(avgRPM)) ? '0' : avgRPM,
-        avgTPM: isNaN(Number(avgTPM)) ? '0' : avgTPM,
-        scopeLabel: admin ? t('全站') : t('我的'),
+        totalTokens: Number(data.total_tokens) || 0,
+        totalQuota: Number(data.total_quota) || 0,
+        totalTimes: Number(data.total_count) || 0,
+        avgRPM:
+          data.avg_rpm !== undefined && data.avg_rpm !== null
+            ? Number(data.avg_rpm).toFixed(3)
+            : '0',
+        avgTPM:
+          data.avg_tpm !== undefined && data.avg_tpm !== null
+            ? Number(data.avg_tpm).toFixed(3)
+            : '0',
       });
-    } catch (e) {
+    } catch {
       if (!mountedRef.current) return;
-      if (e?.response?.status === 401 || e?.response?.status === 403) {
-        setLoggedIn(false);
-      }
+      setTodayStats({
+        totalTokens: 0,
+        totalQuota: 0,
+        totalTimes: 0,
+        avgRPM: '0',
+        avgTPM: '0',
+      });
     } finally {
       if (mountedRef.current) setTodayLoading(false);
     }
-  }, [t]);
+  }, []);
 
   const fetchStatus = useCallback(
     async (isManual = false) => {
@@ -761,19 +672,20 @@ const ModelStatusBoard = () => {
   const overallMeta = STATUS_META[overallHealth];
 
   return (
-    <div className='relative min-h-[calc(100vh-8rem)]'>
+    // mt-[60px]: match classic theme pages; fixed header is out of document flow
+    <div className='relative w-full mt-[60px]'>
       {/* ambient background */}
-      <div className='pointer-events-none absolute inset-x-0 top-0 h-72 bg-gradient-to-b from-semi-color-primary/[0.06] via-semi-color-primary/[0.02] to-transparent' />
+      <div className='pointer-events-none absolute inset-x-0 top-0 h-64 bg-gradient-to-b from-semi-color-primary/[0.05] via-semi-color-primary/[0.015] to-transparent' />
 
-      <div className='relative w-full max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 py-5 sm:py-7 space-y-6 sm:space-y-8'>
+      <div className='relative w-full max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 pt-3 sm:pt-5 pb-6 sm:pb-8 space-y-6 sm:space-y-7'>
         {/* ── Hero ── */}
-        <header className='relative overflow-hidden rounded-3xl border border-semi-color-border/80 bg-semi-color-bg-1/90 backdrop-blur-sm shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]'>
+        <header className='relative overflow-hidden rounded-2xl sm:rounded-3xl border border-semi-color-border/80 bg-semi-color-bg-1 shadow-sm'>
           <div className='absolute inset-0 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-semi-color-primary/10 via-transparent to-transparent' />
-          <div className='absolute -right-16 -top-16 h-48 w-48 rounded-full bg-semi-color-primary/10 blur-3xl' />
+          <div className='absolute -right-16 -top-16 h-48 w-48 rounded-full bg-semi-color-primary/10 blur-3xl pointer-events-none' />
 
-          <div className='relative px-5 sm:px-7 py-5 sm:py-6'>
-            <div className='flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between'>
-              <div className='min-w-0 space-y-3'>
+          <div className='relative px-4 sm:px-6 lg:px-7 py-4 sm:py-5 lg:py-6'>
+            <div className='flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between'>
+              <div className='min-w-0 space-y-2.5 sm:space-y-3'>
                 <div className='flex flex-wrap items-center gap-2'>
                   <span
                     className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ring-1 ${overallMeta.soft}`}
@@ -799,20 +711,20 @@ const ModelStatusBoard = () => {
                 </div>
 
                 <div className='flex items-start gap-3'>
-                  <div className='mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-semi-color-primary to-semi-color-primary/70 text-white shadow-lg shadow-semi-color-primary/25'>
+                  <div className='mt-0.5 flex h-10 w-10 sm:h-11 sm:w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-semi-color-primary to-semi-color-primary/70 text-white shadow-lg shadow-semi-color-primary/25'>
                     <IconServer size='large' />
                   </div>
                   <div className='min-w-0'>
                     <Title
                       heading={2}
                       style={{ margin: 0 }}
-                      className='!text-xl sm:!text-2xl !font-bold !tracking-tight'
+                      className='!text-lg sm:!text-xl lg:!text-2xl !font-bold !tracking-tight !leading-tight'
                     >
                       {t('模型状态')}
                     </Title>
                     <Text
                       type='tertiary'
-                      className='!mt-1 !block !text-sm !leading-relaxed max-w-xl'
+                      className='!mt-1 !block !text-xs sm:!text-sm !leading-relaxed max-w-xl'
                     >
                       {t(
                         '实时监控模型可用性与成功率，结合今日用量洞察服务健康度',
@@ -923,14 +835,8 @@ const ModelStatusBoard = () => {
           </div>
         </header>
 
-        {/* ── Today tokens ── */}
-        <TodayTokenStatsBar
-          stats={todayStats}
-          loading={todayLoading}
-          loggedIn={loggedIn}
-          t={t}
-          onLogin={() => navigate('/login')}
-        />
+        {/* ── Today tokens (public site-wide summary) ── */}
+        <TodayTokenStatsBar stats={todayStats} loading={todayLoading} t={t} />
 
         {error && (
           <Banner type='warning' description={error} closeIcon={null} />
