@@ -4177,6 +4177,17 @@
     "我的": "Mine",
     "统计 Tokens": "Tokens",
     "平均 RPM": "Average RPM",
-    "平均 TPM": "Average TPM"
+    "平均 TPM": "Average TPM",
+    "基于近期流量的模型可用性": "Model availability from recent traffic",
+    "模型可用性": "Model availability",
+    "绿 ≥95% · 黄 80–95% · 红 <80%": "Green ≥95% · Yellow 80–95% · Red <80%",
+    "等待数据": "Awaiting data",
+    "实时监控模型可用性与成功率，结合今日用量洞察服务健康度": "Live model availability and success rates, with today’s usage insights",
+    "清除筛选": "Clear filter",
+    "监控模型": "Monitored models",
+    "时间线": "Timeline",
+    "当前筛选下无模型": "No models match this filter",
+    "试试切换其他状态筛选，或清除筛选查看全部模型": "Try another status filter, or clear filters to see all models",
+    "查看全部模型": "View all models"
   }
 }
