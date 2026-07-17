@@ -56,9 +56,11 @@ func TestGetSettingDefaultsExportCompressionAndAsyncWrite(t *testing.T) {
 	require.Equal(t, defaultCompressionWorkers(), setting.ExportCompressionWorkers)
 	require.Equal(t, defaultCompressionQueueSize(), setting.ExportCompressionQueueSize)
 	require.GreaterOrEqual(t, setting.ExportCompressionWorkers, 1)
-	require.LessOrEqual(t, setting.ExportCompressionWorkers, 32)
+	require.LessOrEqual(t, setting.ExportCompressionWorkers, 128)
 	require.Equal(t, 1, setting.ExportCompressionLevel)
-	require.EqualValues(t, 64<<20, setting.ExportScanBatchMaxBytes)
+	require.EqualValues(t, defaultScanBatchMaxBytes(), setting.ExportScanBatchMaxBytes)
+	require.GreaterOrEqual(t, setting.ExportScanBatchMaxBytes, int64(64)<<20)
+	require.LessOrEqual(t, setting.ExportScanBatchMaxBytes, int64(1)<<30)
 	require.True(t, setting.AsyncWriteEnabled)
 	require.Equal(t, 4096, setting.WriteQueueSize)
 	require.EqualValues(t, 128<<20, setting.WriteQueueMaxBytes)
@@ -109,8 +111,8 @@ func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 		conversationLogSetting = previous
 	})
 
-	conversationLogSetting.ExportCompressionWorkers = 33
-	conversationLogSetting.ExportCompressionQueueSize = 65
+	conversationLogSetting.ExportCompressionWorkers = 200
+	conversationLogSetting.ExportCompressionQueueSize = 300
 	conversationLogSetting.ExportCompressionLevel = 10
 	conversationLogSetting.ExportScanBatchMaxBytes = 0
 	conversationLogSetting.WriteQueueSize = 0
@@ -126,7 +128,7 @@ func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 	require.Equal(t, defaultCompressionWorkers(), setting.ExportCompressionWorkers)
 	require.Equal(t, defaultCompressionQueueSize(), setting.ExportCompressionQueueSize)
 	require.Equal(t, 1, setting.ExportCompressionLevel)
-	require.EqualValues(t, 64<<20, setting.ExportScanBatchMaxBytes)
+	require.EqualValues(t, defaultScanBatchMaxBytes(), setting.ExportScanBatchMaxBytes)
 	require.Equal(t, 4096, setting.WriteQueueSize)
 	require.EqualValues(t, 128<<20, setting.WriteQueueMaxBytes)
 	require.Equal(t, 100, setting.WriteBatchSize)
@@ -137,7 +139,7 @@ func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 
 	minWorkers, maxWorkers := ExportCompressionWorkersBounds()
 	require.Equal(t, 1, minWorkers)
-	require.Equal(t, 32, maxWorkers)
+	require.Equal(t, 128, maxWorkers)
 	minLevel, maxLevel := ExportCompressionLevelBounds()
 	require.Equal(t, -2, minLevel)
 	require.Equal(t, 9, maxLevel)

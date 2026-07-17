@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/shirou/gopsutil/mem"
 )
 
 const (
@@ -48,17 +49,19 @@ const (
 	defaultExportScanBatchSize   = 5000
 	defaultExportMarkBatchSize   = 2000
 	defaultExportDeleteBatchSize = 2000
-	defaultExportScanBatchBytes  = int64(64) << 20 // 64 MiB
-	minExportBatchSize           = 100
-	maxExportBatchSize           = 10000
-	minExportScanBatchBytes      = int64(1) << 20 // 1 MiB
-	maxExportScanBatchBytes      = int64(2) << 30 // 2 GiB
+	// Fallback when host RAM cannot be sampled; large boxes use defaultScanBatchMaxBytes().
+	defaultExportScanBatchBytes = int64(64) << 20 // 64 MiB
+	minExportBatchSize          = 100
+	maxExportBatchSize          = 10000
+	minExportScanBatchBytes     = int64(1) << 20 // 1 MiB
+	maxExportScanBatchBytes     = int64(2) << 30 // 2 GiB
 
 	defaultExportCompressionLevel = 1 // gzip.BestSpeed
 	minExportCompressionWorkers   = 1
-	maxExportCompressionWorkers   = 32
+	// Large export hosts (32–128 cores) need headroom well above the old 32 cap.
+	maxExportCompressionWorkers   = 128
 	minExportCompressionQueueSize = 0
-	maxExportCompressionQueueSize = 64
+	maxExportCompressionQueueSize = 256
 	minExportCompressionLevel     = -2 // gzip.HuffmanOnly
 	maxExportCompressionLevel     = 9  // gzip.BestCompression
 
@@ -361,7 +364,7 @@ var conversationLogSetting = ConversationLogSetting{
 	ExportJobConcurrency:         1,
 	ExportJobRetentionDays:       14,
 	ExportScanBatchSize:          defaultExportScanBatchSize,
-	ExportScanBatchMaxBytes:      defaultExportScanBatchBytes,
+	ExportScanBatchMaxBytes:      defaultScanBatchMaxBytes(),
 	ExportMarkBatchSize:          defaultExportMarkBatchSize,
 	ExportDeleteBatchSize:        defaultExportDeleteBatchSize,
 	ExportCompressionWorkers:     defaultCompressionWorkers(),
@@ -544,7 +547,7 @@ func ExportBatchSizeBounds() (min, max int) {
 
 func clampExportScanBatchBytes(value int64) int64 {
 	if value < minExportScanBatchBytes || value > maxExportScanBatchBytes {
-		return defaultExportScanBatchBytes
+		return defaultScanBatchMaxBytes()
 	}
 	return value
 }
@@ -553,12 +556,38 @@ func ExportScanBatchBytesBounds() (min, max int64) {
 	return minExportScanBatchBytes, maxExportScanBatchBytes
 }
 
+// defaultScanBatchMaxBytes scales the per-scan memory budget to host RAM so a
+// 128 GiB box is not stuck on the old 64 MiB default. Uses ~0.4% of total RAM,
+// clamped to [64 MiB, 1 GiB]. Fresh installs / out-of-range config only.
+func defaultScanBatchMaxBytes() int64 {
+	const (
+		floorBytes = int64(64) << 20  // 64 MiB
+		ceilBytes  = int64(1) << 30   // 1 GiB
+	)
+	memInfo, err := mem.VirtualMemory()
+	if err != nil || memInfo == nil || memInfo.Total == 0 {
+		return defaultExportScanBatchBytes
+	}
+	// 0.4% of RAM: 128 GiB → ~524 MiB; 32 GiB → ~131 MiB; 16 GiB → ~67 MiB.
+	n := int64(memInfo.Total / 250)
+	if n < floorBytes {
+		return floorBytes
+	}
+	if n > ceilBytes {
+		return ceilBytes
+	}
+	return n
+}
+
 // defaultCompressionWorkers scales shard gzip compression to the host's cores,
 // clamped to the compression-worker bounds. Shard compression is CPU-bound and
 // runs in a bounded pool, so more cores compress more shards concurrently. Only
 // fresh/unconfigured installs pick this up; an explicit stored value is honored.
 func defaultCompressionWorkers() int {
-	n := runtime.NumCPU()
+	n := runtime.GOMAXPROCS(0)
+	if cpus := runtime.NumCPU(); cpus > 0 && (n <= 0 || cpus < n) {
+		n = cpus
+	}
 	if n < minExportCompressionWorkers {
 		return minExportCompressionWorkers
 	}
@@ -570,8 +599,13 @@ func defaultCompressionWorkers() int {
 
 // defaultCompressionQueueSize keeps the pending-shard queue at least as deep as
 // the worker count so the shard writer never stalls waiting for a free slot.
+// On large hosts, queue a bit deeper than workers so seal-rate bursts don't
+// block the scan thread.
 func defaultCompressionQueueSize() int {
-	q := defaultCompressionWorkers()
+	q := defaultCompressionWorkers() * 2
+	if q < defaultCompressionWorkers() {
+		q = defaultCompressionWorkers()
+	}
 	if q > maxExportCompressionQueueSize {
 		return maxExportCompressionQueueSize
 	}

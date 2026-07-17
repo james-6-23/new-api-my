@@ -169,3 +169,9 @@ func ExportJobShardBounds(c *gin.Context) {
 		"max_shard_bytes": max,
 	})
 }
+
+// GetExportJobRuntime returns host/process CPU/memory and live export pool
+// activity for the sharded-export dashboard.
+func GetExportJobRuntime(c *gin.Context) {
+	common.ApiSuccess(c, service.BuildConversationExportRuntimeStats())
+}

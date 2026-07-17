@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -669,6 +670,17 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 	if job.LocalExportDisabled && !job.S3Upload {
 		return fmt.Errorf("local export disabled requires S3 upload")
 	}
+	live := registerExportLiveJob(job.JobId)
+	defer unregisterExportLiveJob(job.JobId)
+	if live != nil {
+		live.setPhase("starting")
+	}
+	// Seed adaptive plan from current host load before the first batch.
+	plan := globalExportGovernor.refresh(true)
+	if live != nil {
+		live.setCompressionWorkers(plan.CompressionWorkers)
+	}
+
 	var query model.ConversationLogQuery
 	if strings.TrimSpace(job.FilterJSON) != "" {
 		if err := common.Unmarshal([]byte(job.FilterJSON), &query); err != nil {
@@ -730,6 +742,7 @@ func executeExportJob(ctx context.Context, job *model.ConversationExportJob) err
 		snapshotMaxID:    snapshotMaxID,
 		limitRecords:     job.LimitRecords,
 		s3Uploader:       s3Uploader,
+		live:             live,
 	}
 	defer func() {
 		state.abortShardCompression()
@@ -990,6 +1003,9 @@ type shardWriterState struct {
 
 	// Progress throttling
 	lastProgressAt time.Time
+
+	// live feeds the export-jobs runtime dashboard (CPU/pool activity).
+	live *exportLiveJob
 }
 
 type shardDataWriter struct {
@@ -1033,6 +1049,8 @@ type shardCompressorPool struct {
 	jobs     chan shardCompressionJob
 	jobWG    sync.WaitGroup
 	workerWG sync.WaitGroup
+	workers  int
+	live     *exportLiveJob
 
 	submitMu sync.Mutex
 	mu       sync.Mutex
@@ -1040,9 +1058,11 @@ type shardCompressorPool struct {
 	results  []shardCompressionResult
 	closed   bool
 	onResult func(shardCompressionResult) error
+	queued   int32
+	active   int64
 }
 
-func newShardCompressorPool(ctx context.Context, workers, queueSize int) *shardCompressorPool {
+func newShardCompressorPool(ctx context.Context, workers, queueSize int, live *exportLiveJob) *shardCompressorPool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1054,9 +1074,15 @@ func newShardCompressorPool(ctx context.Context, workers, queueSize int) *shardC
 	}
 	poolCtx, cancel := context.WithCancel(ctx)
 	pool := &shardCompressorPool{
-		ctx:    poolCtx,
-		cancel: cancel,
-		jobs:   make(chan shardCompressionJob, queueSize),
+		ctx:     poolCtx,
+		cancel:  cancel,
+		jobs:    make(chan shardCompressionJob, queueSize),
+		workers: workers,
+		live:    live,
+	}
+	if live != nil {
+		// Report adaptive effective concurrency (not the warm pool size).
+		live.setCompressionWorkers(globalExportGovernor.compressionWorkersNow())
 	}
 	for i := 0; i < workers; i++ {
 		pool.workerWG.Add(1)
@@ -1068,7 +1094,26 @@ func newShardCompressorPool(ctx context.Context, workers, queueSize int) *shardC
 func (p *shardCompressorPool) worker() {
 	defer p.workerWG.Done()
 	for job := range p.jobs {
+		atomic.AddInt32(&p.queued, -1)
+		if p.live != nil {
+			p.live.setCompressionQueued(int(atomic.LoadInt32(&p.queued)))
+		}
+		// Adaptive slot: pool has hardMax warm workers, but only
+		// compressionWorkersNow() may run at once under load.
+		if err := globalExportGovernor.acquireCompressionSlot(p.ctx.Done(), &p.active); err != nil {
+			p.setErr(fmt.Errorf("compress shard %d: %w", job.Index, p.ctx.Err()))
+			p.jobWG.Done()
+			continue
+		}
+		if p.live != nil {
+			p.live.setCompressionWorkers(globalExportGovernor.compressionWorkersNow())
+			p.live.addCompressionActive(1)
+		}
 		result, err := compressShardJob(p.ctx, job)
+		atomic.AddInt64(&p.active, -1)
+		if p.live != nil {
+			p.live.addCompressionActive(-1)
+		}
 		if err != nil {
 			p.setErr(fmt.Errorf("compress shard %d: %w", job.Index, err))
 		} else {
@@ -1101,6 +1146,10 @@ func (p *shardCompressorPool) Submit(job shardCompressionJob) error {
 	p.mu.Unlock()
 	select {
 	case p.jobs <- job:
+		atomic.AddInt32(&p.queued, 1)
+		if p.live != nil {
+			p.live.setCompressionQueued(int(atomic.LoadInt32(&p.queued)))
+		}
 		return nil
 	case <-p.ctx.Done():
 		p.jobWG.Done()
@@ -1388,6 +1437,12 @@ func (s *shardWriterState) maybePushProgress(force bool) {
 			float64(uncompressed)/(1<<30),
 		)
 	}
+	if s.live != nil {
+		s.live.observeProgress(s.scannedSourceRecords, records, uncompressed)
+		// Keep dashboard adaptive fields fresh while scanning/writing.
+		plan := globalExportGovernor.refresh(false)
+		s.live.setCompressionWorkers(plan.CompressionWorkers)
+	}
 	updateJobProgress(s.jobID, map[string]interface{}{
 		"shard_count":        s.currentIndex,
 		"exported_records":   records,
@@ -1550,7 +1605,11 @@ func (s *shardWriterState) closeCurrentShard(ctx context.Context) error {
 
 func (s *shardWriterState) ensureCompressor(ctx context.Context) *shardCompressorPool {
 	if s.compressor == nil {
-		s.compressor = newShardCompressorPool(ctx, exportCompressionWorkers(), exportCompressionQueueSize())
+		// Warm pool at host hard-cap; adaptive governor limits how many run.
+		s.compressor = newShardCompressorPool(ctx, exportCompressionWorkersPoolSize(), exportCompressionQueueSize(), s.live)
+		if s.live != nil {
+			s.live.setPhase("compressing")
+		}
 		if s.s3Uploader != nil {
 			s.compressor.onResult = func(result shardCompressionResult) error {
 				return s.handleShardCompressionResult(ctx, result, true)
@@ -1972,6 +2031,9 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 	// sessions in this batch. nil when CrossSessionToolFill is disabled.
 	pool := newEmptyBatchSessionToolPool()
 
+	if state.live != nil {
+		state.live.setPhase("scanning")
+	}
 	err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1980,16 +2042,16 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 			return err
 		}
 		state.observeScannedBatch(logs)
-		prepared := prepareConversationExportLogsParallel(logs)
-		// Marshal each record's StrictAPIRecord line and harvest its declared tools
-		// in parallel — both are per-record JSON work. Exports are restricted to the
-		// responses/messages entrypoints, so completions/unclassifiable records are
-		// dropped here. The tool merge into the shared pool and the spool append stay
-		// sequential below, so id-order — and thus the pool's tie-break winner and
-		// the spool layout — is byte-for-byte identical to the serial path.
+		// Single parallel pass: prepare + marshal + tool harvest. Merging the
+		// previous two barriers removes an extra fork/join and intermediate slice
+		// while keeping the sequential merge/append path (and thus id-order)
+		// byte-identical to the serial baseline.
 		harvestTools := pool != nil
-		payloads := parallelMap(prepared, func(_ int, p conversationExportPreparedLog) apiHijackScanPayload {
-			item := p.log
+		payloads := parallelMapTracked(logs, func(_ int, item *model.ConversationLog) apiHijackScanPayload {
+			if item == nil {
+				return apiHijackScanPayload{}
+			}
+			p := prepareConversationExportLog(item)
 			if !p.validation.Exportable {
 				return apiHijackScanPayload{}
 			}
@@ -2019,7 +2081,7 @@ func exportAPIHijackSharded(ctx context.Context, query model.ConversationLogQuer
 				payload.tools = extractSessionToolsFromRequestBody(item.Provider, requestBody)
 			}
 			return payload
-		})
+		}, state.live)
 		for i := range payloads {
 			pl := &payloads[i]
 			// Chunked export: stop spooling once the job's record cap is hit.
@@ -2200,12 +2262,17 @@ func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWri
 	// buffered into a bounded batch and filled across a worker pool. The pool is
 	// read-only during replay, so concurrent lookups are safe. Shard append stays
 	// sequential (in id order) so shard boundaries stay byte-for-byte identical to
-	// the serial path. With fill inactive the map is a no-op cheap streaming copy.
-	const (
-		replayBatchRecords = 1024
-		replayBatchBytes   = int64(32) << 20
-	)
+	// the serial path. With fill inactive, stream appends one-by-one (no batch
+	// buffering) to keep peak memory low.
 	fillActive := !pool.empty()
+	if state != nil && state.live != nil {
+		if fillActive {
+			state.live.setPhase("tool_fill")
+		} else {
+			state.live.setPhase("replay")
+		}
+	}
+	replayBatchRecords, replayBatchBytes := exportReplayBatchLimits()
 
 	type replayRecord struct {
 		meta apiHijackSpoolMeta
@@ -2213,6 +2280,32 @@ func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWri
 	}
 	batch := make([]replayRecord, 0, 256)
 	batchBytes := int64(0)
+
+	appendOne := func(rec *replayRecord) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := state.compressionErr(); err != nil {
+			return err
+		}
+		lineLen := int64(len(rec.data) + 1)
+		if state.wouldOverflowMax(lineLen) {
+			if err := state.closeCurrentShard(ctx); err != nil {
+				return err
+			}
+		}
+		if err := state.appendLine(ctx, rec.data, []int{rec.meta.ID}, 0, rec.meta.RequestTimeMin, rec.meta.ResponseTimeMax, kind); err != nil {
+			return err
+		}
+		wrote = true
+		if state.shouldRotateAfter() {
+			if err := state.closeCurrentShard(ctx); err != nil {
+				return err
+			}
+		}
+		state.maybePushProgress(false)
+		return nil
+	}
 
 	flush := func() error {
 		if len(batch) == 0 {
@@ -2223,37 +2316,21 @@ func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWri
 			for i := range batch {
 				lines[i] = batch[i].data
 			}
-			filled := parallelMap(lines, func(_ int, line []byte) []byte {
+			var live *exportLiveJob
+			if state != nil {
+				live = state.live
+			}
+			filled := parallelMapTracked(lines, func(_ int, line []byte) []byte {
 				return applyCrossSessionToolFillToStrictRecordLine(line, pool)
-			})
+			}, live)
 			for i := range batch {
 				batch[i].data = filled[i]
 			}
 		}
 		for i := range batch {
-			if err := ctx.Err(); err != nil {
+			if err := appendOne(&batch[i]); err != nil {
 				return err
 			}
-			if err := state.compressionErr(); err != nil {
-				return err
-			}
-			rec := &batch[i]
-			lineLen := int64(len(rec.data) + 1)
-			if state.wouldOverflowMax(lineLen) {
-				if err := state.closeCurrentShard(ctx); err != nil {
-					return err
-				}
-			}
-			if err := state.appendLine(ctx, rec.data, []int{rec.meta.ID}, 0, rec.meta.RequestTimeMin, rec.meta.ResponseTimeMax, kind); err != nil {
-				return err
-			}
-			wrote = true
-			if state.shouldRotateAfter() {
-				if err := state.closeCurrentShard(ctx); err != nil {
-					return err
-				}
-			}
-			state.maybePushProgress(false)
 		}
 		batch = batch[:0]
 		batchBytes = 0
@@ -2279,6 +2356,13 @@ func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWri
 		if err := common.Unmarshal(metaLine, &meta); err != nil {
 			return wrote, err
 		}
+		if !fillActive {
+			// Stream when fill is off — no need to hold a 32–128 MiB batch.
+			if err := appendOne(&replayRecord{meta: meta, data: dataLine}); err != nil {
+				return wrote, err
+			}
+			continue
+		}
 		batch = append(batch, replayRecord{meta: meta, data: dataLine})
 		batchBytes += int64(len(dataLine))
 		if len(batch) >= replayBatchRecords || batchBytes >= replayBatchBytes {
@@ -2291,6 +2375,12 @@ func replayAPIHijackKind(ctx context.Context, path, kind string, state *shardWri
 		return wrote, err
 	}
 	return wrote, nil
+}
+
+// exportReplayBatchLimits follows the adaptive governor (memory pressure can
+// shrink the fill batch mid-job).
+func exportReplayBatchLimits() (records int, maxBytes int64) {
+	return globalExportGovernor.replayBudgetNow()
 }
 
 // applyCrossSessionToolFillToStrictRecordLine parses a spooled StrictAPIRecord
@@ -2941,24 +3031,54 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 	if !ok {
 		return nil, 0, pool, nil
 	}
+	if state != nil && state.live != nil {
+		state.live.setPhase("scanning")
+	}
+	type sessionScanPayload struct {
+		exportable  bool
+		item        *model.ConversationLog
+		requestBody string
+		tools       []SessionTool
+	}
 	var eligible int64
 	err = forEachConversationExportLog(ctx, validQuery, func(logs []*model.ConversationLog) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		state.observeScannedBatch(logs)
-		prepared := prepareConversationExportLogsParallel(logs)
-		for i := range prepared {
-			p := &prepared[i]
-			if !p.validation.Exportable {
-				continue
+		harvestTools := pool != nil
+		var live *exportLiveJob
+		if state != nil {
+			live = state.live
+		}
+		// Parallel prepare + tool harvest; sequential pool merge + bucket write
+		// keep id order and tool-pool tie-break deterministic.
+		payloads := parallelMapTracked(logs, func(_ int, item *model.ConversationLog) sessionScanPayload {
+			if item == nil {
+				return sessionScanPayload{}
 			}
-			item := p.log
-			if item.SessionId == "" {
-				continue
+			p := prepareConversationExportLog(item)
+			if !p.validation.Exportable || item.SessionId == "" {
+				return sessionScanPayload{}
 			}
 			requestBody := p.EffectiveRequestBody()
-			pool.addRequestBody(item.Provider, requestBody)
+			out := sessionScanPayload{
+				exportable:  true,
+				item:        item,
+				requestBody: requestBody,
+			}
+			if harvestTools {
+				out.tools = extractSessionToolsFromRequestBody(item.Provider, requestBody)
+			}
+			return out
+		}, live)
+		for i := range payloads {
+			pl := &payloads[i]
+			if !pl.exportable {
+				continue
+			}
+			item := pl.item
+			pool.addTools(pl.tools)
 			record := sessionBucketRecord{
 				ID:           item.Id,
 				SessionID:    item.SessionId,
@@ -2966,7 +3086,7 @@ func writeSessionBuckets(ctx context.Context, query model.ConversationLogQuery, 
 				RelayFormat:  item.RelayFormat,
 				FinalFormat:  item.FinalRequestFormat,
 				RequestPath:  item.RequestPath,
-				RequestBody:  requestBody,
+				RequestBody:  pl.requestBody,
 				ResponseBody: item.ResponseBody,
 				RequestTime:  item.RequestTime,
 				ResponseTime: item.ResponseTime,

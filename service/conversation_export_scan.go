@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,15 +32,21 @@ var conversationExportLogSelectColumns = []string{
 }
 
 func forEachConversationExportLog(ctx context.Context, query model.ConversationLogQuery, fn func([]*model.ConversationLog) error) error {
-	return model.ForEachConversationLogSelectedByStorageBudget(ctx, query, conversationExportLogSelectColumns, exportScanBatchSize(), exportScanBatchMaxBytes(), fn)
+	// Adaptive budgets: re-sample CPU/RAM headroom on every outer fetch so a
+	// long export can grow on a quiet 128 GiB box and shrink under pressure.
+	return model.ForEachConversationLogSelectedByStorageBudgetFn(ctx, query, conversationExportLogSelectColumns, func() (int, int64) {
+		return globalExportGovernor.scanBudgetNow()
+	}, fn)
 }
 
 func exportScanBatchSize() int {
-	return conversation_log_setting.GetSetting().ExportScanBatchSize
+	size, _ := globalExportGovernor.scanBudgetNow()
+	return size
 }
 
 func exportScanBatchMaxBytes() int64 {
-	return conversation_log_setting.GetSetting().ExportScanBatchMaxBytes
+	_, bytes := globalExportGovernor.scanBudgetNow()
+	return bytes
 }
 
 func exportMarkBatchSize() int {
@@ -53,11 +58,36 @@ func exportDeleteBatchSize() int {
 }
 
 func exportCompressionWorkers() int {
-	return conversation_log_setting.GetSetting().ExportCompressionWorkers
+	// Adaptive effective concurrency (may be below the pool size / config).
+	return globalExportGovernor.compressionWorkersNow()
+}
+
+// exportCompressionWorkersPoolSize is the goroutine count for the compressor
+// pool: host hard cap so scale-up never needs to spawn mid-job.
+func exportCompressionWorkersPoolSize() int {
+	_, hardComp, _ := exportHostHardCaps()
+	if hardComp < 1 {
+		return 1
+	}
+	return hardComp
 }
 
 func exportCompressionQueueSize() int {
-	return conversation_log_setting.GetSetting().ExportCompressionQueueSize
+	// Queue at least 2× hard cap so seal bursts do not block the scan thread
+	// while adaptive concurrency is temporarily low.
+	q := exportCompressionWorkersPoolSize() * 2
+	cfg := conversation_log_setting.GetSetting().ExportCompressionQueueSize
+	if cfg > q {
+		q = cfg
+	}
+	_, maxQ := conversation_log_setting.ExportCompressionQueueSizeBounds()
+	if q > maxQ {
+		q = maxQ
+	}
+	if q < 1 {
+		q = 1
+	}
+	return q
 }
 
 func exportCompressionLevel() int {
@@ -240,19 +270,15 @@ func prepareConversationExportLog(log *model.ConversationLog) conversationExport
 	}
 }
 
-// exportPrepareWorkers sizes the record-preparation pool to the host's cores.
-// Record preparation (JSON parse of request+response, validation, effective
-// request-body rebuild) is CPU-bound, so it scales with cores; capped so a
-// single export job never monopolizes a large box.
+// maxExportPrepareWorkers caps the per-job CPU pool so one export never takes
+// every core on a 64+/128-core host (leaves headroom for API traffic + gzip).
+const maxExportPrepareWorkers = 64
+
+// exportPrepareWorkers returns the adaptive prepare-pool size for the next
+// parallelMap. The governor samples host CPU/RAM and leaves a core reserve for
+// the API process.
 func exportPrepareWorkers() int {
-	n := runtime.NumCPU() - 1
-	if n < 1 {
-		return 1
-	}
-	if n > 16 {
-		return 16
-	}
-	return n
+	return globalExportGovernor.prepareWorkersNow()
 }
 
 // parallelMap applies fn to every item across a bounded worker pool sized to the
@@ -261,14 +287,33 @@ func exportPrepareWorkers() int {
 // state (e.g. merge into a tool pool) do so sequentially over the returned slice
 // so order-sensitive merges stay deterministic. Falls back to a serial loop for
 // tiny inputs or single-core hosts.
+//
+// live, when non-nil, receives +1/-1 around the whole map so the runtime
+// dashboard can show prepare-pool activity.
 func parallelMap[T, R any](items []T, fn func(int, T) R) []R {
+	return parallelMapTracked(items, fn, nil)
+}
+
+func parallelMapTracked[T, R any](items []T, fn func(int, T) R, live *exportLiveJob) []R {
 	out := make([]R, len(items))
+	// Refresh adaptive plan before each batch so long scans track load.
 	workers := exportPrepareWorkers()
+	if workers > len(items) {
+		workers = len(items)
+	}
 	if workers <= 1 || len(items) <= 1 {
+		if live != nil && len(items) > 0 {
+			live.addPrepareActive(1)
+			defer live.addPrepareActive(-1)
+		}
 		for i, it := range items {
 			out[i] = fn(i, it)
 		}
 		return out
+	}
+	if live != nil {
+		live.addPrepareActive(int64(workers))
+		defer live.addPrepareActive(-int64(workers))
 	}
 	var wg sync.WaitGroup
 	next := int64(-1)
@@ -299,7 +344,11 @@ func parallelMap[T, R any](items []T, fn func(int, T) R) []R {
 // per record and every downstream helper mutates only that record's own maps, so
 // goroutines share no mutable state.
 func prepareConversationExportLogsParallel(logs []*model.ConversationLog) []conversationExportPreparedLog {
-	return parallelMap(logs, func(_ int, item *model.ConversationLog) conversationExportPreparedLog {
+	return prepareConversationExportLogsParallelTracked(logs, nil)
+}
+
+func prepareConversationExportLogsParallelTracked(logs []*model.ConversationLog, live *exportLiveJob) []conversationExportPreparedLog {
+	return parallelMapTracked(logs, func(_ int, item *model.ConversationLog) conversationExportPreparedLog {
 		p := prepareConversationExportLog(item)
 		if p.validation.Exportable {
 			// Materialize the lazy cache while off the critical path so the
@@ -307,7 +356,7 @@ func prepareConversationExportLogsParallel(logs []*model.ConversationLog) []conv
 			p.EffectiveRequestBody()
 		}
 		return p
-	})
+	}, live)
 }
 
 func (p *conversationExportPreparedLog) EffectiveRequestBody() string {

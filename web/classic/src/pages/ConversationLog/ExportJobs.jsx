@@ -88,6 +88,280 @@ function formatInteger(value) {
   return Number.isFinite(number) ? number.toLocaleString() : '0';
 }
 
+function formatPercent(value, digits = 1) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '-';
+  return `${number.toFixed(digits)}%`;
+}
+
+function formatRateValue(value, unit) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return `- ${unit}`;
+  if (number >= 1000) return `${(number / 1000).toFixed(1)}k ${unit}`;
+  return `${number.toFixed(number >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function utilizationStroke(percent) {
+  if (percent >= 85) return 'var(--semi-color-danger)';
+  if (percent >= 60) return 'var(--semi-color-warning)';
+  return 'var(--semi-color-success)';
+}
+
+function runtimeHintText(runtime, t) {
+  if (!runtime) return '';
+  const map = {
+    adaptive_emergency: t(
+      '资源告急：自适应调度正在大幅降低并行度与批大小，防止拖垮主机',
+    ),
+    adaptive_scale_down: t(
+      '负载偏高：自适应调度正在减载（降 worker / 缩扫描批）',
+    ),
+    adaptive_scale_up: t(
+      '主机有余量：自适应调度正在提升并行度与批内存，吃满空闲资源',
+    ),
+    at_host_cap: t(
+      '已达到为本机预留核心后的上限；若仍偏闲，瓶颈多半在磁盘或数据库',
+    ),
+    io_or_db_bound: t(
+      '任务在跑但 CPU 池空闲，当前更像磁盘/数据库瓶颈',
+    ),
+    compression_workers_low: t(
+      '压缩 worker 配置偏低，大核数机器建议调到接近 CPU 核数',
+    ),
+    prepare_workers_low: t(
+      '解析并行度低于可用核心的一半，CPU 可能吃不满',
+    ),
+    scan_batch_bytes_low: t(
+      '扫描批内存预算偏小（≤64MiB），大内存机器可提高到 256–512MiB',
+    ),
+  };
+  if (runtime.hint && map[runtime.hint]) return map[runtime.hint];
+  if (runtime.underutilized) {
+    return t('当前导出并行配置可能未吃满本机资源');
+  }
+  return '';
+}
+
+function adaptivePressureTag(pressure, t) {
+  const map = {
+    low: { color: 'green', text: t('余量充足') },
+    normal: { color: 'blue', text: t('负载正常') },
+    high: { color: 'orange', text: t('负载偏高') },
+    critical: { color: 'red', text: t('资源告急') },
+  };
+  const cfg = map[pressure] || { color: 'grey', text: pressure || t('自适应') };
+  return <Tag color={cfg.color}>{cfg.text}</Tag>;
+}
+
+function adaptiveModeText(mode, t) {
+  const map = {
+    scale_up: t('升配中'),
+    scale_down: t('降载中'),
+    emergency: t('紧急降载'),
+    hold: t('维持'),
+  };
+  return map[mode] || mode || '-';
+}
+
+function ExportRuntimeDashboard({ runtime, loading, onRefresh, t }) {
+  const cpu = Number(runtime?.host_cpu_percent || 0);
+  const procCpu = Number(runtime?.process_cpu_percent || 0);
+  const mem = Number(runtime?.host_memory_percent || 0);
+  const cores = Number(runtime?.num_cpu || 0);
+  const prepare = Number(runtime?.prepare_workers || 0);
+  const compress = Number(runtime?.compression_workers || 0);
+  const coreShare = Math.round(
+    Math.min(100, Math.max(0, Number(runtime?.configured_core_share || 0) * 100)),
+  );
+  const hint = runtimeHintText(runtime, t);
+  const active = Number(runtime?.active_jobs || 0) > 0;
+
+  const metricCard = (label, value, extra) => (
+    <div className='rounded-xl border border-[var(--semi-color-border)] bg-[var(--semi-color-bg-1)] px-3 py-2.5'>
+      <div className='text-xs text-[var(--semi-color-text-2)]'>{label}</div>
+      <div className='mt-1 text-lg font-semibold tabular-nums'>{value}</div>
+      {extra ? (
+        <div className='mt-0.5 text-xs text-[var(--semi-color-text-2)]'>
+          {extra}
+        </div>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <Card className='!rounded-2xl' bordered>
+      <div className='flex flex-col gap-3'>
+        <div className='flex flex-wrap items-start justify-between gap-3'>
+          <div>
+            <Title heading={5} style={{ margin: 0 }}>
+              {t('导出资源仪表盘')}
+            </Title>
+            <Text type='tertiary'>
+              {t(
+                '自适应调度按实时 CPU/内存升降并行度与扫描批大小：尽量吃满空闲资源，并永久预留核心给在线 API。',
+              )}
+            </Text>
+          </div>
+          <Space wrap>
+            {runtime?.adaptive ? (
+              <Tag color='cyan'>{t('自适应调度')}</Tag>
+            ) : null}
+            {adaptivePressureTag(runtime?.adaptive_pressure, t)}
+            <Tag color='white'>
+              {adaptiveModeText(runtime?.adaptive_mode, t)}
+            </Tag>
+            {active ? (
+              <Tag color='blue'>
+                {t('进行中')} · {(runtime?.active_job_phase || '-').replace(
+                  /_/g,
+                  ' ',
+                )}
+              </Tag>
+            ) : (
+              <Tag color='grey'>{t('空闲')}</Tag>
+            )}
+            <Button
+              size='small'
+              icon={<IconRefresh />}
+              loading={loading}
+              onClick={onRefresh}
+            >
+              {t('刷新指标')}
+            </Button>
+          </Space>
+        </div>
+
+        <div className='grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4'>
+          <div className='rounded-xl border border-[var(--semi-color-border)] bg-[var(--semi-color-bg-1)] px-3 py-2.5'>
+            <div className='flex items-center justify-between text-xs text-[var(--semi-color-text-2)]'>
+              <span>{t('主机 CPU')}</span>
+              <span className='tabular-nums'>{formatPercent(cpu)}</span>
+            </div>
+            <Progress
+              percent={Math.min(100, Math.max(0, cpu))}
+              showInfo={false}
+              stroke={utilizationStroke(cpu)}
+              className='mt-2'
+            />
+            <div className='mt-1 text-xs text-[var(--semi-color-text-2)]'>
+              {t('进程 CPU')} {formatPercent(procCpu)} · EWMA{' '}
+              {formatPercent(runtime?.ewma_cpu)} · {cores || '-'} {t('逻辑核')}
+              {Number(runtime?.reserve_cores || 0) > 0
+                ? ` · ${t('预留')} ${runtime.reserve_cores}`
+                : ''}
+            </div>
+          </div>
+
+          <div className='rounded-xl border border-[var(--semi-color-border)] bg-[var(--semi-color-bg-1)] px-3 py-2.5'>
+            <div className='flex items-center justify-between text-xs text-[var(--semi-color-text-2)]'>
+              <span>{t('主机内存')}</span>
+              <span className='tabular-nums'>{formatPercent(mem)}</span>
+            </div>
+            <Progress
+              percent={Math.min(100, Math.max(0, mem))}
+              showInfo={false}
+              stroke={utilizationStroke(mem)}
+              className='mt-2'
+            />
+            <div className='mt-1 text-xs text-[var(--semi-color-text-2)]'>
+              {t('可用')} {formatBytes(runtime?.host_memory_free_bytes)} ·{' '}
+              {formatBytes(runtime?.host_memory_used_bytes)} /{' '}
+              {formatBytes(runtime?.host_memory_total_bytes)} · {t('进程堆')}{' '}
+              {formatBytes(runtime?.process_heap_inuse_bytes)}
+            </div>
+          </div>
+
+          <div className='rounded-xl border border-[var(--semi-color-border)] bg-[var(--semi-color-bg-1)] px-3 py-2.5'>
+            <div className='flex items-center justify-between text-xs text-[var(--semi-color-text-2)]'>
+              <span>{t('自适应核心占用')}</span>
+              <span className='tabular-nums'>{coreShare}%</span>
+            </div>
+            <Progress
+              percent={coreShare}
+              showInfo={false}
+              stroke={
+                coreShare < 40
+                  ? 'var(--semi-color-warning)'
+                  : 'var(--semi-color-primary)'
+              }
+              className='mt-2'
+            />
+            <div className='mt-1 text-xs text-[var(--semi-color-text-2)]'>
+              {t('解析')} {prepare}/{runtime?.max_prepare_workers ?? '-'} ·{' '}
+              {t('压缩')} {compress}/{runtime?.max_compression_workers ?? '-'}
+              {runtime?.adaptive_reason
+                ? ` · ${String(runtime.adaptive_reason).replace(/_/g, ' ')}`
+                : ''}
+            </div>
+          </div>
+
+          <div className='rounded-xl border border-[var(--semi-color-border)] bg-[var(--semi-color-bg-1)] px-3 py-2.5'>
+            <div className='text-xs text-[var(--semi-color-text-2)]'>
+              {t('实时吞吐')}
+            </div>
+            <div className='mt-1 text-lg font-semibold tabular-nums'>
+              {formatRateValue(runtime?.records_per_sec, t('条/秒'))}
+            </div>
+            <div className='mt-0.5 text-xs text-[var(--semi-color-text-2)]'>
+              {formatBytes(runtime?.bytes_per_sec || 0)}/s · {t('活跃解析')}{' '}
+              {formatInteger(runtime?.prepare_active)} · {t('压缩中')}{' '}
+              {formatInteger(runtime?.compression_active)}
+              {Number(runtime?.compression_queued || 0) > 0
+                ? ` · ${t('排队')} ${formatInteger(runtime.compression_queued)}`
+                : ''}
+            </div>
+          </div>
+        </div>
+
+        <div className='grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-6'>
+          {metricCard(
+            t('扫描批大小'),
+            formatInteger(runtime?.scan_batch_size),
+            t('行/批'),
+          )}
+          {metricCard(
+            t('扫描批内存'),
+            formatBytes(runtime?.scan_batch_max_bytes),
+            t('字节预算'),
+          )}
+          {metricCard(
+            t('压缩队列'),
+            formatInteger(runtime?.compression_queue_size),
+            t('配置深度'),
+          )}
+          {metricCard(
+            t('Goroutines'),
+            formatInteger(runtime?.goroutines),
+            t('进程'),
+          )}
+          {metricCard(
+            t('已扫描'),
+            formatInteger(runtime?.scanned_records),
+            active ? t('当前任务') : t('无活动任务'),
+          )}
+          {metricCard(
+            t('已导出'),
+            formatInteger(runtime?.exported_records),
+            formatBytes(runtime?.uncompressed_bytes),
+          )}
+        </div>
+
+        {hint ? (
+          <div
+            className='rounded-lg px-3 py-2 text-sm'
+            style={{
+              background: 'var(--semi-color-warning-light-default)',
+              color: 'var(--semi-color-warning)',
+            }}
+          >
+            {hint}
+          </div>
+        ) : null}
+      </div>
+    </Card>
+  );
+}
+
 function QualityToolWarnings({ report, t }) {
   if (
     !report ||
@@ -401,7 +675,26 @@ const ExportJobs = ({
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [total, setTotal] = useState(0);
+  const [runtime, setRuntime] = useState(null);
+  const [runtimeLoading, setRuntimeLoading] = useState(false);
   const canCreateExport = localExportEnabled || defaultS3Upload;
+
+  const loadRuntime = async (silent = false) => {
+    if (!silent) setRuntimeLoading(true);
+    try {
+      const res = await API.get('/api/conversation_logs/export_jobs/runtime', {
+        disableDuplicate: true,
+      });
+      const { success, data } = res.data || {};
+      if (success) {
+        setRuntime(data || null);
+      }
+    } catch {
+      // Dashboard is best-effort; don't spam errors on poll failures.
+    } finally {
+      if (!silent) setRuntimeLoading(false);
+    }
+  };
 
   const loadJobs = async (nextPage = page, nextPageSize = pageSize) => {
     setLoading(true);
@@ -428,6 +721,7 @@ const ExportJobs = ({
 
   useEffect(() => {
     loadJobs(1, pageSize);
+    loadRuntime();
   }, []);
 
   // Auto-refresh while any job is running/pending.
@@ -436,10 +730,17 @@ const ExportJobs = ({
     const hasActive = jobs.some(
       (j) => j.status === 'running' || j.status === 'pending',
     );
-    if (!hasActive) return undefined;
-    const timer = setInterval(() => loadJobs(page, pageSize), 3000);
+    // Keep sampling host metrics even when idle (slower), so operators can
+    // size workers before kicking off a large export.
+    const intervalMs = hasActive || Number(runtime?.active_jobs || 0) > 0 ? 3000 : 10000;
+    const timer = setInterval(() => {
+      if (hasActive) {
+        loadJobs(page, pageSize);
+      }
+      loadRuntime(true);
+    }, intervalMs);
     return () => clearInterval(timer);
-  }, [jobs, autoRefresh, page, pageSize]);
+  }, [jobs, autoRefresh, page, pageSize, runtime?.active_jobs]);
 
   const onCreate = async (values) => {
     if (!canCreateExport) {
@@ -721,6 +1022,13 @@ const ExportJobs = ({
 
   return (
     <div className='flex flex-col gap-3'>
+      <ExportRuntimeDashboard
+        runtime={runtime}
+        loading={runtimeLoading}
+        onRefresh={() => loadRuntime(false)}
+        t={t}
+      />
+
       <Card className='!rounded-2xl' bordered>
         <div className='flex items-center justify-between gap-3'>
           <div>
@@ -736,8 +1044,11 @@ const ExportJobs = ({
           <Space>
             <Button
               icon={<IconRefresh />}
-              onClick={() => loadJobs(page, pageSize)}
-              loading={loading}
+              onClick={() => {
+                loadJobs(page, pageSize);
+                loadRuntime(false);
+              }}
+              loading={loading || runtimeLoading}
             >
               {t('刷新')}
             </Button>

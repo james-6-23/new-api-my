@@ -618,11 +618,17 @@ func ForEachConversationLogSelected(ctx context.Context, query ConversationLogQu
 }
 
 func ForEachConversationLogSelectedByStorageBudget(ctx context.Context, query ConversationLogQuery, columns []string, batchSize int, maxBatchBytes int64, fn func([]*ConversationLog) error) error {
-	if maxBatchBytes <= 0 {
-		return ForEachConversationLogSelected(ctx, query, columns, batchSize, fn)
-	}
-	if batchSize <= 0 {
-		batchSize = 100
+	return ForEachConversationLogSelectedByStorageBudgetFn(ctx, query, columns, func() (int, int64) {
+		return batchSize, maxBatchBytes
+	}, fn)
+}
+
+// ForEachConversationLogSelectedByStorageBudgetFn is like the fixed-budget
+// variant, but re-evaluates (batchSize, maxBatchBytes) before every outer DB
+// fetch. Callers use this for adaptive export that grows/shrinks under load.
+func ForEachConversationLogSelectedByStorageBudgetFn(ctx context.Context, query ConversationLogQuery, columns []string, budgetFn func() (batchSize int, maxBatchBytes int64), fn func([]*ConversationLog) error) error {
+	if budgetFn == nil {
+		return ForEachConversationLogSelected(ctx, query, columns, 100, fn)
 	}
 	columns = ensureConversationLogIDSelected(columns)
 	lastID := 0
@@ -632,6 +638,31 @@ func ForEachConversationLogSelectedByStorageBudget(ctx context.Context, query Co
 				return err
 			}
 		}
+		batchSize, maxBatchBytes := budgetFn()
+		if batchSize <= 0 {
+			batchSize = 100
+		}
+		if maxBatchBytes <= 0 {
+			// Fall back to pure row-count batching for this iteration.
+			var logs []*ConversationLog
+			db := applyConversationLogQuery(conversationLogDBWithContext(ctx).Model(&ConversationLog{}), query)
+			if len(columns) > 0 {
+				db = db.Select(columns)
+			}
+			err := db.Where("id > ?", lastID).Order("id asc").Limit(batchSize).Find(&logs).Error
+			if err != nil {
+				return err
+			}
+			if len(logs) == 0 {
+				return nil
+			}
+			if err := fn(logs); err != nil {
+				return err
+			}
+			lastID = logs[len(logs)-1].Id
+			continue
+		}
+
 		var refs []*ConversationLog
 		err := applyConversationLogQuery(conversationLogDBWithContext(ctx).Model(&ConversationLog{}), query).
 			Select("id, storage_bytes").
@@ -651,6 +682,12 @@ func ForEachConversationLogSelectedByStorageBudget(ctx context.Context, query Co
 				if err := ctx.Err(); err != nil {
 					return err
 				}
+			}
+			// Re-sample byte budget inside the ref window so mid-window pressure
+			// can shrink the next sub-batch without waiting for the next fetch.
+			_, maxBatchBytes = budgetFn()
+			if maxBatchBytes <= 0 {
+				maxBatchBytes = int64(64) << 20
 			}
 			ids := make([]int, 0, len(refs)-start)
 			batchBytes := int64(0)

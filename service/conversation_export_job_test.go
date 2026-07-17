@@ -538,7 +538,7 @@ func TestShardWriterStateUploadsShardAsCompressionCompletes(t *testing.T) {
 
 func TestShardCompressorPoolReturnsCompressionError(t *testing.T) {
 	dir := t.TempDir()
-	pool := newShardCompressorPool(context.Background(), 1, 1)
+	pool := newShardCompressorPool(context.Background(), 1, 1, nil)
 	require.NoError(t, pool.Submit(shardCompressionJob{
 		Index:      1,
 		TmpPath:    filepath.Join(dir, "missing.jsonl.gz"),
@@ -1015,7 +1015,8 @@ func TestBuildConversationExportBatchRecommendationLargeRecordBody(t *testing.T)
 	require.Equal(t, "large", recommendation.Level)
 	require.Equal(t, "large_record_body", recommendation.Reason)
 	require.False(t, recommendation.SQLiteLimited)
-	require.Equal(t, 218, recommendation.ScanBatchSize)
+	// Scan rows scale with ExportScanBatchMaxBytes (host-RAM adaptive default).
+	require.Equal(t, recommendedScanRowsForBytes(300*1024), recommendation.ScanBatchSize)
 	require.Equal(t, 3000, recommendation.MarkBatchSize)
 	require.Equal(t, 3000, recommendation.DeleteBatchSize)
 }

@@ -109,8 +109,11 @@ const defaultSettings = {
   export_scan_batch_max_bytes: defaultExportScanBatchMaxBytes,
   export_mark_batch_size: 2000,
   export_delete_batch_size: 2000,
-  export_compression_workers: 4,
-  export_compression_queue_size: 4,
+  // Placeholder defaults only — real values come from the server, which scales
+  // workers to NumCPU. Keep these non-tiny so a failed settings load does not
+  // silently pin large hosts to 4 workers.
+  export_compression_workers: 0,
+  export_compression_queue_size: 0,
   export_compression_level: 1,
   async_write_enabled: true,
   write_queue_size: 4096,
@@ -2323,14 +2326,16 @@ const ConversationLog = () => {
                         field='export_compression_workers'
                         label={t('压缩 worker 数')}
                         min={1}
-                        max={32}
+                        max={128}
                         step={1}
                         precision={0}
-                        extraText={t('同时压缩 gzip 分片的后台 worker 数')}
+                        extraText={t(
+                          '同时压缩 gzip 分片的后台 worker 数；大核数机器建议接近 CPU 核数（上限 128）',
+                        )}
                         onChange={(value) =>
                           setSettings({
                             ...settings,
-                            export_compression_workers: Number(value || 4),
+                            export_compression_workers: Number(value || 1),
                           })
                         }
                       />
@@ -2340,10 +2345,12 @@ const ConversationLog = () => {
                         field='export_compression_queue_size'
                         label={t('压缩队列大小')}
                         min={0}
-                        max={64}
+                        max={256}
                         step={1}
                         precision={0}
-                        extraText={t('等待压缩的 gzip 分片队列长度')}
+                        extraText={t(
+                          '等待压缩的 gzip 分片队列长度；建议 ≥ worker 数（上限 256）',
+                        )}
                         onChange={(value) =>
                           setSettings({
                             ...settings,
