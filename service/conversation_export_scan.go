@@ -3,7 +3,10 @@ package service
 import (
 	"context"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -235,6 +238,76 @@ func prepareConversationExportLog(log *model.ConversationLog) conversationExport
 		parsed:     parsed,
 		validation: validateAPIRecordParsed(log, parsed),
 	}
+}
+
+// exportPrepareWorkers sizes the record-preparation pool to the host's cores.
+// Record preparation (JSON parse of request+response, validation, effective
+// request-body rebuild) is CPU-bound, so it scales with cores; capped so a
+// single export job never monopolizes a large box.
+func exportPrepareWorkers() int {
+	n := runtime.NumCPU() - 1
+	if n < 1 {
+		return 1
+	}
+	if n > 16 {
+		return 16
+	}
+	return n
+}
+
+// parallelMap applies fn to every item across a bounded worker pool sized to the
+// host's cores, returning results index-aligned with items (order preserved). fn
+// must be pure with respect to shared state; callers that need to mutate shared
+// state (e.g. merge into a tool pool) do so sequentially over the returned slice
+// so order-sensitive merges stay deterministic. Falls back to a serial loop for
+// tiny inputs or single-core hosts.
+func parallelMap[T, R any](items []T, fn func(int, T) R) []R {
+	out := make([]R, len(items))
+	workers := exportPrepareWorkers()
+	if workers <= 1 || len(items) <= 1 {
+		for i, it := range items {
+			out[i] = fn(i, it)
+		}
+		return out
+	}
+	var wg sync.WaitGroup
+	next := int64(-1)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(atomic.AddInt64(&next, 1))
+				if i >= len(items) {
+					return
+				}
+				out[i] = fn(i, items[i])
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+// prepareConversationExportLogsParallel prepares a scanned batch across a bounded
+// worker pool and materializes each record's effective request body up front, so
+// the caller's sequential pass — which must preserve record (id-ascending) order
+// for stable bucket/shard output — only does cheap, order-sensitive work. The
+// returned slice is index-aligned with logs.
+//
+// Safe to parallelize: prepareConversationExportLog builds a fresh parsed body
+// per record and every downstream helper mutates only that record's own maps, so
+// goroutines share no mutable state.
+func prepareConversationExportLogsParallel(logs []*model.ConversationLog) []conversationExportPreparedLog {
+	return parallelMap(logs, func(_ int, item *model.ConversationLog) conversationExportPreparedLog {
+		p := prepareConversationExportLog(item)
+		if p.validation.Exportable {
+			// Materialize the lazy cache while off the critical path so the
+			// sequential consumer just reads the precomputed string.
+			p.EffectiveRequestBody()
+		}
+		return p
+	})
 }
 
 func (p *conversationExportPreparedLog) EffectiveRequestBody() string {

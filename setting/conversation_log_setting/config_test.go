@@ -51,8 +51,12 @@ func TestGetSettingDefaultsExportCompressionAndAsyncWrite(t *testing.T) {
 	})
 
 	setting := GetSetting()
-	require.Equal(t, 4, setting.ExportCompressionWorkers)
-	require.Equal(t, 4, setting.ExportCompressionQueueSize)
+	// Compression workers/queue default to a CPU-adaptive value, so assert against
+	// the same helper rather than a fixed count.
+	require.Equal(t, defaultCompressionWorkers(), setting.ExportCompressionWorkers)
+	require.Equal(t, defaultCompressionQueueSize(), setting.ExportCompressionQueueSize)
+	require.GreaterOrEqual(t, setting.ExportCompressionWorkers, 1)
+	require.LessOrEqual(t, setting.ExportCompressionWorkers, 32)
 	require.Equal(t, 1, setting.ExportCompressionLevel)
 	require.EqualValues(t, 64<<20, setting.ExportScanBatchMaxBytes)
 	require.True(t, setting.AsyncWriteEnabled)
@@ -118,8 +122,9 @@ func TestGetSettingClampsExportCompressionAndAsyncWrite(t *testing.T) {
 	conversationLogSetting.CapturePauseDiskPath = ""
 
 	setting := GetSetting()
-	require.Equal(t, 4, setting.ExportCompressionWorkers)
-	require.Equal(t, 4, setting.ExportCompressionQueueSize)
+	// Out-of-range worker/queue values fall back to the CPU-adaptive default.
+	require.Equal(t, defaultCompressionWorkers(), setting.ExportCompressionWorkers)
+	require.Equal(t, defaultCompressionQueueSize(), setting.ExportCompressionQueueSize)
 	require.Equal(t, 1, setting.ExportCompressionLevel)
 	require.EqualValues(t, 64<<20, setting.ExportScanBatchMaxBytes)
 	require.Equal(t, 4096, setting.WriteQueueSize)

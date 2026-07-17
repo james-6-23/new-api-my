@@ -356,6 +356,88 @@ func TestAPIHijackExportGroupsInterleavedKindsIntoContiguousShards(t *testing.T)
 	require.EqualValues(t, 3, msgShard.RecordCount)
 }
 
+// TestAPIHijackExportBorrowsCrossSessionToolDefinition drives a full api-hijack
+// export through the parallel scan (harvest) and the batched, parallel replay
+// (fill) stages, asserting that a record which calls a tool it never declared
+// borrows the real definition another session declared in the same batch. This
+// pins the byte-level equivalence of the parallelized fill path.
+func TestAPIHijackExportBorrowsCrossSessionToolDefinition(t *testing.T) {
+	setupConversationExportJobTestDB(t)
+	setCrossSessionToolFill(t, true)
+	now := int64(1710000000)
+
+	// Session B declares lookup_target_profile with a real schema; session A calls
+	// the same tool but never declares it. Both are responses-kind records.
+	sessionBRequest := `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"look up abc"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_b","type":"function","function":{"name":"lookup_target_profile","arguments":"{\"target\":\"abc\"}"}}]},
+			{"role":"tool","tool_call_id":"call_b","content":"found"},
+			{"role":"user","content":"ok"}
+		],
+		"tools":[{"type":"function","function":{"name":"lookup_target_profile","description":"Looks up a target profile.","parameters":{"type":"object","properties":{"target":{"type":"string","description":"Target id"}},"required":["target"]}}}]
+	}`
+	sessionARequest := `{
+		"model":"gpt-5",
+		"messages":[
+			{"role":"user","content":"look up def"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup_target_profile","arguments":"{\"target\":\"def\"}"}}]},
+			{"role":"tool","tool_call_id":"call_a","content":"found"},
+			{"role":"user","content":"great"}
+		]
+	}`
+	resp := `{"choices":[{"message":{"role":"assistant","content":"done"}}],"usage":{"total_tokens":5}}`
+
+	for i, s := range []struct{ session, req string }{
+		{"sess_a", sessionARequest},
+		{"sess_b", sessionBRequest},
+	} {
+		require.NoError(t, model.CreateConversationLog(&model.ConversationLog{
+			CreatedAt:        now + int64(i),
+			SessionId:        s.session,
+			Provider:         "openai",
+			RequestPath:      "/v1/responses",
+			RelayFormat:      "openai_responses",
+			RequestBody:      s.req,
+			ResponseBody:     resp,
+			RequestTime:      now + int64(i),
+			ResponseTime:     now + int64(i) + 1,
+			ValidationStatus: ConversationValidationValid,
+		}))
+	}
+
+	filter := model.ConversationLogQuery{StartTime: now, EndTime: now + 100}
+	filterJSON, err := common.Marshal(filter)
+	require.NoError(t, err)
+	outputDir := filepath.Join(t.TempDir(), "export")
+	require.NoError(t, os.MkdirAll(outputDir, 0o755))
+	job := &model.ConversationExportJob{
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		JobId:            "job-api-toolfill",
+		Mode:             conversation_log_setting.ExportModeAPIHijackJSONL,
+		FilterJSON:       string(filterJSON),
+		ShardTargetBytes: 1 << 30,
+		ShardMaxBytes:    1 << 30,
+		Status:           model.ConversationExportJobStatusRunning,
+		OutputDirectory:  outputDir,
+		Trigger:          "manual",
+	}
+	require.NoError(t, model.CreateConversationExportJob(job))
+	require.NoError(t, executeExportJob(context.Background(), job))
+
+	manifestBytes, err := os.ReadFile(filepath.Join(outputDir, "manifest.json"))
+	require.NoError(t, err)
+	var manifest TopManifest
+	require.NoError(t, common.Unmarshal(manifestBytes, &manifest))
+	require.Len(t, manifest.Shards, 1, "both records are responses-kind → one shard")
+
+	data := string(readGzipBytes(t, filepath.Join(outputDir, manifest.Shards[0].File)))
+	require.Contains(t, data, "Looks up a target profile",
+		"session A's exported record must borrow session B's tool definition via the batched replay fill")
+}
+
 func TestShardWriterStateWaitsForQueuedShardCompression(t *testing.T) {
 	dir := t.TempDir()
 	outputDir := filepath.Join(dir, "out")
@@ -609,7 +691,7 @@ func TestSessionProcessedSourceIDsAllowDeletingRejectedSessionRows(t *testing.T)
 		jobID:  "job-session-cleanup",
 		tmpDir: t.TempDir(),
 	}
-	_, eligible, err := writeSessionBuckets(context.Background(), model.ConversationLogQuery{}, state)
+	_, eligible, _, err := writeSessionBuckets(context.Background(), model.ConversationLogQuery{}, state)
 	require.NoError(t, err)
 	require.EqualValues(t, 2, eligible)
 	require.EqualValues(t, 2, state.processedIDCount)
@@ -1263,7 +1345,7 @@ func TestSessionBucketRebuildKeepsInterleavedSessionComplete(t *testing.T) {
 	require.NoError(t, err)
 	summary := ConversationExportSummary{RejectedSessionsByReason: map[string]int64{}}
 	qualityAcc := newQualityPreflightAccumulator(conversation_log_setting.ExportModeSessionJSONL)
-	totalSessions, err := buildSessionSpoolFromBuckets(context.Background(), manager.sortedPaths(), spool, &summary, nil, qualityAcc, nil, nil)
+	totalSessions, err := buildSessionSpoolFromBuckets(context.Background(), manager.sortedPaths(), spool, &summary, nil, qualityAcc, nil, nil, newEmptyBatchSessionToolPool())
 	require.NoError(t, err)
 	require.NoError(t, spool.close())
 	require.EqualValues(t, 2, totalSessions)

@@ -1027,21 +1027,29 @@ func (p *sessionToolPool) addTools(tools []SessionTool) {
 	}
 }
 
+// extractSessionToolsFromRequestBody harvests declared tool definitions from one
+// request body across all provider layouts. It is pure (no shared state), so an
+// export scan can run it across a worker pool and merge the results into the pool
+// sequentially afterwards via addTools.
+func extractSessionToolsFromRequestBody(provider, requestBody string) []SessionTool {
+	requestBody = strings.TrimSpace(requestBody)
+	if requestBody == "" {
+		return nil
+	}
+	var request map[string]interface{}
+	if err := common.Unmarshal([]byte(requestBody), &request); err != nil {
+		return nil
+	}
+	return extractAllSessionTools(request, provider)
+}
+
 // addRequestBody harvests declared tool definitions from one request body across
 // all provider layouts, so a batch pass can accumulate the pool cheaply.
 func (p *sessionToolPool) addRequestBody(provider, requestBody string) {
 	if p == nil {
 		return
 	}
-	requestBody = strings.TrimSpace(requestBody)
-	if requestBody == "" {
-		return
-	}
-	var request map[string]interface{}
-	if err := common.Unmarshal([]byte(requestBody), &request); err != nil {
-		return
-	}
-	p.addTools(extractAllSessionTools(request, provider))
+	p.addTools(extractSessionToolsFromRequestBody(provider, requestBody))
 }
 
 // lookup returns a complete cross-session definition for name, renamed to the

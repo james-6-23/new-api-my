@@ -2,6 +2,7 @@ package conversation_log_setting
 
 import (
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/QuantumNous/new-api/setting/config"
@@ -53,15 +54,13 @@ const (
 	minExportScanBatchBytes      = int64(1) << 20 // 1 MiB
 	maxExportScanBatchBytes      = int64(2) << 30 // 2 GiB
 
-	defaultExportCompressionWorkers   = 4
-	defaultExportCompressionQueueSize = 4
-	defaultExportCompressionLevel     = 1 // gzip.BestSpeed
-	minExportCompressionWorkers       = 1
-	maxExportCompressionWorkers       = 32
-	minExportCompressionQueueSize     = 0
-	maxExportCompressionQueueSize     = 64
-	minExportCompressionLevel         = -2 // gzip.HuffmanOnly
-	maxExportCompressionLevel         = 9  // gzip.BestCompression
+	defaultExportCompressionLevel = 1 // gzip.BestSpeed
+	minExportCompressionWorkers   = 1
+	maxExportCompressionWorkers   = 32
+	minExportCompressionQueueSize = 0
+	maxExportCompressionQueueSize = 64
+	minExportCompressionLevel     = -2 // gzip.HuffmanOnly
+	maxExportCompressionLevel     = 9  // gzip.BestCompression
 
 	defaultAsyncWriteEnabled    = true
 	defaultWriteQueueSize       = 4096
@@ -365,8 +364,8 @@ var conversationLogSetting = ConversationLogSetting{
 	ExportScanBatchMaxBytes:      defaultExportScanBatchBytes,
 	ExportMarkBatchSize:          defaultExportMarkBatchSize,
 	ExportDeleteBatchSize:        defaultExportDeleteBatchSize,
-	ExportCompressionWorkers:     defaultExportCompressionWorkers,
-	ExportCompressionQueueSize:   defaultExportCompressionQueueSize,
+	ExportCompressionWorkers:     defaultCompressionWorkers(),
+	ExportCompressionQueueSize:   defaultCompressionQueueSize(),
 	ExportCompressionLevel:       defaultExportCompressionLevel,
 	AsyncWriteEnabled:            defaultAsyncWriteEnabled,
 	WriteQueueSize:               defaultWriteQueueSize,
@@ -554,9 +553,34 @@ func ExportScanBatchBytesBounds() (min, max int64) {
 	return minExportScanBatchBytes, maxExportScanBatchBytes
 }
 
+// defaultCompressionWorkers scales shard gzip compression to the host's cores,
+// clamped to the compression-worker bounds. Shard compression is CPU-bound and
+// runs in a bounded pool, so more cores compress more shards concurrently. Only
+// fresh/unconfigured installs pick this up; an explicit stored value is honored.
+func defaultCompressionWorkers() int {
+	n := runtime.NumCPU()
+	if n < minExportCompressionWorkers {
+		return minExportCompressionWorkers
+	}
+	if n > maxExportCompressionWorkers {
+		return maxExportCompressionWorkers
+	}
+	return n
+}
+
+// defaultCompressionQueueSize keeps the pending-shard queue at least as deep as
+// the worker count so the shard writer never stalls waiting for a free slot.
+func defaultCompressionQueueSize() int {
+	q := defaultCompressionWorkers()
+	if q > maxExportCompressionQueueSize {
+		return maxExportCompressionQueueSize
+	}
+	return q
+}
+
 func clampExportCompressionWorkers(value int) int {
 	if value < minExportCompressionWorkers || value > maxExportCompressionWorkers {
-		return defaultExportCompressionWorkers
+		return defaultCompressionWorkers()
 	}
 	return value
 }
@@ -567,7 +591,7 @@ func ExportCompressionWorkersBounds() (min, max int) {
 
 func clampExportCompressionQueueSize(value int) int {
 	if value < minExportCompressionQueueSize || value > maxExportCompressionQueueSize {
-		return defaultExportCompressionQueueSize
+		return defaultCompressionQueueSize()
 	}
 	return value
 }
