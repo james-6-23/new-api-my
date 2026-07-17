@@ -68,6 +68,13 @@ export const useHeaderBar = ({ onMobileMenuToggle, drawerOpen }) => {
             requireAuth: false, // 默认不需要登录鉴权
           };
         }
+        // modelStatus 兼容 boolean -> object
+        if (typeof modules.modelStatus === 'boolean') {
+          modules.modelStatus = {
+            enabled: modules.modelStatus,
+            requireAuth: false,
+          };
+        }
 
         return modules;
       } catch (error) {
@@ -86,6 +93,16 @@ export const useHeaderBar = ({ onMobileMenuToggle, drawerOpen }) => {
         : false; // 默认不需要登录
     }
     return false; // 默认不需要登录
+  }, [headerNavModules]);
+
+  // 模型状态页权限配置
+  const modelStatusRequireAuth = useMemo(() => {
+    if (headerNavModules?.modelStatus) {
+      return typeof headerNavModules.modelStatus === 'object'
+        ? headerNavModules.modelStatus.requireAuth === true
+        : false;
+    }
+    return false;
   }, [headerNavModules]);
 
   const isConsoleRoute = location.pathname.startsWith('/console');
@@ -238,6 +255,7 @@ export const useHeaderBar = ({ onMobileMenuToggle, drawerOpen }) => {
     drawerOpen,
     headerNavModules,
     pricingRequireAuth,
+    modelStatusRequireAuth,
 
     // Actions
     logout,

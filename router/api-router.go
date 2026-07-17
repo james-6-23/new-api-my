@@ -37,6 +37,12 @@ func SetApiRouter(router *gin.Engine) {
 			perfMetricsRoute.GET("/summary", controller.GetPerfMetricsSummary)
 			perfMetricsRoute.GET("", controller.GetPerfMetrics)
 		}
+		// Public model status board (classic 顶栏「模型状态」)
+		modelStatusRoute := apiRouter.Group("/model-status")
+		modelStatusRoute.Use(middleware.HeaderNavModuleAuth("modelStatus"))
+		{
+			modelStatusRoute.GET("", controller.GetModelStatus)
+		}
 		apiRouter.GET("/rankings", middleware.HeaderNavModuleAuth("rankings"), controller.GetRankings)
 		apiRouter.GET("/verification", middleware.TurnstileCheck(), middleware.EmailVerificationRateLimit(), controller.SendRegistrationEmailVerification)
 		apiRouter.GET("/reset_password", middleware.CriticalRateLimit(), middleware.TurnstileCheck(), controller.SendPasswordResetEmail)

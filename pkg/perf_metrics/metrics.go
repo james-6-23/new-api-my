@@ -201,6 +201,169 @@ func bucketStart(ts int64) int64 {
 	return ts - (ts % bucketSeconds)
 }
 
+// QueryStatusBoard builds a new_api_tools-style model status board from perf_metrics.
+// All groups for the same model are aggregated into a single row with continuous slots.
+func QueryStatusBoard(hours int) (StatusBoardResult, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	if hours > 24*30 {
+		hours = 24 * 30
+	}
+
+	bucketSec := perf_metrics_setting.GetBucketSeconds()
+	if bucketSec <= 0 {
+		bucketSec = 3600
+	}
+
+	now := time.Now().Unix()
+	endTs := bucketStart(now) + bucketSec - 1
+	startTs := now - int64(hours)*3600
+	firstBucket := bucketStart(startTs)
+	lastBucket := bucketStart(now)
+
+	// Aggregate counters by model + bucket across all groups.
+	type modelBucketKey struct {
+		model    string
+		bucketTs int64
+	}
+	merged := map[modelBucketKey]counters{}
+	totals := map[string]counters{}
+
+	rows, err := model.GetAllPerfMetricsInRange(startTs, endTs)
+	if err != nil {
+		return StatusBoardResult{}, err
+	}
+	for _, row := range rows {
+		if row.ModelName == "" || row.RequestCount == 0 {
+			continue
+		}
+		mk := modelBucketKey{model: row.ModelName, bucketTs: row.BucketTs}
+		cur := merged[mk]
+		cur.requestCount += row.RequestCount
+		cur.successCount += row.SuccessCount
+		cur.totalLatencyMs += row.TotalLatencyMs
+		cur.ttftSumMs += row.TtftSumMs
+		cur.ttftCount += row.TtftCount
+		cur.outputTokens += row.OutputTokens
+		cur.generationMs += row.GenerationMs
+		merged[mk] = cur
+
+		t := totals[row.ModelName]
+		t.requestCount += row.RequestCount
+		t.successCount += row.SuccessCount
+		t.totalLatencyMs += row.TotalLatencyMs
+		t.outputTokens += row.OutputTokens
+		t.generationMs += row.GenerationMs
+		totals[row.ModelName] = t
+	}
+
+	// Merge in-memory hot buckets so the latest interval is near-real-time.
+	hotBuckets.Range(func(key, value any) bool {
+		k := key.(bucketKey)
+		if k.bucketTs < startTs || k.bucketTs > endTs || k.model == "" {
+			return true
+		}
+		snap := value.(*atomicBucket).snapshot()
+		if snap.requestCount == 0 {
+			return true
+		}
+		mk := modelBucketKey{model: k.model, bucketTs: k.bucketTs}
+		cur := merged[mk]
+		cur.requestCount += snap.requestCount
+		cur.successCount += snap.successCount
+		cur.totalLatencyMs += snap.totalLatencyMs
+		cur.ttftSumMs += snap.ttftSumMs
+		cur.ttftCount += snap.ttftCount
+		cur.outputTokens += snap.outputTokens
+		cur.generationMs += snap.generationMs
+		merged[mk] = cur
+
+		t := totals[k.model]
+		t.requestCount += snap.requestCount
+		t.successCount += snap.successCount
+		t.totalLatencyMs += snap.totalLatencyMs
+		t.outputTokens += snap.outputTokens
+		t.generationMs += snap.generationMs
+		totals[k.model] = t
+		return true
+	})
+
+	// Continuous slot timeline for the selected window.
+	slotTimes := make([]int64, 0)
+	for ts := firstBucket; ts <= lastBucket; ts += bucketSec {
+		slotTimes = append(slotTimes, ts)
+	}
+	if len(slotTimes) == 0 {
+		slotTimes = append(slotTimes, firstBucket)
+	}
+
+	models := make([]ModelStatusItem, 0, len(totals))
+	for name, total := range totals {
+		if total.requestCount == 0 {
+			continue
+		}
+		rate := successRate(total)
+		slots := make([]StatusSlot, 0, len(slotTimes))
+		for i, ts := range slotTimes {
+			c := merged[modelBucketKey{model: name, bucketTs: ts}]
+			slotRate := successRate(c)
+			slots = append(slots, StatusSlot{
+				Slot:          i,
+				StartTime:     ts,
+				EndTime:       ts + bucketSec,
+				TotalRequests: c.requestCount,
+				SuccessCount:  c.successCount,
+				SuccessRate:   math.Round(slotRate*100) / 100,
+				Status:        statusColor(slotRate, c.requestCount),
+			})
+		}
+		models = append(models, ModelStatusItem{
+			ModelName:     name,
+			DisplayName:   name,
+			TimeWindow:    fmt.Sprintf("%dh", hours),
+			TotalRequests: total.requestCount,
+			SuccessCount:  total.successCount,
+			SuccessRate:   math.Round(rate*100) / 100,
+			AvgLatencyMs:  avg(total.totalLatencyMs, total.requestCount),
+			AvgTps:        math.Round(avgTps(total)*100) / 100,
+			CurrentStatus: statusColor(rate, total.requestCount),
+			SlotData:      slots,
+		})
+	}
+
+	sort.Slice(models, func(i, j int) bool {
+		// Unhealthy models first, then by request volume.
+		priority := map[string]int{StatusRed: 0, StatusYellow: 1, StatusGreen: 2, StatusEmpty: 3}
+		pi, pj := priority[models[i].CurrentStatus], priority[models[j].CurrentStatus]
+		if pi != pj {
+			return pi < pj
+		}
+		return models[i].TotalRequests > models[j].TotalRequests
+	})
+
+	return StatusBoardResult{
+		TimeWindow: fmt.Sprintf("%dh", hours),
+		Hours:      hours,
+		BucketSec:  bucketSec,
+		Models:     models,
+	}, nil
+}
+
+// statusColor maps success rate to green/yellow/red/empty (new_api_tools thresholds).
+func statusColor(rate float64, total int64) string {
+	if total <= 0 {
+		return StatusEmpty
+	}
+	if rate >= 95 {
+		return StatusGreen
+	}
+	if rate >= 80 {
+		return StatusYellow
+	}
+	return StatusRed
+}
+
 func mergeCounters(merged map[bucketKey]counters, key bucketKey, value counters) {
 	if value.requestCount == 0 {
 		return

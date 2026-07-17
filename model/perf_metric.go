@@ -59,6 +59,16 @@ func GetPerfMetrics(modelName string, group string, startTs int64, endTs int64) 
 	return metrics, err
 }
 
+// GetAllPerfMetricsInRange returns all perf metric rows within [startTs, endTs].
+func GetAllPerfMetricsInRange(startTs int64, endTs int64) ([]PerfMetric, error) {
+	var metrics []PerfMetric
+	err := DB.Model(&PerfMetric{}).
+		Where("bucket_ts >= ? AND bucket_ts <= ?", startTs, endTs).
+		Order("model_name ASC, bucket_ts ASC").
+		Find(&metrics).Error
+	return metrics, err
+}
+
 type PerfMetricSummary struct {
 	ModelName      string `json:"model_name"`
 	RequestCount   int64  `json:"request_count"`

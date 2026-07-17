@@ -26,6 +26,7 @@ export const useNavigation = (t, docsLink, headerNavModules) => {
       home: true,
       console: true,
       pricing: true,
+      modelStatus: true,
       docs: true,
       about: true,
     };
@@ -48,6 +49,11 @@ export const useNavigation = (t, docsLink, headerNavModules) => {
         text: t('模型广场'),
         itemKey: 'pricing',
         to: '/pricing',
+      },
+      {
+        text: t('模型状态'),
+        itemKey: 'modelStatus',
+        to: '/model-status',
       },
       ...(docsLink
         ? [
@@ -76,6 +82,11 @@ export const useNavigation = (t, docsLink, headerNavModules) => {
         return typeof modules.pricing === 'object'
           ? modules.pricing.enabled
           : modules.pricing;
+      }
+      if (link.itemKey === 'modelStatus') {
+        return typeof modules.modelStatus === 'object'
+          ? modules.modelStatus.enabled !== false
+          : modules.modelStatus !== false;
       }
       return modules[link.itemKey] === true;
     });

@@ -54,6 +54,7 @@ import SetupCheck from './components/layout/SetupCheck';
 const Home = lazy(() => import('./pages/Home'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
 const About = lazy(() => import('./pages/About'));
+const ModelStatus = lazy(() => import('./pages/ModelStatus'));
 const UserAgreement = lazy(() => import('./pages/UserAgreement'));
 const PrivacyPolicy = lazy(() => import('./pages/PrivacyPolicy'));
 
@@ -66,26 +67,36 @@ function App() {
   const location = useLocation();
   const [statusState] = useContext(StatusContext);
 
-  // 获取模型广场权限配置
-  const pricingRequireAuth = useMemo(() => {
+  // 获取模型广场 / 模型状态权限配置
+  const { pricingRequireAuth, modelStatusRequireAuth } = useMemo(() => {
     const headerNavModulesConfig = statusState?.status?.HeaderNavModules;
     if (headerNavModulesConfig) {
       try {
         const modules = JSON.parse(headerNavModulesConfig);
-
-        // 处理向后兼容性：如果pricing是boolean，默认不需要登录
-        if (typeof modules.pricing === 'boolean') {
-          return false; // 默认不需要登录鉴权
-        }
-
-        // 如果是对象格式，使用requireAuth配置
-        return modules.pricing?.requireAuth === true;
+        const pricingAuth =
+          typeof modules.pricing === 'object'
+            ? modules.pricing?.requireAuth === true
+            : false;
+        const modelStatusAuth =
+          typeof modules.modelStatus === 'object'
+            ? modules.modelStatus?.requireAuth === true
+            : false;
+        return {
+          pricingRequireAuth: pricingAuth,
+          modelStatusRequireAuth: modelStatusAuth,
+        };
       } catch (error) {
         console.error('解析顶栏模块配置失败:', error);
-        return false; // 默认不需要登录
+        return {
+          pricingRequireAuth: false,
+          modelStatusRequireAuth: false,
+        };
       }
     }
-    return false; // 默认不需要登录
+    return {
+      pricingRequireAuth: false,
+      modelStatusRequireAuth: false,
+    };
   }, [statusState?.status?.HeaderNavModules]);
 
   return (
@@ -339,6 +350,25 @@ function App() {
             ) : (
               <Suspense fallback={<Loading></Loading>} key={location.pathname}>
                 <Pricing />
+              </Suspense>
+            )
+          }
+        />
+        <Route
+          path='/model-status'
+          element={
+            modelStatusRequireAuth ? (
+              <PrivateRoute>
+                <Suspense
+                  fallback={<Loading></Loading>}
+                  key={location.pathname}
+                >
+                  <ModelStatus />
+                </Suspense>
+              </PrivateRoute>
+            ) : (
+              <Suspense fallback={<Loading></Loading>} key={location.pathname}>
+                <ModelStatus />
               </Suspense>
             )
           }

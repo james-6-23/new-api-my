@@ -46,6 +46,10 @@ export default function SettingsHeaderNavModules(props) {
       enabled: true,
       requireAuth: false, // 默认不需要登录鉴权
     },
+    modelStatus: {
+      enabled: true,
+      requireAuth: false,
+    },
     docs: true,
     about: true,
   });
@@ -54,10 +58,11 @@ export default function SettingsHeaderNavModules(props) {
   function handleHeaderNavModuleChange(moduleKey) {
     return (checked) => {
       const newModules = { ...headerNavModules };
-      if (moduleKey === 'pricing') {
-        // 对于pricing模块，只更新enabled属性
+      if (moduleKey === 'pricing' || moduleKey === 'modelStatus') {
+        // 对象型模块：只更新 enabled
+        const prev = newModules[moduleKey];
         newModules[moduleKey] = {
-          ...newModules[moduleKey],
+          ...(typeof prev === 'object' ? prev : { requireAuth: false }),
           enabled: checked,
         };
       } else {
@@ -77,12 +82,27 @@ export default function SettingsHeaderNavModules(props) {
     setHeaderNavModules(newModules);
   }
 
+  // 处理模型状态权限控制变更
+  function handleModelStatusAuthChange(checked) {
+    const newModules = { ...headerNavModules };
+    const prev = newModules.modelStatus;
+    newModules.modelStatus = {
+      ...(typeof prev === 'object' ? prev : { enabled: true }),
+      requireAuth: checked,
+    };
+    setHeaderNavModules(newModules);
+  }
+
   // 重置顶栏模块为默认配置
   function resetHeaderNavModules() {
     const defaultModules = {
       home: true,
       console: true,
       pricing: {
+        enabled: true,
+        requireAuth: false,
+      },
+      modelStatus: {
         enabled: true,
         requireAuth: false,
       },
@@ -141,6 +161,19 @@ export default function SettingsHeaderNavModules(props) {
             requireAuth: false, // 默认不需要登录鉴权
           };
         }
+        if (typeof modules.modelStatus === 'boolean') {
+          modules.modelStatus = {
+            enabled: modules.modelStatus,
+            requireAuth: false,
+          };
+        }
+        // 旧配置没有 modelStatus 时默认开启
+        if (modules.modelStatus === undefined) {
+          modules.modelStatus = {
+            enabled: true,
+            requireAuth: false,
+          };
+        }
 
         setHeaderNavModules(modules);
       } catch (error) {
@@ -149,6 +182,10 @@ export default function SettingsHeaderNavModules(props) {
           home: true,
           console: true,
           pricing: {
+            enabled: true,
+            requireAuth: false,
+          },
+          modelStatus: {
             enabled: true,
             requireAuth: false,
           },
@@ -179,6 +216,12 @@ export default function SettingsHeaderNavModules(props) {
       hasSubConfig: true, // 标识该模块有子配置
     },
     {
+      key: 'modelStatus',
+      title: t('模型状态'),
+      description: t('模型可用性与成功率看板'),
+      hasSubConfig: true,
+    },
+    {
       key: 'docs',
       title: t('文档'),
       description: t('系统文档和帮助信息'),
@@ -189,6 +232,16 @@ export default function SettingsHeaderNavModules(props) {
       description: t('关于系统的详细信息'),
     },
   ];
+
+  const isObjectModule = (key) => key === 'pricing' || key === 'modelStatus';
+
+  const isModuleEnabled = (key) => {
+    const value = headerNavModules[key];
+    if (isObjectModule(key)) {
+      return typeof value === 'object' ? value?.enabled !== false : value !== false;
+    }
+    return value === true;
+  };
 
   return (
     <Card>
@@ -244,72 +297,71 @@ export default function SettingsHeaderNavModules(props) {
                   </div>
                   <div style={{ marginLeft: '16px' }}>
                     <Switch
-                      checked={
-                        module.key === 'pricing'
-                          ? headerNavModules[module.key]?.enabled
-                          : headerNavModules[module.key]
-                      }
+                      checked={isModuleEnabled(module.key)}
                       onChange={handleHeaderNavModuleChange(module.key)}
                       size='default'
                     />
                   </div>
                 </div>
 
-                {/* 为模型广场添加权限控制子开关 */}
-                {module.key === 'pricing' &&
-                  (module.key === 'pricing'
-                    ? headerNavModules[module.key]?.enabled
-                    : headerNavModules[module.key]) && (
+                {/* 对象型模块的登录鉴权子开关 */}
+                {isObjectModule(module.key) && isModuleEnabled(module.key) && (
+                  <div
+                    style={{
+                      borderTop: '1px solid var(--semi-color-border)',
+                      marginTop: '12px',
+                      paddingTop: '12px',
+                    }}
+                  >
                     <div
                       style={{
-                        borderTop: '1px solid var(--semi-color-border)',
-                        marginTop: '12px',
-                        paddingTop: '12px',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
                       }}
                     >
-                      <div
-                        style={{
-                          display: 'flex',
-                          justifyContent: 'space-between',
-                          alignItems: 'center',
-                        }}
-                      >
-                        <div style={{ flex: 1, textAlign: 'left' }}>
-                          <div
-                            style={{
-                              fontWeight: '500',
-                              fontSize: '12px',
-                              color: 'var(--semi-color-text-1)',
-                              marginBottom: '2px',
-                            }}
-                          >
-                            {t('需要登录访问')}
-                          </div>
-                          <Text
-                            type='secondary'
-                            size='small'
-                            style={{
-                              fontSize: '11px',
-                              color: 'var(--semi-color-text-2)',
-                              lineHeight: '1.4',
-                              display: 'block',
-                            }}
-                          >
-                            {t('开启后未登录用户无法访问模型广场')}
-                          </Text>
+                      <div style={{ flex: 1, textAlign: 'left' }}>
+                        <div
+                          style={{
+                            fontWeight: '500',
+                            fontSize: '12px',
+                            color: 'var(--semi-color-text-1)',
+                            marginBottom: '2px',
+                          }}
+                        >
+                          {t('需要登录访问')}
                         </div>
-                        <div style={{ marginLeft: '16px' }}>
-                          <Switch
-                            checked={
-                              headerNavModules.pricing?.requireAuth || false
-                            }
-                            onChange={handlePricingAuthChange}
-                            size='default'
-                          />
-                        </div>
+                        <Text
+                          type='secondary'
+                          size='small'
+                          style={{
+                            fontSize: '11px',
+                            color: 'var(--semi-color-text-2)',
+                            lineHeight: '1.4',
+                            display: 'block',
+                          }}
+                        >
+                          {module.key === 'pricing'
+                            ? t('开启后未登录用户无法访问模型广场')
+                            : t('开启后未登录用户无法访问模型状态')}
+                        </Text>
+                      </div>
+                      <div style={{ marginLeft: '16px' }}>
+                        <Switch
+                          checked={
+                            headerNavModules[module.key]?.requireAuth || false
+                          }
+                          onChange={
+                            module.key === 'pricing'
+                              ? handlePricingAuthChange
+                              : handleModelStatusAuthChange
+                          }
+                          size='default'
+                        />
                       </div>
                     </div>
-                  )}
+                  </div>
+                )}
               </Card>
             </Col>
           ))}

@@ -59,6 +59,47 @@ type SummaryAllResult struct {
 	Models []ModelSummary `json:"models"`
 }
 
+// Status colors aligned with new_api_tools model status monitor.
+const (
+	StatusGreen  = "green"
+	StatusYellow = "yellow"
+	StatusRed    = "red"
+	StatusEmpty  = "empty"
+)
+
+// StatusSlot is one time-bucket cell on the model status board.
+type StatusSlot struct {
+	Slot          int     `json:"slot"`
+	StartTime     int64   `json:"start_time"`
+	EndTime       int64   `json:"end_time"`
+	TotalRequests int64   `json:"total_requests"`
+	SuccessCount  int64   `json:"success_count"`
+	SuccessRate   float64 `json:"success_rate"`
+	Status        string  `json:"status"` // green | yellow | red | empty
+}
+
+// ModelStatusItem is one model row on the public model status board.
+type ModelStatusItem struct {
+	ModelName     string       `json:"model_name"`
+	DisplayName   string       `json:"display_name"`
+	TimeWindow    string       `json:"time_window"`
+	TotalRequests int64        `json:"total_requests"`
+	SuccessCount  int64        `json:"success_count"`
+	SuccessRate   float64      `json:"success_rate"`
+	AvgLatencyMs  int64        `json:"avg_latency_ms"`
+	AvgTps        float64      `json:"avg_tps"`
+	CurrentStatus string       `json:"current_status"`
+	SlotData      []StatusSlot `json:"slot_data"`
+}
+
+// StatusBoardResult is the response payload for GET /api/model-status.
+type StatusBoardResult struct {
+	TimeWindow string            `json:"time_window"`
+	Hours      int               `json:"hours"`
+	BucketSec  int64             `json:"bucket_seconds"`
+	Models     []ModelStatusItem `json:"models"`
+}
+
 type bucketKey struct {
 	model    string
 	group    string
