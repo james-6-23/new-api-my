@@ -40,10 +40,11 @@ const (
 	exportGovComfortFreeBytes  = uint64(2) << 30   // 2 GiB — prefer not to scale up below
 	exportGovAbundantFreeBytes = uint64(4) << 30   // 4 GiB — free to grow batches
 
-	// Align with setting package floor (1 MiB) so operator ceilings like 1 MiB
-	// in tests/production are not silently raised.
+	// Align with setting package floor (1 MiB). Hard cap matches
+	// conversation_log_setting.maxExportScanBatchBytes (4 GiB) so a configured
+	// 4096 MB ceiling is actually usable by the adaptive scan path.
 	exportGovMinScanBatchBytes = int64(1) << 20 // 1 MiB
-	exportGovMaxScanBatchBytes = int64(1) << 30 // 1 GiB
+	exportGovMaxScanBatchBytes = int64(4) << 30 // 4 GiB
 	exportGovMinScanBatchSize  = 100
 	exportGovMaxScanBatchSize  = 10000
 )

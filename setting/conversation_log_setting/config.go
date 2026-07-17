@@ -53,8 +53,9 @@ const (
 	defaultExportScanBatchBytes = int64(64) << 20 // 64 MiB
 	minExportBatchSize          = 100
 	maxExportBatchSize          = 10000
-	minExportScanBatchBytes     = int64(1) << 20 // 1 MiB
-	maxExportScanBatchBytes     = int64(2) << 30 // 2 GiB
+	minExportScanBatchBytes = int64(1) << 20 // 1 MiB
+	// 4 GiB ceiling for large-body / large-RAM export hosts (UI max 4096 MB).
+	maxExportScanBatchBytes = int64(4) << 30 // 4 GiB
 
 	defaultExportCompressionLevel = 1 // gzip.BestSpeed
 	minExportCompressionWorkers   = 1
@@ -557,19 +558,20 @@ func ExportScanBatchBytesBounds() (min, max int64) {
 }
 
 // defaultScanBatchMaxBytes scales the per-scan memory budget to host RAM so a
-// 128 GiB box is not stuck on the old 64 MiB default. Uses ~0.4% of total RAM,
-// clamped to [64 MiB, 1 GiB]. Fresh installs / out-of-range config only.
+// large box is not stuck on the old 64 MiB default. Uses ~0.5% of total RAM,
+// clamped to [64 MiB, 2 GiB]. Fresh installs / out-of-range config only.
+// Operators can still raise the ceiling up to maxExportScanBatchBytes (4 GiB).
 func defaultScanBatchMaxBytes() int64 {
 	const (
-		floorBytes = int64(64) << 20  // 64 MiB
-		ceilBytes  = int64(1) << 30   // 1 GiB
+		floorBytes = int64(64) << 20 // 64 MiB
+		ceilBytes  = int64(2) << 30  // 2 GiB
 	)
 	memInfo, err := mem.VirtualMemory()
 	if err != nil || memInfo == nil || memInfo.Total == 0 {
 		return defaultExportScanBatchBytes
 	}
-	// 0.4% of RAM: 128 GiB → ~524 MiB; 32 GiB → ~131 MiB; 16 GiB → ~67 MiB.
-	n := int64(memInfo.Total / 250)
+	// 0.5% of RAM: 128 GiB → ~655 MiB; 64 GiB → ~328 MiB; 16 GiB → ~82 MiB.
+	n := int64(memInfo.Total / 200)
 	if n < floorBytes {
 		return floorBytes
 	}

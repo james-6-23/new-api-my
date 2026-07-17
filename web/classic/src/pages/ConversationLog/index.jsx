@@ -209,6 +209,34 @@ function mibToBytes(value, fallbackBytes) {
   return Math.round(number) * MiB;
 }
 
+// Form is controlled via values={...}. API settings store *bytes* fields, but
+// several inputs are *MB* fields (export_scan_batch_max_mb, …). Without injecting
+// those derived keys into the controlled values object, every setSettings()
+// re-render wipes the MB inputs back to empty/previous — looks like "can't type
+// 4096". Always build form values through this helper.
+function buildSettingsFormValues(settingsLike = {}) {
+  return {
+    ...settingsLike,
+    auto_export_threshold_mb: bytesToMiB(
+      settingsLike.auto_export_threshold_bytes,
+    ),
+    auto_export_shard_max_mb: bytesToMiB(
+      settingsLike.auto_export_shard_max_bytes,
+    ),
+    export_scan_batch_max_mb: bytesToMiB(
+      settingsLike.export_scan_batch_max_bytes,
+    ),
+    write_queue_max_mb: bytesToMiB(settingsLike.write_queue_max_bytes),
+    write_batch_max_mb: bytesToMiB(settingsLike.write_batch_max_bytes),
+    capture_max_mb: bytesToMiB(settingsLike.capture_max_bytes_per_request),
+    capture_global_max_mb: bytesToMiB(settingsLike.capture_global_max_bytes),
+  };
+}
+
+// UI / API ceilings for scan-batch memory (MiB). Keep in sync with backend
+// maxExportScanBatchBytes (4 GiB).
+const EXPORT_SCAN_BATCH_MAX_MB = 4096;
+
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -404,6 +432,12 @@ const ConversationLog = () => {
   const [backfillLoading, setBackfillLoading] = useState(false);
   const [mode, setMode] = useState('api_hijack_jsonl');
   const [settings, setSettings] = useState(defaultSettings);
+  // Controlled Form values must include derived *_mb fields or InputNumber
+  // will snap back on every settings update / blur.
+  const settingsFormValues = useMemo(
+    () => buildSettingsFormValues(settings),
+    [settings],
+  );
   const [summary, setSummary] = useState(null);
   const [diskSpace, setDiskSpace] = useState(null);
   const [batchRecommendationHint, setBatchRecommendationHint] = useState(null);
@@ -557,31 +591,9 @@ const ConversationLog = () => {
           max: Number(bounds.max || defaultBatchSizeBounds.max),
         });
         setSettings(nextSettings);
-        // MB-typed form fields aren't first-class properties of the
-        // settings object (the API stores bytes), so Form's values={settings}
-        // controlled mode can't populate them on its own. Inject the derived
-        // MB values into the form state explicitly.
-        const formValues = {
-          ...nextSettings,
-          auto_export_threshold_mb: bytesToMiB(
-            nextSettings.auto_export_threshold_bytes,
-          ),
-          auto_export_shard_max_mb: bytesToMiB(
-            nextSettings.auto_export_shard_max_bytes,
-          ),
-          export_scan_batch_max_mb: bytesToMiB(
-            nextSettings.export_scan_batch_max_bytes,
-          ),
-          write_queue_max_mb: bytesToMiB(nextSettings.write_queue_max_bytes),
-          write_batch_max_mb: bytesToMiB(nextSettings.write_batch_max_bytes),
-          capture_max_mb: bytesToMiB(
-            nextSettings.capture_max_bytes_per_request,
-          ),
-          capture_global_max_mb: bytesToMiB(
-            nextSettings.capture_global_max_bytes,
-          ),
-        };
-        settingsFormRef.current?.setValues(formValues);
+        settingsFormRef.current?.setValues(
+          buildSettingsFormValues(nextSettings),
+        );
         void loadS3RotationStatus(false, nextSettings.s3);
       } else {
         showError(summaryRes.data.message);
@@ -671,7 +683,51 @@ const ConversationLog = () => {
   const saveSettings = async () => {
     setSettingsSaving(true);
     try {
-      const res = await API.put('/api/conversation_logs/settings', settings);
+      // Prefer form values for fields the operator may have typed; map MB → bytes
+      // so a controlled-form race can't save a stale settings snapshot.
+      const formValues = settingsFormRef.current?.getValues?.() || {};
+      const payload = {
+        ...settings,
+        ...formValues,
+        export_scan_batch_max_bytes: mibToBytes(
+          formValues.export_scan_batch_max_mb,
+          settings.export_scan_batch_max_bytes,
+        ),
+        write_queue_max_bytes: mibToBytes(
+          formValues.write_queue_max_mb,
+          settings.write_queue_max_bytes,
+        ),
+        write_batch_max_bytes: mibToBytes(
+          formValues.write_batch_max_mb,
+          settings.write_batch_max_bytes,
+        ),
+        capture_max_bytes_per_request: mibToBytes(
+          formValues.capture_max_mb,
+          settings.capture_max_bytes_per_request,
+        ),
+        capture_global_max_bytes: mibToBytes(
+          formValues.capture_global_max_mb,
+          settings.capture_global_max_bytes,
+        ),
+        auto_export_threshold_bytes: mibToBytes(
+          formValues.auto_export_threshold_mb,
+          settings.auto_export_threshold_bytes,
+        ),
+        auto_export_shard_max_bytes: mibToBytes(
+          formValues.auto_export_shard_max_mb,
+          settings.auto_export_shard_max_bytes,
+        ),
+      };
+      // Strip form-only MB keys so the API body stays clean.
+      delete payload.export_scan_batch_max_mb;
+      delete payload.write_queue_max_mb;
+      delete payload.write_batch_max_mb;
+      delete payload.capture_max_mb;
+      delete payload.capture_global_max_mb;
+      delete payload.auto_export_threshold_mb;
+      delete payload.auto_export_shard_max_mb;
+
+      const res = await API.put('/api/conversation_logs/settings', payload);
       const { success, message, data } = res.data;
       if (!success) {
         showError(message);
@@ -683,29 +739,15 @@ const ConversationLog = () => {
         s3: { ...defaultSettings.s3, ...(data?.s3 || {}) },
       };
       setSettings(nextSettings);
-      const formValues = {
-        ...nextSettings,
-        auto_export_threshold_mb: bytesToMiB(
-          nextSettings.auto_export_threshold_bytes,
-        ),
-        auto_export_shard_max_mb: bytesToMiB(
-          nextSettings.auto_export_shard_max_bytes,
-        ),
-        export_scan_batch_max_mb: bytesToMiB(
-          nextSettings.export_scan_batch_max_bytes,
-        ),
-        write_queue_max_mb: bytesToMiB(nextSettings.write_queue_max_bytes),
-        write_batch_max_mb: bytesToMiB(nextSettings.write_batch_max_bytes),
-        capture_max_mb: bytesToMiB(nextSettings.capture_max_bytes_per_request),
-        capture_global_max_mb: bytesToMiB(
-          nextSettings.capture_global_max_bytes,
-        ),
-      };
-      settingsFormRef.current?.setValues(formValues);
+      settingsFormRef.current?.setValues(buildSettingsFormValues(nextSettings));
       showSuccess(t('保存成功'));
       await loadSummary();
     } catch (error) {
-      showError(error.message || t('保存失败，请重试'));
+      const msg =
+        error?.response?.data?.message ||
+        error?.message ||
+        t('保存失败，请重试');
+      showError(msg);
     } finally {
       setSettingsSaving(false);
     }
@@ -1752,7 +1794,7 @@ const ConversationLog = () => {
             >
               <Spin spinning={summaryLoading}>
                 <Form
-                  values={settings}
+                  values={settingsFormValues}
                   getFormApi={(formApi) => (settingsFormRef.current = formApi)}
                   layout='vertical'
                 >
@@ -1932,13 +1974,13 @@ const ConversationLog = () => {
                           '单个请求所有捕获正文合计的内存上限，超出截断；防止大请求撑高内存',
                         )}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             capture_max_bytes_per_request: mibToBytes(
                               value,
-                              settings.capture_max_bytes_per_request,
+                              prev.capture_max_bytes_per_request,
                             ),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -1953,13 +1995,13 @@ const ConversationLog = () => {
                           '所有并发请求捕获正文合计的进程级内存预算，耗尽后并发请求被截断(capture_truncated_global_budget)；需与实例内存匹配',
                         )}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             capture_global_max_bytes: mibToBytes(
                               value,
-                              settings.capture_global_max_bytes,
+                              prev.capture_global_max_bytes,
                             ),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2304,18 +2346,21 @@ const ConversationLog = () => {
                         field='export_scan_batch_max_mb'
                         label={t('扫描内存上限 (MB)')}
                         min={1}
-                        max={2048}
+                        max={EXPORT_SCAN_BATCH_MAX_MB}
                         step={16}
                         precision={0}
-                        extraText={t('单批读取完整会话正文的估算内存上限')}
+                        extraText={t(
+                          '单批读取完整会话正文的估算内存上限（最大 4096 MB / 4 GiB；自适应会在此天花板内升降）',
+                        )}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             export_scan_batch_max_bytes: mibToBytes(
                               value,
-                              defaultSettings.export_scan_batch_max_bytes,
+                              prev.export_scan_batch_max_bytes ||
+                                defaultSettings.export_scan_batch_max_bytes,
                             ),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2333,10 +2378,10 @@ const ConversationLog = () => {
                           '同时压缩 gzip 分片的后台 worker 数；大核数机器建议接近 CPU 核数（上限 128）',
                         )}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             export_compression_workers: Number(value || 1),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2352,10 +2397,10 @@ const ConversationLog = () => {
                           '等待压缩的 gzip 分片队列长度；建议 ≥ worker 数（上限 256）',
                         )}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             export_compression_queue_size: Number(value || 0),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2369,10 +2414,10 @@ const ConversationLog = () => {
                         precision={0}
                         extraText={t('1 为最快，-1 为默认，9 为最高压缩率')}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             export_compression_level: Number(value ?? 1),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2460,13 +2505,14 @@ const ConversationLog = () => {
                         disabled={settings.async_write_enabled === false}
                         extraText={t('队列正文估算内存达到上限时回退同步写入')}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             write_queue_max_bytes: mibToBytes(
                               value,
-                              defaultSettings.write_queue_max_bytes,
+                              prev.write_queue_max_bytes ||
+                                defaultSettings.write_queue_max_bytes,
                             ),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2481,13 +2527,14 @@ const ConversationLog = () => {
                         disabled={settings.async_write_enabled === false}
                         extraText={t('后台批量入库达到估算内存后立即刷新')}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             write_batch_max_bytes: mibToBytes(
                               value,
-                              defaultSettings.write_batch_max_bytes,
+                              prev.write_batch_max_bytes ||
+                                defaultSettings.write_batch_max_bytes,
                             ),
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2509,10 +2556,10 @@ const ConversationLog = () => {
                           '存储占用达到阈值时自动导出 gzip JSONL 分片',
                         )}
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
+                          setSettings((prev) => ({
+                            ...prev,
                             auto_export_enabled: value,
-                          })
+                          }))
                         }
                       />
                     </Col>
@@ -2525,11 +2572,13 @@ const ConversationLog = () => {
                         step={64}
                         suffix='MB'
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
-                            auto_export_threshold_bytes:
-                              Number(value || 0) * 1024 * 1024,
-                          })
+                          setSettings((prev) => ({
+                            ...prev,
+                            auto_export_threshold_bytes: mibToBytes(
+                              value,
+                              prev.auto_export_threshold_bytes,
+                            ),
+                          }))
                         }
                       />
                     </Col>
@@ -2542,11 +2591,13 @@ const ConversationLog = () => {
                         step={64}
                         suffix='MB'
                         onChange={(value) =>
-                          setSettings({
-                            ...settings,
-                            auto_export_shard_max_bytes:
-                              Number(value || 0) * 1024 * 1024,
-                          })
+                          setSettings((prev) => ({
+                            ...prev,
+                            auto_export_shard_max_bytes: mibToBytes(
+                              value,
+                              prev.auto_export_shard_max_bytes,
+                            ),
+                          }))
                         }
                       />
                     </Col>

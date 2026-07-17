@@ -132,7 +132,7 @@ function runtimeHintText(runtime, t) {
       '解析并行度低于可用核心的一半，CPU 可能吃不满',
     ),
     scan_batch_bytes_low: t(
-      '扫描批内存预算偏小（≤64MiB），大内存机器可提高到 256–512MiB',
+      '扫描批内存预算偏小，大内存机器可在采集配置将上限提高到 1–4 GiB',
     ),
   };
   if (runtime.hint && map[runtime.hint]) return map[runtime.hint];
