@@ -253,6 +253,8 @@ func QueryStatusBoard(hours int) (StatusBoardResult, error) {
 		t.requestCount += row.RequestCount
 		t.successCount += row.SuccessCount
 		t.totalLatencyMs += row.TotalLatencyMs
+		t.ttftSumMs += row.TtftSumMs
+		t.ttftCount += row.TtftCount
 		t.outputTokens += row.OutputTokens
 		t.generationMs += row.GenerationMs
 		totals[row.ModelName] = t
@@ -283,6 +285,8 @@ func QueryStatusBoard(hours int) (StatusBoardResult, error) {
 		t.requestCount += snap.requestCount
 		t.successCount += snap.successCount
 		t.totalLatencyMs += snap.totalLatencyMs
+		t.ttftSumMs += snap.ttftSumMs
+		t.ttftCount += snap.ttftCount
 		t.outputTokens += snap.outputTokens
 		t.generationMs += snap.generationMs
 		totals[k.model] = t
@@ -326,6 +330,7 @@ func QueryStatusBoard(hours int) (StatusBoardResult, error) {
 			SuccessCount:  total.successCount,
 			SuccessRate:   math.Round(rate*100) / 100,
 			AvgLatencyMs:  avg(total.totalLatencyMs, total.requestCount),
+			AvgTtftMs:     avg(total.ttftSumMs, total.ttftCount),
 			AvgTps:        math.Round(avgTps(total)*100) / 100,
 			CurrentStatus: statusColor(rate, total.requestCount),
 			SlotData:      slots,

@@ -87,6 +87,7 @@ type ModelStatusItem struct {
 	SuccessCount  int64        `json:"success_count"`
 	SuccessRate   float64      `json:"success_rate"`
 	AvgLatencyMs  int64        `json:"avg_latency_ms"`
+	AvgTtftMs     int64        `json:"avg_ttft_ms"` // average time-to-first-token (stream only)
 	AvgTps        float64      `json:"avg_tps"`
 	CurrentStatus string       `json:"current_status"`
 	SlotData      []StatusSlot `json:"slot_data"`

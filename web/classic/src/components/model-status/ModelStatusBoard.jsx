@@ -28,7 +28,6 @@ import {
   Banner,
   Button,
   Empty,
-  Select,
   Skeleton,
   Spin,
   Tag,
@@ -67,22 +66,12 @@ import { API, renderQuota, showError } from '../../helpers';
 
 const { Text, Title } = Typography;
 
-const TIME_WINDOWS = [
-  { value: 1, labelKey: '1小时' },
-  { value: 6, labelKey: '6小时' },
-  { value: 12, labelKey: '12小时' },
-  { value: 24, labelKey: '24小时' },
-  { value: 72, labelKey: '3天' },
-  { value: 168, labelKey: '7天' },
-];
-
-const REFRESH_OPTIONS = [
-  { value: 0, labelKey: '手动刷新' },
-  { value: 30, labelKey: '30秒' },
-  { value: 60, labelKey: '60秒' },
-  { value: 120, labelKey: '2分钟' },
-  { value: 300, labelKey: '5分钟' },
-];
+/** Fixed window — no client selector (prevents param-spam). */
+const FIXED_HOURS = 24;
+/** Auto refresh every 5 minutes (no client selector). */
+const FIXED_REFRESH_SEC = 300;
+/** Manual refresh cooldown to limit API abuse. */
+const MANUAL_REFRESH_COOLDOWN_SEC = 30;
 
 const MODEL_LOGO_RULES = [
   { match: /gpt|openai|o1|o3|chatgpt|dall-e|whisper|tts/i, Icon: OpenAI },
@@ -106,7 +95,8 @@ const STATUS_META = {
   green: {
     labelKey: '正常',
     tag: 'green',
-    bar: 'bg-emerald-500',
+    // OpenAI-status style: solid uptime cells
+    bar: 'bg-[#22c55e]',
     soft: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 ring-emerald-500/20',
     glow: 'shadow-emerald-500/20',
     dot: 'bg-emerald-500',
@@ -114,7 +104,7 @@ const STATUS_META = {
   yellow: {
     labelKey: '警告',
     tag: 'orange',
-    bar: 'bg-amber-400',
+    bar: 'bg-[#f59e0b]',
     soft: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 ring-amber-500/20',
     glow: 'shadow-amber-500/20',
     dot: 'bg-amber-400',
@@ -122,7 +112,7 @@ const STATUS_META = {
   red: {
     labelKey: '异常',
     tag: 'red',
-    bar: 'bg-rose-500',
+    bar: 'bg-[#ef4444]',
     soft: 'bg-rose-500/10 text-rose-600 dark:text-rose-400 ring-rose-500/20',
     glow: 'shadow-rose-500/20',
     dot: 'bg-rose-500',
@@ -130,10 +120,10 @@ const STATUS_META = {
   empty: {
     labelKey: '无请求',
     tag: 'grey',
-    bar: 'bg-slate-200 dark:bg-zinc-700',
+    bar: 'bg-slate-200 dark:bg-zinc-600',
     soft: 'bg-slate-500/10 text-slate-500 dark:text-zinc-400 ring-slate-500/10',
     glow: '',
-    dot: 'bg-slate-300 dark:bg-zinc-600',
+    dot: 'bg-slate-300 dark:bg-zinc-500',
   },
 };
 
@@ -171,22 +161,31 @@ function ModelLogo({ modelName, size = 22 }) {
   );
 }
 
-/** Uptime-style fixed-height slot timeline */
+/**
+ * Uptime-style timeline (OpenAI status page).
+ * Important: Semi Tooltip wraps children in an inline node that breaks flex
+ * height — outer shell owns flex/height, inner div owns color.
+ */
 function SlotBar({ slots, t }) {
   if (!slots?.length) {
     return (
-      <div className='h-8 rounded-lg bg-semi-color-fill-0 flex items-center justify-center text-xs text-semi-color-text-2'>
+      <div className='h-9 rounded-md bg-semi-color-fill-0 flex items-center justify-center text-xs text-semi-color-text-2'>
         {t('暂无时间线数据')}
       </div>
     );
   }
 
   return (
-    <div className='flex items-stretch gap-[2px] h-8 w-full rounded-lg overflow-hidden'>
+    <div
+      className='flex w-full items-stretch gap-[2px] sm:gap-[3px]'
+      style={{ height: 36 }}
+      role='img'
+      aria-label={t('时间线')}
+    >
       {slots.map((slot) => {
         const meta = STATUS_META[slot.status] || STATUS_META.empty;
         const tip = (
-          <div className='text-xs space-y-1.5 min-w-[140px]'>
+          <div className='text-xs space-y-1.5 min-w-[148px]'>
             <div className='font-semibold pb-1 border-b border-white/10'>
               {formatTime(slot.start_time)} – {formatTime(slot.end_time)}
             </div>
@@ -210,16 +209,26 @@ function SlotBar({ slots, t }) {
                   : '—'}
               </span>
             </div>
+            <div className='flex justify-between gap-6'>
+              <span className='opacity-70'>{t('状态')}</span>
+              <span className='font-medium'>{t(meta.labelKey)}</span>
+            </div>
           </div>
         );
         return (
-          <Tooltip key={slot.slot} content={tip}>
+          <Tooltip key={slot.slot} content={tip} position='top'>
             <div
-              className={`flex-1 min-w-[3px] rounded-[2px] transition-all duration-150 hover:brightness-110 hover:scale-y-125 origin-center cursor-default ${meta.bar}`}
-              style={{
-                opacity: slot.total_requests > 0 ? 1 : 0.55,
-              }}
-            />
+              className='flex-1 min-w-[3px] h-full cursor-default'
+              style={{ minHeight: 36 }}
+            >
+              <div
+                className={`h-full w-full rounded-[2px] transition-transform duration-150 hover:scale-y-110 origin-center ${meta.bar}`}
+                style={{
+                  opacity: slot.total_requests > 0 ? 1 : 0.45,
+                  minHeight: 36,
+                }}
+              />
+            </div>
           </Tooltip>
         );
       })}
@@ -380,26 +389,27 @@ function ModelStatusCard({ model, t }) {
   const rate = Number(model.success_rate || 0);
 
   return (
-    <article
-      className={`group relative overflow-hidden rounded-2xl border border-semi-color-border bg-semi-color-bg-1 p-4 sm:p-5 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg ${meta.glow}`}
-    >
-      {/* left status accent */}
-      <span
-        className={`absolute left-0 top-0 bottom-0 w-[3px] ${meta.bar} opacity-90`}
-      />
-
-      <div className='flex items-start justify-between gap-3 mb-4'>
+    <article className='group rounded-2xl border border-semi-color-border bg-semi-color-bg-1 px-4 py-4 sm:px-5 sm:py-4 transition-shadow duration-200 hover:shadow-md'>
+      <div className='flex items-start justify-between gap-3 mb-3'>
         <div className='flex items-center gap-3 min-w-0'>
-          <div className='relative flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-semi-color-fill-0 border border-semi-color-border/70 shadow-sm'>
-            <ModelLogo modelName={model.model_name} size={22} />
+          <div className='relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-semi-color-fill-0 border border-semi-color-border/70'>
+            <ModelLogo modelName={model.model_name} size={20} />
             <span
               className={`absolute -right-0.5 -bottom-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-semi-color-bg-1 ${meta.dot}`}
             />
           </div>
           <div className='min-w-0'>
-            <h3 className='font-semibold text-semi-color-text-0 truncate tracking-tight'>
-              {model.display_name || model.model_name}
-            </h3>
+            <div className='flex flex-wrap items-center gap-2'>
+              <h3 className='font-semibold text-semi-color-text-0 truncate tracking-tight'>
+                {model.display_name || model.model_name}
+              </h3>
+              <span
+                className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 ${meta.soft}`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} />
+                {t(meta.labelKey)}
+              </span>
+            </div>
             <div className='mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-semi-color-text-2'>
               <span>
                 {t('请求数')}{' '}
@@ -407,20 +417,31 @@ function ModelStatusCard({ model, t }) {
                   {Number(model.total_requests || 0).toLocaleString()}
                 </span>
               </span>
+              {model.avg_ttft_ms > 0 && (
+                <>
+                  <span className='opacity-30'>·</span>
+                  <span>
+                    {t('平均首字')}{' '}
+                    <span className='font-medium tabular-nums text-semi-color-text-1'>
+                      {Number(model.avg_ttft_ms).toLocaleString()}ms
+                    </span>
+                  </span>
+                </>
+              )}
               {model.avg_latency_ms > 0 && (
                 <>
-                  <span className='opacity-30'>|</span>
+                  <span className='opacity-30'>·</span>
                   <span>
                     {t('延迟')}{' '}
                     <span className='font-medium tabular-nums text-semi-color-text-1'>
-                      {model.avg_latency_ms}ms
+                      {Number(model.avg_latency_ms).toLocaleString()}ms
                     </span>
                   </span>
                 </>
               )}
               {model.avg_tps > 0 && (
                 <>
-                  <span className='opacity-30'>|</span>
+                  <span className='opacity-30'>·</span>
                   <span>
                     TPS{' '}
                     <span className='font-medium tabular-nums text-semi-color-text-1'>
@@ -433,36 +454,25 @@ function ModelStatusCard({ model, t }) {
           </div>
         </div>
 
-        <div className='flex flex-col items-end gap-1.5 shrink-0'>
-          <div
-            className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${meta.soft}`}
-          >
-            <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} />
-            {rate.toFixed(1)}%
+        <div className='shrink-0 text-right'>
+          <div className='text-base sm:text-lg font-semibold tabular-nums text-semi-color-text-0 leading-none'>
+            {rate.toFixed(2)}%
           </div>
-          <span className='text-[11px] text-semi-color-text-2'>
-            {t(meta.labelKey)}
-          </span>
+          <div className='mt-1 text-[11px] text-semi-color-text-2'>
+            {t('成功率')}
+          </div>
         </div>
-      </div>
-
-      {/* progress track under success rate */}
-      <div className='mb-3 h-1 w-full overflow-hidden rounded-full bg-semi-color-fill-0'>
-        <div
-          className={`h-full rounded-full transition-all duration-500 ${meta.bar}`}
-          style={{ width: `${Math.min(100, Math.max(0, rate))}%` }}
-        />
       </div>
 
       <SlotBar slots={model.slot_data} t={t} />
 
-      <div className='mt-3 flex items-center justify-between text-[11px] text-semi-color-text-2'>
+      <div className='mt-2.5 flex items-center justify-between text-[11px] text-semi-color-text-2'>
         <span className='tabular-nums'>
           {model.slot_data?.length
             ? formatTime(model.slot_data[0].start_time)
             : ''}
         </span>
-        <span className='opacity-50'>{t('时间线')}</span>
+        <span className='opacity-50'>{t('近 24 小时')}</span>
         <span className='tabular-nums'>
           {model.slot_data?.length
             ? formatTime(model.slot_data[model.slot_data.length - 1].end_time)
@@ -475,14 +485,13 @@ function ModelStatusCard({ model, t }) {
 
 const ModelStatusBoard = () => {
   const { t } = useTranslation();
-  const [hours, setHours] = useState(24);
-  const [refreshInterval, setRefreshInterval] = useState(60);
   const [statusFilter, setStatusFilter] = useState('all');
   const [models, setModels] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
-  const [countdown, setCountdown] = useState(60);
+  const [countdown, setCountdown] = useState(FIXED_REFRESH_SEC);
+  const [manualCooldown, setManualCooldown] = useState(0);
   const [error, setError] = useState('');
   const [todayStats, setTodayStats] = useState({
     totalTokens: 0,
@@ -492,16 +501,11 @@ const ModelStatusBoard = () => {
     avgTPM: '0',
   });
   const [todayLoading, setTodayLoading] = useState(true);
-  const intervalRef = useRef(refreshInterval);
   const mountedRef = useRef(true);
-
-  useEffect(() => {
-    intervalRef.current = refreshInterval;
-    setCountdown(refreshInterval > 0 ? refreshInterval : 0);
-  }, [refreshInterval]);
+  const lastManualRefreshRef = useRef(0);
+  const lastAutoRefreshRef = useRef(Date.now());
 
   // Public site-wide today usage — dedicated API, no admin session needed.
-  // Does NOT call /api/data/* (admin-only detailed series).
   const fetchTodayTokenStats = useCallback(async () => {
     if (mountedRef.current) setTodayLoading(true);
     try {
@@ -551,7 +555,10 @@ const ModelStatusBoard = () => {
       else if (models.length === 0) setLoading(true);
       setError('');
       try {
-        const res = await API.get(`/api/model-status?hours=${hours}`);
+        // Fixed 24h window — no client-controlled hours param surface.
+        const res = await API.get(
+          `/api/model-status?hours=${FIXED_HOURS}`,
+        );
         const { success, data, message } = res.data;
         if (!mountedRef.current) return;
         if (!success) {
@@ -561,7 +568,8 @@ const ModelStatusBoard = () => {
         }
         setModels(data?.models || []);
         setLastUpdate(new Date());
-        if (intervalRef.current > 0) setCountdown(intervalRef.current);
+        setCountdown(FIXED_REFRESH_SEC);
+        lastAutoRefreshRef.current = Date.now();
       } catch (e) {
         if (!mountedRef.current) return;
         const msg =
@@ -575,14 +583,28 @@ const ModelStatusBoard = () => {
         }
       }
     },
-    [hours, models.length, t],
+    [models.length, t],
   );
 
   const refreshAll = useCallback(
     async (isManual = false) => {
+      if (isManual) {
+        const now = Date.now();
+        const elapsed = Math.floor(
+          (now - lastManualRefreshRef.current) / 1000,
+        );
+        if (elapsed < MANUAL_REFRESH_COOLDOWN_SEC) {
+          const left = MANUAL_REFRESH_COOLDOWN_SEC - elapsed;
+          showError(t('刷新过于频繁，请 {{n}} 秒后再试', { n: left }));
+          setManualCooldown(left);
+          return;
+        }
+        lastManualRefreshRef.current = now;
+        setManualCooldown(MANUAL_REFRESH_COOLDOWN_SEC);
+      }
       await Promise.all([fetchStatus(isManual), fetchTodayTokenStats()]);
     },
-    [fetchStatus, fetchTodayTokenStats],
+    [fetchStatus, fetchTodayTokenStats, t],
   );
 
   useEffect(() => {
@@ -591,32 +613,36 @@ const ModelStatusBoard = () => {
     return () => {
       mountedRef.current = false;
     };
-  }, [hours]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Fixed auto-refresh every FIXED_REFRESH_SEC; pause when tab hidden.
   useEffect(() => {
-    if (refreshInterval <= 0) return undefined;
-
-    let lastRefresh = Date.now();
+    lastAutoRefreshRef.current = Date.now();
     const timer = setInterval(() => {
       setCountdown((prev) => {
         if (prev <= 1) {
-          refreshAll(false);
-          lastRefresh = Date.now();
-          return refreshInterval;
+          if (document.visibilityState === 'visible') {
+            refreshAll(false);
+            lastAutoRefreshRef.current = Date.now();
+          }
+          return FIXED_REFRESH_SEC;
         }
         return prev - 1;
       });
+      setManualCooldown((cd) => (cd > 0 ? cd - 1 : 0));
     }, 1000);
 
     const onVisible = () => {
       if (document.visibilityState !== 'visible') return;
-      const elapsed = Math.floor((Date.now() - lastRefresh) / 1000);
-      if (elapsed >= refreshInterval) {
+      const elapsed = Math.floor(
+        (Date.now() - lastAutoRefreshRef.current) / 1000,
+      );
+      if (elapsed >= FIXED_REFRESH_SEC) {
         refreshAll(false);
-        lastRefresh = Date.now();
-        setCountdown(refreshInterval);
+        lastAutoRefreshRef.current = Date.now();
+        setCountdown(FIXED_REFRESH_SEC);
       } else {
-        setCountdown(Math.max(1, refreshInterval - elapsed));
+        setCountdown(Math.max(1, FIXED_REFRESH_SEC - elapsed));
       }
     };
     document.addEventListener('visibilitychange', onVisible);
@@ -625,7 +651,7 @@ const ModelStatusBoard = () => {
       clearInterval(timer);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [refreshInterval, refreshAll]);
+  }, [refreshAll]);
 
   const filteredModels = useMemo(() => {
     if (statusFilter === 'all') return models;
@@ -651,15 +677,6 @@ const ModelStatusBoard = () => {
       red: models.filter((m) => m.current_status === 'red').length,
     };
   }, [models]);
-
-  const windowOptions = TIME_WINDOWS.map((w) => ({
-    value: w.value,
-    label: t(w.labelKey),
-  }));
-  const refreshOptions = REFRESH_OPTIONS.map((w) => ({
-    value: w.value,
-    label: t(w.labelKey),
-  }));
 
   const overallHealth =
     overview.red > 0
@@ -699,15 +716,14 @@ const ModelStatusBoard = () => {
                       ? t(overallMeta.labelKey)
                       : t('等待数据')}
                   </span>
-                  {refreshInterval > 0 && (
-                    <span className='inline-flex items-center gap-1.5 rounded-full bg-semi-color-fill-0 px-2.5 py-1 text-[11px] text-semi-color-text-2 ring-1 ring-semi-color-border'>
-                      <span className='relative flex h-1.5 w-1.5'>
-                        <span className='absolute inline-flex h-full w-full animate-ping rounded-full bg-semi-color-primary opacity-60' />
-                        <span className='relative inline-flex h-1.5 w-1.5 rounded-full bg-semi-color-primary' />
-                      </span>
-                      {t('自动刷新')} {formatCountdown(countdown)}
+                  <span className='inline-flex items-center gap-1.5 rounded-full bg-semi-color-fill-0 px-2.5 py-1 text-[11px] text-semi-color-text-2 ring-1 ring-semi-color-border'>
+                    <span className='relative flex h-1.5 w-1.5'>
+                      <span className='absolute inline-flex h-full w-full animate-ping rounded-full bg-semi-color-primary opacity-60' />
+                      <span className='relative inline-flex h-1.5 w-1.5 rounded-full bg-semi-color-primary' />
                     </span>
-                  )}
+                    {t('近 24 小时')} · {t('自动刷新')}{' '}
+                    {formatCountdown(countdown)}
+                  </span>
                 </div>
 
                 <div className='flex items-start gap-3'>
@@ -739,30 +755,20 @@ const ModelStatusBoard = () => {
                 </div>
               </div>
 
-              {/* controls */}
+              {/* Manual refresh only — no hours/interval selectors (anti-spam) */}
               <div className='flex flex-wrap items-center gap-2 lg:justify-end lg:pt-1'>
-                <Select
-                  value={hours}
-                  optionList={windowOptions}
-                  onChange={setHours}
-                  style={{ width: 118 }}
-                  className='!rounded-xl'
-                />
-                <Select
-                  value={refreshInterval}
-                  optionList={refreshOptions}
-                  onChange={setRefreshInterval}
-                  style={{ width: 110 }}
-                />
                 <Button
                   icon={<IconRefresh />}
                   loading={refreshing || todayLoading}
+                  disabled={manualCooldown > 0}
                   onClick={() => refreshAll(true)}
                   theme='solid'
                   type='primary'
                   className='!rounded-xl'
                 >
-                  {t('刷新')}
+                  {manualCooldown > 0
+                    ? `${t('刷新')} (${manualCooldown}s)`
+                    : t('刷新')}
                 </Button>
               </div>
             </div>
@@ -896,7 +902,7 @@ const ModelStatusBoard = () => {
               ))}
             </div>
           ) : filteredModels.length > 0 ? (
-            <div className='grid grid-cols-1 lg:grid-cols-2 gap-4'>
+            <div className='grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4'>
               {filteredModels.map((model) => (
                 <ModelStatusCard
                   key={model.model_name}
